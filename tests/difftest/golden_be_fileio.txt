@@ -1,0 +1,7 @@
+size=74
+line one: the quick brown fox
+line two: 0123456789
+line three: !@#$%^&*()
+total=74
+fileio OK
+D2-EXIT=0

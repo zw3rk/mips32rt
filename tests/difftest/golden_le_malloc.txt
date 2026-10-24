@@ -1,0 +1,15 @@
+block 1 sum=11
+block 1 zero=0
+block 7 sum=2629098042
+block 7 zero=0
+block 64 sum=1922419872
+block 64 zero=0
+block 1000 sum=426489284
+block 1000 zero=0
+block 65536 sum=2765062144
+block 65536 zero=0
+block 300000 sum=2926141616
+block 300000 zero=0
+realloc: sum=2201088264
+calloc: total=0
+D2-EXIT=0
