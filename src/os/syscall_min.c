@@ -281,6 +281,9 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
 /* Phase 2 static-libc layer (src/os/syscalls.c, lane L2a). */
 int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp);
 
+/* Phase 4 thread layer (src/os/threads.c, lane L4b). */
+int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp);
+
 int32_t mips_syscall(mips32_ctx_t *ctx)
 {
     uint32_t nr;
@@ -348,6 +351,9 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         /* Single-threaded Phase 1: pid is the tid (real tids in Phase 4). */
         return sc_ret(ctx, (int32_t)getpid());
     }
+    /* Phase 4 (lane L4b): CLONE_VM-family threads live in threads.c. */
+    case MIPS32_NR_clone:
+        return mips_sc_clone(ctx, sp);
     /* Phase 2 (lane L2a): static-libc numbers handled in syscalls.c. */
     case MIPS32_NR_open:
     case MIPS32_NR_openat:
