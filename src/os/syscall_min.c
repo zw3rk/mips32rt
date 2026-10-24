@@ -60,6 +60,13 @@ extern long syscall(long __n, ...);
 /* Locally frozen: __NR_set_tid_address = __NR_Linux + 252 (see above). */
 #define MIPS32_NR_TID_ADDRESS 4252U
 
+/* Cross-lane hook (same weak-reference pattern as src/os/proc.c): the
+ * Phase 2 DBT provides mips32_dbt_invalidate_range; without it
+ * (interp-only link) cacheflush is a successful no-op. */
+__attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
+                                                      uint32_t start,
+                                                      uint32_t end);
+
 /* MIPS new_utsname: 6 fields of 65 bytes (Linux UAPI, all arches). */
 #define MIPS_UTS_FIELD 65U
 #define MIPS_UTS_SIZE  (6U * MIPS_UTS_FIELD)
@@ -377,6 +384,23 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
             return sc_ret(ctx, -EFAULT);
         }
         return sc_ret(ctx, (int32_t)rt32_vm_mprotect(ctx, addr, len, prot));
+    }
+    case MIPS32_NR_cacheflush: {
+        uint32_t addr = o32_arg(ctx, sp, 0, &ok);
+        uint32_t len  = o32_arg(ctx, sp, 1, &ok);
+        if (!ok) {
+            return sc_ret(ctx, -EFAULT);
+        }
+        if (len != 0U && mips32_dbt_invalidate_range != NULL) {
+            uint64_t end64 = (uint64_t)addr + (uint64_t)len;
+
+            if (end64 > 0xFFFFFFFFULL) {
+                mips32_dbt_invalidate_range(ctx, addr, 0U);
+            } else {
+                mips32_dbt_invalidate_range(ctx, addr, (uint32_t)end64);
+            }
+        }
+        return sc_ret(ctx, 0);
     }
     case MIPS32_NR_uname:
         return sc_uname(ctx, sp);

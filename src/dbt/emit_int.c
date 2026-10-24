@@ -507,7 +507,7 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
     }
 }
 
-/* REGIMM traps (fault shape mirrors SPECIAL traps), SYNCI NOP. */
+/* REGIMM traps (fault shape mirrors SPECIAL traps); SYNCI declines. */
 static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                        uint32_t fpc)
 {
@@ -520,7 +520,7 @@ static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     case 0x0BU: idx = 3U; break; /* TLTIU */
     case 0x0CU: idx = 4U; break; /* TEQI */
     case 0x0EU: idx = 7U; break; /* TNEI */
-    case 0x1FU: return 0; /* SYNCI */
+    case 0x1FU: return -1; /* SYNCI has SMC side effects: interp path */
     default: return -1;
     }
     cmp_simm(b, d->rs, d->simm);
@@ -837,7 +837,7 @@ static int slot_ok(const mips_dec_t *d)
             (f == 0x20U && (d->sa == 2U || d->sa == 16U || d->sa == 24U)) ||
             (f == 0x3BU && d->rd == MIPS32_RDHWR_ULR);
     }
-    case MIPS_OP_REGIMM: return d->rt == 0x1FU;
+    case MIPS_OP_REGIMM: return 0; /* SYNCI now single-steps (SMC) */
     case MIPS_OP_ADDI: case MIPS_OP_ADDIU: case MIPS_OP_SLTI:
     case MIPS_OP_SLTIU: case MIPS_OP_ANDI: case MIPS_OP_ORI:
     case MIPS_OP_XORI: case MIPS_OP_LUI: case MIPS_OP_LB: case MIPS_OP_LH:
