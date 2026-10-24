@@ -281,6 +281,12 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
 /* Phase 2 static-libc layer (src/os/syscalls.c, lane L2a). */
 int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp);
 
+/* Phase 4 process lifecycle (src/os/proc.c, lane L4c). */
+int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp);
+int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp);
+int32_t mips_proc_wait4(mips32_ctx_t *ctx, uint32_t sp);
+int32_t mips_proc_waitpid(mips32_ctx_t *ctx, uint32_t sp);
+
 int32_t mips_syscall(mips32_ctx_t *ctx)
 {
     uint32_t nr;
@@ -348,6 +354,16 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         /* Single-threaded Phase 1: pid is the tid (real tids in Phase 4). */
         return sc_ret(ctx, (int32_t)getpid());
     }
+    /* Phase 4 (lane L4c): process lifecycle in proc.c (vfork has no
+     * O32 number; it arrives via the L4b clone path). */
+    case MIPS32_NR_fork:
+        return mips_proc_fork(ctx, sp);
+    case MIPS32_NR_execve:
+        return mips_proc_execve(ctx, sp);
+    case MIPS32_NR_wait4:
+        return mips_proc_wait4(ctx, sp);
+    case MIPS32_NR_waitpid:
+        return mips_proc_waitpid(ctx, sp);
     /* Phase 2 (lane L2a): static-libc numbers handled in syscalls.c. */
     case MIPS32_NR_open:
     case MIPS32_NR_openat:
