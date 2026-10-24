@@ -1,0 +1,90 @@
+--- toolchain ---
+mips-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+qemu-mips version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
+--- build BE ---
+  Class:                             ELF32
+  Data:                              2's complement, big endian
+  Machine:                           MIPS R3000
+--- run BE under qemu-mips ---
+qemu: uncaught target signal 10 (Bus error) - core dumped
+P3 nan-mode: PASS mode=legacy div0=0x7fbfffff
+P3 fpuid: PASS FIR=0x00739300 FCSR(reset)=0x00000000 mode=legacy
+P3 add.s: PASS 1.5+2.25=0x40700000
+P3 sub.s: PASS 1.5-2.25=0xbf400000
+P3 mul.s: PASS 1.5*2.25=0x40580000
+P3 div.s: PASS 2.25/1.5=0x3fc00000
+P3 sqrt.s: PASS sqrt(2)=0x3fb504f3
+P3 sqrt.s-neg: PASS sqrt(-4)=0x7fbfffff fcsr=0x00010044
+P3 add.d: PASS 1.5+2.25=0x400e000000000000
+P3 sub.d: PASS 1.5-2.25=0xbfe8000000000000
+P3 mul.d: PASS 1.5*2.25=0x400b000000000000
+P3 div.d: PASS 2.25/1.5=0x3ff8000000000000
+P3 sqrt.d: PASS sqrt(2)=0x3ff6a09e667f3bcd
+P3 abs.s: PASS abs(-1)=1
+P3 abs.d: PASS abs(-1)=1
+P3 neg.s: PASS neg(1.5)
+P3 neg.d: PASS neg(-1.5)
+P3 mov.s: PASS mov(2.5)
+P3 mov.d: PASS mov(2.5)
+P3 abs.s-snan: PASS abs(snan)=0x7fffffff
+P3 neg.s-qnan: PASS neg(qnan)=0xffbfffff
+P3 mov.s-snan: PASS mov(snan)=0x7fffffff
+P3 abs.d-snan: PASS abs.d(snan)=0x7ffffffffffbffff
+P3 mov.d-qnan: PASS payload kept
+P3 nan-default-s: PASS 0.0f/0.0f=0x7fbfffff fcsr=0x00010040
+P3 nan-default-d: PASS 0.0/0.0=0x7ff7ffffffffffff
+P3 nan-quiet-passthru: PASS add(qnan,1)=0x7fbfffff fcsr=0x00000000
+P3 nan-snan-quiet: PASS add(snan,1)=0x7fbfffff fcsr=0x00010040
+P3 nan-snan-quiet-d: PASS add.d(snan,1)=0x7ff7ffffffffffff fcsr=0x00010040
+P3 trap-snan: PASS add(snan)+trap trapped=1 fcsr=0x00010800
+P3 trap-qnan-silent: PASS add(qnan)+trap trapped=0 res=0x7fbfffff
+P3 trap-abs-snan-silent: PASS abs(snan)+trap trapped=0 res=0x7fffffff
+P3 trap-abs-qnan-silent: PASS abs(qnan)+trap trapped=0 res=0x7fbfffff
+P3 divz-pos: PASS 1/0=0x7f800000 fcsr=0x00008020
+P3 divz-neg: PASS -1/0=0xff800000
+P3 divz-d: PASS 1.0/0.0=0x7ff0000000000000
+P3 ovf-s: PASS max*2=0x7f800000 fcsr=0x00005014
+P3 ovf-d: PASS dmax*2=0x7ff0000000000000
+P3 cvt-ovf: PASS cvt.w.s(1e20)=0x7fffffff fcsr=0x00010040
+P3 round.w.s: PASS half-even 1.5->2 2.5->2 -2.5->-2
+P3 trunc.w.s: PASS toward-zero
+P3 ceil.w.s: PASS toward+inf
+P3 floor.w.s: PASS toward-inf
+P3 rm-rz: PASS rz
+P3 rm-rp: PASS rp
+P3 rm-rm: PASS rm
+P3 rm-rn: PASS rn
+P3 cvt.d.s: PASS 3.25f->d
+P3 cvt.s.d: PASS 3.25d->s
+P3 cvt.s.w: PASS 12345
+P3 cvt.d.w: PASS -7
+P3 cvt-chain-w: PASS cvt.w.s(cvt.s.w(12345))=12345
+P3 cvt-w-d: PASS cvt.w.d(-7.0)=-7
+P3 cmp-eq: PASS eq t/f
+P3 cmp-lt: PASS lt
+P3 cmp-le: PASS le
+P3 cmp-un-d: PASS un
+P3 bc1t-taken: PASS cnt=11
+P3 bc1t-nottaken: PASS cnt=1
+P3 bc1f-taken: PASS cnt=11
+P3 bc1f-nottaken: PASS cnt=1
+P3 bc1tl-taken: PASS delay runs cnt=11
+P3 bc1tl-annul: PASS delay annulled cnt=0
+P3 bc1fl-taken: PASS delay runs cnt=11
+P3 bc1fl-annul: PASS delay annulled cnt=0
+P3 mtc1-mfc1-a: PASS in=0x12345678 out=0x12345678
+P3 mtc1-mfc1-b: PASS in=0x00000000 out=0x00000000
+P3 mtc1-mfc1-c: PASS in=0xffffffff out=0xffffffff
+P3 mthc1-mfhc1: PASS lo=0xdeadbeef hi=0x12345678
+P3 fcsr-rm0: PASS rm=0 back=0x00000000
+P3 fcsr-rm1: PASS rm=1 back=0x00000001
+P3 fcsr-rm2: PASS rm=2 back=0x00000002
+P3 fcsr-rm3: PASS rm=3 back=0x00000003
+P3 fcsr-flag-set: PASS Flags.V after 0/0
+P3 fcsr-flag-clear: PASS flags cleared
+P3 swc1-lwc1: PASS aligned word round-trip
+P3 sdc1-ldc1: PASS ldc1=0x400e000000000000
+P3 unaligned-lwc1: PASS child sig=10 (AdEL fault)
+P3 checks: 78 pass, 0 fail
+P3-RESULT: PASS
+BE-EXIT=0
