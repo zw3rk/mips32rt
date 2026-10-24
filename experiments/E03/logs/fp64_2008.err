@@ -1,0 +1,3 @@
+/usr/lib/gcc-cross/mipsel-linux-gnu/12/../../../../mipsel-linux-gnu/bin/ld: /tmp/ccPAJxlV.o: linking -mnan=2008 module with previous -mnan=legacy modules
+/usr/lib/gcc-cross/mipsel-linux-gnu/12/../../../../mipsel-linux-gnu/bin/ld: failed to merge target specific data of file /tmp/ccPAJxlV.o
+collect2: error: ld returned 1 exit status

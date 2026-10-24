@@ -1,0 +1,32 @@
+== sizes ==
+sizeof(float)=4 sizeof(double)=8 sizeof(void*)=4
+endian=little
+== FPU id ==
+FIR=0x00739300 FCSR(reset)=0x00000000
+fcsr-reset: FCSR=0x00000000 cause[VZOU IX]=0x00 en=0x00 flags=0x00 RM=0 FS=0 FO=0 FN=0
+FIR: F64=1 L=1 W=1 3D=0 PS=0 D=1 S=1 procid=0x93
+== (1) NaN bit patterns ==
+0.0f/0.0f bits=0x7fbfffff
+0.0/0.0  bits=0x7ff7ffffffffffff
+f_lo_bit=0x7fbfffff (Legacy QNaN / 2008 SNaN)
+f_hi_bit=0x7fffffff (Legacy SNaN / 2008 QNaN)
+d_lo_bit=0x7ff7ffffffffffff
+d_hi_bit=0x7ffffffffffbffff
+add.s(0x7fbfffff,1.0)=0x7fbfffff fcsr=0x00000000
+add.s(0x7fffffff,1.0)=0x7fbfffff fcsr=0x00010040
+== (2) GPR<->FPR moves ==
+mtc1/mfc1 in=0x12345678 out=0x12345678 OK
+mtc1/mfc1 in=0x00000000 out=0x00000000 OK
+mtc1/mfc1 in=0xffffffff out=0xffffffff OK
+mtc1/mthc1/mfc1/mfhc1 lo=0xdeadbeef hi=0x12345678 -> lo=0xdeadbeef hi=0x12345678 OK
+== (3) ABS.S/ABS.D on sNaN (Invalid trap ENABLED) ==
+abs.s(0x7fbfffff): trapped=0 res=0x7fbfffff fcsr=0x00000800
+abs.s(0x7fffffff): trapped=0 res=0x7fffffff fcsr=0x00000800
+abs.d(0x7ff7ffffffffffff): trapped=0 res=0x7ff7ffffffffffff fcsr=0x00000800
+abs.d(0x7ffffffffffbffff): trapped=0 res=0x7ffffffffffbffff fcsr=0x00000800
+add.s(0x7fbfffff)+trap: trapped=0 res=0x7fbfffff fcsr=0x00000800
+add.s(0x7fffffff)+trap: trapped=1 res=0xdead0000 fcsr=0x00010800
+abs.s(-1.0f)=0x3f800000 (expect 0x3f800000)
+abs.d(-1.0)=0x3ff0000000000000 (expect 0x3ff0000000000000)
+fcsr-final: FCSR=0x00000000 cause[VZOU IX]=0x00 en=0x00 flags=0x00 RM=0 FS=0 FO=0 FN=0
+DONE
