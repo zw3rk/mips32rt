@@ -1,0 +1,42 @@
+ENDIAN=BE
+HOST_BYTE0=00 (1 means LE landing)
+INIT_RT=0xAABBCCDD MEM_PATTERN=11:22:33:44
+LWL off=0 init=0xAABBCCDD result=0x11223344
+LWL off=1 init=0xAABBCCDD result=0x223344DD
+LWL off=2 init=0xAABBCCDD result=0x3344CCDD
+LWL off=3 init=0xAABBCCDD result=0x44BBCCDD
+LWR off=0 init=0xAABBCCDD result=0xAABBCC11
+LWR off=1 init=0xAABBCCDD result=0xAABB1122
+LWR off=2 init=0xAABBCCDD result=0xAA112233
+LWR off=3 init=0xAABBCCDD result=0x11223344
+PAIRLOAD off=0 init=0xAABBCCDD result=0x11223311
+PAIRLOAD off=1 init=0xAABBCCDD result=0x22331122
+PAIRLOAD off=2 init=0xAABBCCDD result=0x33112233
+PAIRLOAD off=3 init=0xAABBCCDD result=0x11223344
+SWL off=0 mem=AA:BB:CC:DD:00:00
+SWL off=1 mem=00:AA:BB:CC:00:00
+SWL off=2 mem=00:00:AA:BB:00:00
+SWL off=3 mem=00:00:00:AA:00:00
+SWR off=0 mem=DD:00:00:00:00:00
+SWR off=1 mem=CC:DD:00:00:00:00
+SWR off=2 mem=BB:CC:DD:00:00:00
+SWR off=3 mem=AA:BB:CC:DD:00:00
+PAIRSTORE off=0 mem=44:22:33:44:00:00
+PAIRSTORE off=1 mem=33:44:22:33:00:00
+PAIRSTORE off=2 mem=22:33:44:22:00:00
+PAIRSTORE off=3 mem=11:22:33:44:00:00
+ULW off=0 init=0xAABBCCDD result=0x11223344
+ULW off=1 init=0xAABBCCDD result=0x22334455
+ULW off=2 init=0xAABBCCDD result=0x33445566
+ULW off=3 init=0xAABBCCDD result=0x44556677
+USW off=0 mem=AA:BB:CC:DD:00:00
+USW off=1 mem=00:AA:BB:CC:DD:00
+USW off=2 mem=00:00:AA:BB:CC:DD
+USW off=3 mem=00:00:00:AA:BB:CC
+LW off=1 value=UNSET signal=10
+LW off=2 value=UNSET signal=10
+LW off=3 value=UNSET signal=10
+SW off=1 mem=UNSET signal=10
+SW off=2 mem=UNSET signal=10
+SW off=3 mem=UNSET signal=10
+DONE
