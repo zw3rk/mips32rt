@@ -79,6 +79,10 @@ typedef struct dbt_cache {
     void       *last_code;
     uint32_t    last_smc;
     int         last_valid;
+    size_t      last_bi; /* block index for last_* (H3: O(1) metadata) */
+    uint32_t    smc_memo_page; /* H3: last page resolved by dbt_smc_version */
+    uint32_t    smc_memo_version;
+    int         smc_memo_valid;
 } dbt_cache_t;
 
 /* RC4 threads: one cache per host thread.  A shared cache would race
@@ -232,6 +236,8 @@ static void dbt_flush_all(void)
     dbt_cache->ras_top = 0;
     dbt_cache->pool_used = 0;
     dbt_cache->last_valid = 0;
+    dbt_cache->last_bi = 0;
+    dbt_cache->smc_memo_valid = 0;
 }
 
 static int dbt_cache_ensure(mips32_ctx_t *ctx)
@@ -262,17 +268,27 @@ static int dbt_cache_ensure(mips32_ctx_t *ctx)
 uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page)
 {
     size_t i;
+    uint32_t v = 1U;
 
     (void)ctx;
     if (dbt_cache == NULL) {
         return 1U;
     }
+    /* H3: hot loops re-query 1-2 pages per dispatch; memoize the last
+     * resolution instead of scanning all 1024 slots every time. */
+    if (dbt_cache->smc_memo_valid != 0 && dbt_cache->smc_memo_page == page) {
+        return dbt_cache->smc_memo_version;
+    }
     for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
         if (dbt_cache->smc[i].used != 0U && dbt_cache->smc[i].page == page) {
-            return dbt_cache->smc[i].version;
+            v = dbt_cache->smc[i].version;
+            break;
         }
     }
-    return 1U;
+    dbt_cache->smc_memo_page = page;
+    dbt_cache->smc_memo_version = v;
+    dbt_cache->smc_memo_valid = 1;
+    return v;
 }
 
 void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
@@ -290,6 +306,7 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
             if (dbt_cache->smc[i].version == 0U) {
                 dbt_cache->smc[i].version = 1U;
             }
+            dbt_cache->smc_memo_valid = 0;
             return;
         }
     }
@@ -298,18 +315,20 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
             dbt_cache->smc[i].page = page;
             dbt_cache->smc[i].version = 2U;
             dbt_cache->smc[i].used = 1U;
+            dbt_cache->smc_memo_valid = 0;
             return;
         }
     }
 }
 
-static void dbt_ibtc_fill(uint32_t pc, void *code, uint32_t smc)
+static void dbt_ibtc_fill(uint32_t pc, void *code, uint32_t smc, size_t bi)
 {
     uint32_t idx = dbt_ibtc_index(pc);
 
     dbt_cache->ibtc[idx].guest_pc = pc;
     dbt_cache->ibtc[idx].code = code;
     dbt_cache->ibtc[idx].smc_version = smc;
+    dbt_cache->ibtc[idx].blk_idx = bi;
 }
 
 /* Strong backend for the rt32 weak hook (SMC): bridge guest mm/cache
@@ -338,7 +357,7 @@ void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
     }
 }
 
-static void *dbt_pool_lookup(uint32_t pc, uint32_t smc)
+static void *dbt_pool_lookup(uint32_t pc, uint32_t smc, size_t *bip)
 {
     size_t i;
 
@@ -346,18 +365,25 @@ static void *dbt_pool_lookup(uint32_t pc, uint32_t smc)
         if (dbt_cache->blocks[i].guest_pc == pc &&
             dbt_cache->blocks[i].code != NULL &&
             dbt_cache->blocks[i].smc_version == smc) {
-            dbt_ibtc_fill(pc, dbt_cache->blocks[i].code, smc);
+            dbt_ibtc_fill(pc, dbt_cache->blocks[i].code, smc, i);
+            if (bip != NULL) {
+                *bip = i;
+            }
             return dbt_cache->blocks[i].code;
         }
     }
     return NULL;
 }
 
-void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
+/* Indexed lookup: same resolution as dbt_lookup, additionally reporting
+ * the block-cache index in *bip (H3: lets dbt_main skip its O(n) metadata
+ * rescan). Every path that publishes last_* also publishes last_bi. */
+static void *dbt_lookup_bi(mips32_ctx_t *ctx, uint32_t pc, size_t *bip)
 {
     uint32_t idx;
     dbt_ibtc_entry_t *e;
     uint32_t smc;
+    size_t bi = 0;
 
     if (ctx == NULL || dbt_cache == NULL || dbt_cache->ibtc == NULL) {
         return NULL;
@@ -366,13 +392,16 @@ void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
     /* Single-entry direct-chaining memo: repeated self-loop dispatch. */
     if (dbt_cache->last_valid != 0 && dbt_cache->last_pc == pc &&
         dbt_cache->last_smc == smc && dbt_cache->last_code != NULL) {
+        if (bip != NULL) {
+            *bip = dbt_cache->last_bi;
+        }
         return dbt_cache->last_code;
     }
     /* RAS fast path: a return to the recorded guest address pops the top. */
     if (dbt_cache->ras_top > 0) {
         dbt_ras_entry_t *r = &dbt_cache->ras[dbt_cache->ras_top - 1];
         if (r->guest_pc == pc && r->code != NULL && r->smc_version == smc) {
-            void *code = dbt_pool_lookup(pc, smc);
+            void *code = dbt_pool_lookup(pc, smc, &bi);
 
             dbt_cache->ras_top--;
             if (code != NULL) {
@@ -380,6 +409,10 @@ void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
                 dbt_cache->last_code = code;
                 dbt_cache->last_smc = smc;
                 dbt_cache->last_valid = 1;
+                dbt_cache->last_bi = bi;
+                if (bip != NULL) {
+                    *bip = bi;
+                }
                 return code;
             }
         }
@@ -392,9 +425,18 @@ void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
         dbt_cache->last_code = e->code;
         dbt_cache->last_smc = smc;
         dbt_cache->last_valid = 1;
+        dbt_cache->last_bi = e->blk_idx;
+        if (bip != NULL) {
+            *bip = e->blk_idx;
+        }
         return e->code;
     }
-    return dbt_pool_lookup(pc, smc);
+    return dbt_pool_lookup(pc, smc, bip);
+}
+
+void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
+{
+    return dbt_lookup_bi(ctx, pc, NULL);
 }
 
 static void dbt_ras_push(uint32_t pc)
@@ -408,7 +450,7 @@ static void dbt_ras_push(uint32_t pc)
         dbt_cache->ras_top = MIPS32_RAS_SIZE - 1U;
     }
     smc = dbt_smc_version(NULL, mips32_page_down(pc));
-    code = dbt_pool_lookup(pc, smc);
+    code = dbt_pool_lookup(pc, smc, NULL);
     dbt_cache->ras[dbt_cache->ras_top].guest_pc = pc;
     dbt_cache->ras[dbt_cache->ras_top].code = code;
     dbt_cache->ras[dbt_cache->ras_top].smc_version = smc;
@@ -565,8 +607,8 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     b->code_len = out_len;
     b->smc_version = smc;
     dbt_cache->block_link[dbt_cache->block_count] = (uint8_t)link;
+    dbt_ibtc_fill(pc, code, smc, dbt_cache->block_count);
     dbt_cache->block_count++;
-    dbt_ibtc_fill(pc, code, smc);
     ctx->blocks_compiled++;
     return 0;
 }
@@ -636,14 +678,13 @@ int dbt_main(mips32_ctx_t *ctx)
         int have_b = 0;
         void *code = NULL;
         uint32_t reason = MIPS32_EXIT_NONE;
-        size_t i = 0;
 
         if (ctx->exit_reason != MIPS32_EXIT_NONE) {
             (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
                 ctx->exit_reason, ctx->exit_info);
             return 1;
         }
-        code = dbt_lookup(ctx, pc);
+        code = dbt_lookup_bi(ctx, pc, &bi);
         if (code == NULL) {
             int cr = dbt_compile(ctx, pc);
 
@@ -665,7 +706,7 @@ int dbt_main(mips32_ctx_t *ctx)
                 }
                 continue;
             }
-            code = dbt_lookup(ctx, pc);
+            code = dbt_lookup_bi(ctx, pc, &bi);
             if (code == NULL) {
                 if (dbt_step_fallback(ctx) != 0) {
                     return 1;
@@ -673,14 +714,13 @@ int dbt_main(mips32_ctx_t *ctx)
                 continue;
             }
         }
-        for (i = 0; i < dbt_cache->block_count; i++) {
-            if (dbt_cache->blocks[i].guest_pc == pc &&
-                dbt_cache->blocks[i].code == code) {
-                b = &dbt_cache->blocks[i];
-                bi = i;
-                have_b = 1;
-                break;
-            }
+        /* H3: the lookup carries the block index; validate it instead
+         * of rescanning the whole cache per dispatch. */
+        if (bi < dbt_cache->block_count &&
+            dbt_cache->blocks[bi].guest_pc == pc &&
+            dbt_cache->blocks[bi].code == code) {
+            b = &dbt_cache->blocks[bi];
+            have_b = 1;
         }
         /* RC4: run the block under the host-fault guard, which owns
          * both the checkpoint frame and the trampoline call (the

@@ -37,6 +37,7 @@ typedef struct dbt_ibtc_entry {
     uint32_t guest_pc;
     void    *code;
     uint32_t smc_version;
+    size_t   blk_idx; /* index into dbt_cache.blocks (H3: O(1) metadata) */
 } dbt_ibtc_entry_t;
 
 /* One RAS slot: guest return PC with its resolved code, if any. */
