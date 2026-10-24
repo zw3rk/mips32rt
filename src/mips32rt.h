@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "a32host.h" /* vendored, byte-identical to i686rt/a32rt (D14) */
 
@@ -70,7 +71,7 @@
 /* Architectural limits, page/window constants (SPEC 1.1, 1.2). */
 #define MIPS32_MAX_REGIONS   512U
 #define MIPS32_RAS_SIZE      64U
-#define MIPS32_IBTC_SIZE     1024U
+#define MIPS32_IBTC_SIZE     4096U
 #define MIPS32_PAGE_SIZE     4096U
 #define MIPS32_TASK_SIZE_TOP 0x7FFF8000U /* O32 useg compat limit (SPEC 1.1) */
 #define MIPS32_STACK_TOP     0x7FFF0000U /* initial stack top (SPEC 1.1) */
@@ -318,5 +319,37 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr);
 
 /* Minimal O32 syscall dispatcher (src/os/syscall_min.c, lane L1c). */
 int32_t mips_syscall(mips32_ctx_t *ctx);
+
+/*
+ * ---- Phase 2 frozen DBT contracts (dispatcher/cache L2b, emitter L2c)
+ *
+ * Guest->host GPR map (SPEC 2.1): w0..w15 cache $v0 ($2), $v1 ($3),
+ * $a0..$a3 ($4..$7), $t0..$t5 ($8..$13), $s0 ($16), $s1 ($17), $sp ($29),
+ * $ra ($31); x19=xCtx, x20=xG (guest_base), x21..x24 scratch.  x18 is
+ * never touched.  $0 reads as zero (wzr); all other guest GPRs spill to
+ * [x19, #off].  Blocks end at control transfers or 4 KiB page crossings
+ * (SPEC 2.2: branch+delay slot emitted as one unit; EXIT_SINGLE_STEP
+ * fallback for a block starting at (pc & 0xfff) == 0xffc).
+ */
+#define MIPS32_DBT_MAX_INSNS 64U
+
+typedef struct dbt_block {
+    uint32_t guest_pc;    /* block entry guest VA */
+    uint32_t guest_end;   /* first VA past the block (delay slot included) */
+    void    *code;        /* host RX entry, NULL until published */
+    size_t   code_len;    /* host bytes */
+    uint32_t smc_version; /* page-version cookie captured at compile time */
+} dbt_block_t;
+
+/* Direct block chaining + 4096-entry IBTC + RAS (src/dbt/dbt.c, L2b). */
+void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc);
+int   dbt_compile(mips32_ctx_t *ctx, uint32_t pc);
+/* Integer emitter (src/dbt/emit_int.c, L2c): pure function of decoded
+ * insns (decoded by the dispatcher via mips_decode) into out[0..cap). */
+int   dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
+                   unsigned count, uint8_t *out, size_t cap,
+                   size_t *out_len, uint32_t *out_end);
+/* Exit-state dump for the RC2 difftest (src/main.c; both engines share it). */
+void  mips_dump_regs(const mips32_ctx_t *ctx, FILE *out);
 
 #endif /* MIPS32RT_H */

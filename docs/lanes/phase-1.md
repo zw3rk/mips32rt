@@ -108,3 +108,37 @@ endiannesses). O32 syscall convention per SPEC 2.3 (stack args at
   ```sh
   sh tests/run_p1_isa.sh && test -s tests/p1_golden_le.txt
   ```
+
+---
+
+## RC1 outcome (coordinator integration, commit `ae18036`)
+
+`tests/rc1_interp_check.sh` is the durable gate: rebuilds the translator,
+builds LE+BE guests, runs them under `--interp`, and requires exit 0,
+`P1-RESULT: PASS`, zero `FAIL` lines, and every golden `PASS` line present
+except the documented set below (verified on both endians; container
+cleaned afterwards).
+
+- **47/47 non-signal checks PASS byte-identically** to the qemu goldens on
+  LE and BE (ALU/shifts/mult-div/all branches + likely annul/annul-trio/
+  jumps/LL-SC/unlaligned/RDHWR/raw-write), exit code 0.
+- **5 documented SKIPs** (test prints `SKIP`, added by the coordinator so
+  the suite runs to completion without signal/fork support):
+  `P1 signals` (sigaltstack/sigaction ENOSYS), `beql-pageend` x2,
+  `delayslot-sigpc`, `unaligned-child` (fork ENOSYS).
+- The not-taken `beql-pageend` golden (`sig=11`) encodes qemu's
+  translate-time over-fetch; SPEC 2.2 mandates architectural annulment
+  (no fetch/fault of `pc+4`), so that line can never match by design and
+  stays a documented divergence even after Phase-4 signal delivery.
+  Handler-dependent lines become live again in Phase 4.
+
+Coordinator integration fixes committed at RC1: `interp_main` wiring +
+`rt32_vm_sync_ctx` after load (startup segfault: ctx region mirror was
+empty), `exec_syscall` no longer faults on nonzero guest results
+(brk addresses), `set_thread_area` (4283) for glibc TLS, RDHWR selector
+field (`rd`, not `rs`), COP1 data-movement subset
+(`src/interp/fpmove.c`: LWC1/SWC1/LDC1/SDC1/MFC1/MTC1/CFC1/CTC1, no
+arithmetic), interp split (`unaligned.c`, `--trace` step/fault lines),
+BE stack word order (`stack32.c`), musl `__domainname`, `_build` mkdir.
+`make check` (69 ABI + decode self-test) and `check-line-limits` green;
+`_build/mips32rt` static-PIE cross build green.

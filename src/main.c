@@ -249,7 +249,30 @@ static int run_guest(mips32_ctx_t *ctx)
     } else {
         r = interp_main(ctx);
     }
+    /* RC2 difftest hook: deterministic exit-state dump (stderr keeps it
+     * separate from guest stdout).  Set MIPS32RT_DUMPSTATE=1. */
+    if (getenv("MIPS32RT_DUMPSTATE") != NULL) {
+        mips_dump_regs(ctx, stderr);
+    }
     return r;
+}
+
+/* Shared exit-state dump for the RC2 difftest harness (both engines). */
+void mips_dump_regs(const mips32_ctx_t *ctx, FILE *out)
+{
+    unsigned i;
+
+    if (ctx == NULL || out == NULL) {
+        return;
+    }
+    (void)fprintf(out, "REGS pc=%08x next=%08x hi=%08x lo=%08x ulr=%08x fcsr=%08x\n",
+                  ctx->pc, ctx->next_pc, ctx->hi, ctx->lo, ctx->ulr, ctx->fcsr);
+    for (i = 0u; i < 32u; i += 4u) {
+        (void)fprintf(out, "GPR r%02u=%08x r%02u=%08x r%02u=%08x r%02u=%08x\n", i,
+                      ctx->gpr[i], i + 1u, ctx->gpr[i + 1u], i + 2u,
+                      ctx->gpr[i + 2u], i + 3u, ctx->gpr[i + 3u]);
+    }
+    (void)fprintf(out, "EXIT reason=%u info=%08x\n", ctx->exit_reason, ctx->exit_info);
 }
 
 int main(int argc, char **argv)
