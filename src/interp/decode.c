@@ -12,6 +12,8 @@
 
 #include "interp/decode.h"
 
+#include <sys/mman.h>
+
 void mips_decode(uint32_t word, mips_dec_t *d)
 {
     uint16_t imm;
@@ -49,12 +51,24 @@ int __attribute__((weak)) guest_ld32(mips32_ctx_t *ctx, uint32_t va,
     return MIPS_FAULT;
 }
 
+/* Range check lives in src/os/syscalls.c (declared in
+ * src/os/syscalls_priv.h); interp/ never includes os-private headers,
+ * so declare it here like the guest_ld32 fallback above. */
+extern int mips_sc_range_ok(const mips32_ctx_t *ctx, uint32_t va,
+    uint32_t len, uint32_t need);
+
 int mips_fetch(mips32_ctx_t *ctx, uint32_t pc, uint32_t *word)
 {
     if (ctx == NULL || word == NULL) {
         return MIPS_FAULT;
     }
     if ((pc & 3U) != 0U) {
+        return MIPS_FAULT;
+    }
+    /* W^X: the host never executes guest bytes, but executing from a
+     * non-executable guest page must still fault (PROT_EXEC required;
+     * PROT_NONE and RW pages trap here, reported as ACCERR). */
+    if (!mips_sc_range_ok(ctx, pc, 4U, (uint32_t)PROT_EXEC)) {
         return MIPS_FAULT;
     }
     return guest_ld32(ctx, pc, word);

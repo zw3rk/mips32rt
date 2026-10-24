@@ -497,13 +497,49 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
     return 0;
 }
 
+/* True when [va, va+len) is covered by recorded regions regardless of
+ * permissions (present but possibly PROT_NONE). */
+static int l4a_range_mapped(const mips32_ctx_t *ctx, uint32_t va,
+    uint32_t len)
+{
+    uint64_t end64;
+    uint32_t cur;
+    size_t i;
+
+    if (ctx == NULL || len == 0U) {
+        return 0;
+    }
+    end64 = (uint64_t)va + (uint64_t)len;
+    if (end64 > 0x100000000ULL) {
+        return 0;
+    }
+    cur = va;
+    for (i = 0; i < ctx->region_count; i++) {
+        const mips32_region_t *r = &ctx->regions[i];
+
+        if (r->start > cur) {
+            return 0; /* Sorted gap: nothing later can cover cur. */
+        }
+        if (r->end <= cur) {
+            continue;
+        }
+        cur = r->end;
+        if ((uint64_t)cur >= end64) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int32_t l4a_fault_code(int signo, uint32_t fault_addr,
     const mips32_ctx_t *ctx)
 {
     if (signo == (int)L4A_SIGSEGV) {
-        if (!l4a_range_ok(ctx, fault_addr, 1U, (uint32_t)PROT_READ)) {
+        if (!l4a_range_mapped(ctx, fault_addr, 1U)) {
             return L4A_SEGV_MAPERR;
         }
+        /* Present page without the needed permission (e.g. PROT_NONE
+         * or a write to a read-only page) is ACCERR, never MAPERR. */
         return L4A_SEGV_ACCERR;
     }
     if (signo == (int)L4A_SIGBUS) {
@@ -735,7 +771,7 @@ static int l4a_on_altstack(const mips32_ctx_t *ctx)
            sp < ctx->sigalt_sp + ctx->sigalt_size;
 }
 
-/* sigaltstack(ss, oss): O32 stack_t is 12 bytes {sp, flags, size}. */
+/* sigaltstack(ss, oss): O32 stack_t is 12 bytes {sp, size, flags}. */
 int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
 {
     int ok = 1;
@@ -762,9 +798,11 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
                  ctx->sigalt_size == 0U)
                     ? L4A_SS_DISABLE
                     : (l4a_on_altstack(ctx) ? L4A_SS_ONSTACK : 0U);
+        /* MIPS O32 stack_t is {sp, size, flags}, unlike the generic
+         * {sp, flags, size} order (asm/signal.h overrides asm-generic). */
         l4a_put32(ctx, oss_va, ctx->sigalt_sp, be);
-        l4a_put32(ctx, oss_va + 4U, flags, be);
-        l4a_put32(ctx, oss_va + 8U, ctx->sigalt_size, be);
+        l4a_put32(ctx, oss_va + 4U, ctx->sigalt_size, be);
+        l4a_put32(ctx, oss_va + 8U, flags, be);
     }
     if (ss_va != 0U) {
         uint32_t nsp;
@@ -775,8 +813,8 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
             return l4a_ret(ctx, -L4A_EFAULT);
         }
         nsp = l4a_get32(ctx, ss_va, be);
-        nflags = l4a_get32(ctx, ss_va + 4U, be);
-        nsize = l4a_get32(ctx, ss_va + 8U, be);
+        nsize = l4a_get32(ctx, ss_va + 4U, be);
+        nflags = l4a_get32(ctx, ss_va + 8U, be);
         if (nflags != L4A_SS_DISABLE && nflags != 0U &&
             nflags != L4A_SS_ONSTACK) {
             return l4a_ret(ctx, -L4A_EINVAL);

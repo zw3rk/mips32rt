@@ -347,10 +347,11 @@ static void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
 }
 
 /* Merge an operation's exception bits (FPSR IOC/DZC/OFC/UFC/IXC in the
- * low 5 bits of wfpsr5) into FCSR (W21): Cause[16:12] is replaced, E is
- * set when an enabled exception occurred, Flags[6:2] accumulate.  An
- * enabled exception stores FCSR and exits EXIT_TRAP at cur (Flags left
- * untouched); otherwise Flags are updated and emission continues.
+ * low 5 bits of wfpsr5) into FCSR (W21): Cause+E[17:12] are replaced
+ * (cleared then set), E is set when an enabled exception occurred,
+ * Flags[6:2] accumulate.  An enabled exception stores FCSR and exits
+ * EXIT_TRAP at cur (Flags left untouched); otherwise Flags are updated
+ * and emission continues.
  * RBIT maps bit k to bit 31-k, so LSR 15 lands V..I on Cause 16..12
  * and LSR 25 on Flags 6..2. */
 static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
@@ -364,12 +365,13 @@ static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
                          NULL);
     a64_emit_shift_imm_w(b, A64_TMP2, 22U, A64_SHIFT_LSR, 25U, false,
                          NULL);
-    a64_emit_mov_imm32(b, 22U, FP_FCSR_CAUSE_MASK);
+    a64_emit_mov_imm32(b, 22U, FP_FCSR_CAUSE_MASK | FP_FCSR_E_BIT);
     a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, 22U, A64_SHIFT_LSL,
                        0U);
     a64_emit_mov_imm32(b, 22U, 0x7CU);
     a64_emit_and_reg_w(b, false, A64_TMP2, A64_TMP2, 22U, A64_SHIFT_LSL,
                        0U);
+    a64_emit_mov_imm32(b, 22U, FP_FCSR_CAUSE_MASK | FP_FCSR_E_BIT);
     a64_emit_bic_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, 21U, 21U, A64_TMP1, A64_SHIFT_LSL, 0U);
     a64_emit_ubfm_w(b, 22U, 21U, FP_FCSR_ENABLE_SHIFT,
@@ -504,7 +506,25 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_fpcr_restore(b);
     a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
     if (nan2008 == 0) {
+        size_t ph_can;
+
         fp_fix(b, 2U, ptype);
+        /* Legacy sNaN arithmetic delivers the canonical Legacy QNaN
+         * (S 0x7fbfffff, D 0x7ff7ffffffffffff, matching qemu for partial
+         * double payloads); W15 nonzero records an sNaN input. */
+        ph_can = a64_emit_cbz_w_placeholder(b, false, 15U);
+        if (ptype == 0u) {
+            a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
+            a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
+        } else {
+            a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
+            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
+            a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
+            a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+            a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+            fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
+        }
+        a64_patch_cbz_w(b, ph_can, b->count);
     }
     fp_st(b, 2U, fd, be, ptype);
     fp_finish(b, 22U, cur);
@@ -693,7 +713,22 @@ static int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_fpsr_read(b, 22U);
     a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
     if (nan2008 == 0) {
+        size_t ph_can;
+
         fp_fix(b, 2U, is_d);
+        ph_can = a64_emit_cbz_w_placeholder(b, false, 15U);
+        if (is_d == 0u) {
+            a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
+            a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
+        } else {
+            a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
+            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
+            a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
+            a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+            a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+            fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
+        }
+        a64_patch_cbz_w(b, ph_can, b->count);
     }
     fp_st(b, 2U, fd, be, is_d);
     fp_finish(b, 22U, cur);

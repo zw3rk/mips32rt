@@ -68,7 +68,6 @@
 typedef struct dbt_cache {
     dbt_block_t blocks[DBT_MAX_BLOCKS];
     uint8_t     block_link[DBT_MAX_BLOCKS];
-    uint8_t     block_likely[DBT_MAX_BLOCKS];
     size_t      block_count;
     dbt_ibtc_entry_t *ibtc;
     dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
@@ -222,7 +221,6 @@ static void dbt_flush_all(void)
         dbt_cache->blocks[i].code = NULL;
         dbt_cache->blocks[i].code_len = 0;
         dbt_cache->block_link[i] = 0;
-        dbt_cache->block_likely[i] = 0;
     }
     for (i = 0; i < MIPS32_IBTC_SIZE; i++) {
         dbt_cache->ibtc[i].code = NULL;
@@ -440,7 +438,6 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     uint32_t cur = pc;
     unsigned count = 0;
     unsigned link = 0;
-    unsigned likely = 0;
     uint32_t end = pc;
     uint32_t word = 0;
     uint32_t smc = 0;
@@ -501,7 +498,6 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
             }
             mips_decode(word, &insns[count + 1]);
             link = (unsigned)dbt_is_link(d);
-            likely = (unsigned)dbt_is_likely(d);
             count += 2U;
             end = cur + 8U;
             break;
@@ -543,7 +539,6 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     b->code_len = out_len;
     b->smc_version = smc;
     dbt_cache->block_link[dbt_cache->block_count] = (uint8_t)link;
-    dbt_cache->block_likely[dbt_cache->block_count] = (uint8_t)likely;
     dbt_cache->block_count++;
     dbt_ibtc_fill(pc, code, smc);
     ctx->blocks_compiled++;
@@ -553,13 +548,12 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
 /*
  * Trace replay for --trace/--difftest parity: re-fetch the words in
  * [start, end) and print the same "I %08x %08x" lines the interpreter
- * prints at fetch time. Branch-likely annul is reconstructed exactly:
- * when the block ends with a likely branch whose target is pc == slot
- * address (branch + 8), the slot line is skipped. On fault exits the
- * replay stops at the faulting word when it lies inside the block.
+ * prints at fetch time (the interpreter fetches an annulled likely
+ * delay slot too, so the slot line is always replayed when mapped).
+ * On fault exits the replay stops at the faulting word when it lies
+ * inside the block.
  */
-static void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b,
-    unsigned likely)
+static void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b)
 {
     uint32_t start = b->guest_pc;
     uint32_t end = b->guest_end;
@@ -577,11 +571,6 @@ static void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b,
             break;
         }
         (void)fprintf(stderr, "I %08x %08x\n", p, word);
-        /* Annulled slot: the trailing likely branch fell through to the
-         * slot address (branch pc + 8) without executing it. */
-        if (likely != 0U && p + 8U == end && ctx->pc == p + 8U) {
-            return;
-        }
     }
 }
 
@@ -677,7 +666,7 @@ int dbt_main(mips32_ctx_t *ctx)
         }
         ctx->blocks_executed++;
         if (have_b != 0 && ctx->trace_enabled) {
-            dbt_trace_block(ctx, b, dbt_cache->block_likely[bi]);
+            dbt_trace_block(ctx, b);
         }
         switch (reason) {
         case MIPS32_EXIT_NONE:
@@ -710,16 +699,16 @@ int dbt_main(mips32_ctx_t *ctx)
         case MIPS32_EXIT_FAULT: {
             /* RC4: inline alignment/mapping exits carry the data address
              * in exit_info; deliver like the mem layer (AdEL/AdES bus
-             * when misaligned, segv otherwise) and resume, else stop. */
+             * when misaligned, segv otherwise) and resume.  An
+             * undeliverable fault must die by signal (mips_trap),
+             * matching interp -- never stop quietly with rc 1. */
             int signo = ((ctx->exit_info & 3U) != 0U) ? 10 : 11;
 
-            if (mips_signal_has_handler(signo) &&
-                mips_raise_guest(ctx, signo, ctx->exit_info) == 0) {
-                continue;
+            mips_trap(ctx, signo, ctx->exit_info);
+            if (ctx->exit_reason != MIPS32_EXIT_NONE) {
+                return 1;
             }
-            (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
-                ctx->exit_reason, ctx->exit_info);
-            return 1;
+            continue;
         }
         default:
             (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",

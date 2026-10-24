@@ -122,6 +122,16 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x00u: /* SLL */
         interp_set_reg(ctx, d->rd, rt << (d->sa & 31u));
         return 0;
+    case 0x01u: { /* MOVCI: MOVF/MOVT on FCSR cc=(rt>>2)&7, tf=rt&1 */
+        unsigned cc = ((unsigned)d->rt >> 2u) & 7u;
+        unsigned tf = (unsigned)d->rt & 1u;
+        int cond = (((ctx->fcsr & fp_fcc_mask(cc)) != 0u) == (tf != 0u));
+
+        if (cond) {
+            interp_set_reg(ctx, d->rd, rs);
+        }
+        return 0;
+    }
     case 0x02u: /* SRL / ROR (rs == 1 selects ROR) */
         if (d->rs == 1u) {
             interp_set_reg(ctx, d->rd, rot_right(rt, d->sa));
@@ -733,6 +743,17 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
         interp_set_reg(ctx, link_rd, pc + 8u);
     }
     if (likely && !taken) {
+        /* The annulled slot is not executed, but its word is still
+         * fetched: like qemu (translate-time fetch) and real hardware
+         * (sequential IF fetch), a fault there reports branch_pc = pc. */
+        mips_dec_t s;
+        ctx->in_delay_slot = 1;
+        ctx->pc = pc + 4u;
+        if (fetch_decode(ctx, pc + 4u, &s) != 0) {
+            return MIPS_FAULT;
+        }
+        (void)s;
+        ctx->in_delay_slot = 0;
         ctx->pc = pc + 8u;
         ctx->next_pc = pc + 12u;
         return 0;

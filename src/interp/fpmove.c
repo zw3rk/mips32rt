@@ -74,6 +74,21 @@ int fpmove_mem(mips32_ctx_t *ctx, const mips_dec_t *d)
     if (fs >= 32u) {
         return MIPS_FAULT;
     }
+    /* MIPS32r2 AdEL/AdES: LWC1/SWC1 require word alignment, LDC1/SDC1
+     * require doubleword alignment (verified against qemu-mipsel/qemu-mips
+     * via test_p3_fpu unaligned-lwc1: SIGBUS sig=10 AdEL). */
+    if ((d->op == 0x31u || d->op == 0x39u)) {
+        if ((addr & 3u) != 0u) {
+            mips_fault(ctx, addr);
+            return MIPS_FAULT;
+        }
+    }
+    if ((d->op == 0x35u || d->op == 0x3Du)) {
+        if ((addr & 7u) != 0u) {
+            mips_fault(ctx, addr);
+            return MIPS_FAULT;
+        }
+    }
     switch (d->op) {
     case 0x31u: { /* LWC1: low 32 bits, upper lane preserved (FR-agnostic) */
         uint8_t m[4];

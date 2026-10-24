@@ -48,14 +48,13 @@ static void fp_raise(struct fp_st *s, unsigned e)
         s->trap = 1;
 }
 
-/* Commit causes/flags. Trap-enabled: Cause sticks, Flags do not (E03:
- * post-trap FCSR keeps Cause.V with no Flags.V), dest unwritten.
- * RC4: a trap-enabled Invalid operation is a synchronous SIGFPE
- * delivered (or fatal) via mips_trap, never a SEGV-class fault. */
+/* Cause+E (17:12) replaced per-insn, Flags (6:2) accumulate. */
 static int fp_commit(struct fp_st *s)
 {
+    s->ctx->fcsr &= ~0x3F000u;
     s->ctx->fcsr |= s->cause;
     if (s->trap) {
+        s->ctx->fcsr |= (1u << 17);
         mips_trap(s->ctx, 8, s->pc);
         return MIPS_FAULT;
     }
@@ -135,9 +134,7 @@ static uint64_t fp_full(unsigned f, const fpv_t *v)
     return v->frac;
 }
 
-/* Binary-op NaN handling (E03 propagation): an sNaN operand raises
- * Invalid and delivers the first sNaN quieted in-mode; otherwise the
- * first quiet NaN passes through bit-identical with no flags. */
+/* sNaN: Invalid + Legacy canonical QNaN, 2008 quieted w/ payload. */
 static int fp_nan2(struct fp_st *s, unsigned f, const fpv_t *a,
                    const fpv_t *b, uint64_t *out)
 {
@@ -150,7 +147,10 @@ static int fp_nan2(struct fp_st *s, unsigned f, const fpv_t *a,
         sn = b;
     if (sn != 0) {
         fp_raise(s, FP_E_V);
-        *out = fp_quiet(f, sn->raw, s->ctx->nan2008);
+        if (s->ctx->nan2008 == 0)
+            *out = fp_default_nan(f, 0);
+        else
+            *out = fp_quiet(f, sn->raw, 1);
     } else {
         *out = (a->cls == FP_NAN) ? a->raw : b->raw;
     }
@@ -738,17 +738,18 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
     case 2u: v = fp_mul(&s, f, ctx->fpr[fs], ctx->fpr[ft]); break;
     case 3u: v = fp_div(&s, f, ctx->fpr[fs], ctx->fpr[ft]); break;
     case 4u: v = fp_sqrt(&s, f, ctx->fpr[fs]); break;
-    case 5u: /* ABS: non-arithmetic sign clear (E03: never signals). */
-        return (f == 0u) ?
-            fp_write_s(&s, fd, (uint32_t)ctx->fpr[fs] & 0x7FFFFFFFu) :
-            fp_write_d(&s, fd, ctx->fpr[fs] & 0x7FFFFFFFFFFFFFFFULL);
-    case 6u: /* MOV: bit copy (S: low 32, upper lane preserved). */
-        return (f == 0u) ? fp_write_s(&s, fd, (uint32_t)ctx->fpr[fs]) :
-                           fp_write_d(&s, fd, ctx->fpr[fs]);
-    case 7u: /* NEG: non-arithmetic sign flip (E03: never signals). */
-        return (f == 0u) ?
-            fp_write_s(&s, fd, (uint32_t)ctx->fpr[fs] ^ 0x80000000u) :
-            fp_write_d(&s, fd, ctx->fpr[fs] ^ 0x8000000000000000ULL);
+    case 5u: /* ABS/NEG/MOV: no FCSR update, bypass commit. */
+        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | ((uint32_t)ctx->fpr[fs] & 0x7FFFFFFFu);
+        else ctx->fpr[fd] = ctx->fpr[fs] & 0x7FFFFFFFFFFFFFFFULL;
+        return 0;
+    case 6u:
+        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | (uint32_t)ctx->fpr[fs];
+        else ctx->fpr[fd] = ctx->fpr[fs];
+        return 0;
+    case 7u:
+        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | ((uint32_t)ctx->fpr[fs] ^ 0x80000000u);
+        else ctx->fpr[fd] = ctx->fpr[fs] ^ 0x8000000000000000ULL;
+        return 0;
     case 8u: case 9u: case 10u: case 11u: /* ROUND/TRUNC/CEIL/FLOOR.L */
         if (fp_to_int(&s, f, ctx->fpr[fs], 64, (int)(func - 8u), 1, &v) != 0)
             v = 0x7FFFFFFFFFFFFFFFULL;

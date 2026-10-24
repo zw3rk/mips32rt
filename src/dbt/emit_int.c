@@ -1,22 +1,13 @@
 /*
- * src/dbt/emit_int.c -- AArch64 integer instruction emitter (Phase 2, L2c).
- *
+ * src/dbt/emit_int.c -- AArch64 integer emitter (Phase 2, L2c).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Frozen dbt_emit_int via a64_emit.h: ALU/shifts/MULT/DIV, hi/lo, EXT/INS/
- * BSHFL, RDHWR ulr, branches + likely-annul (slot inline, ra = pc + 8),
- * mem incl. E05 unaligned + LDXR/STXR LL/SC, CACHE/PREF/SYNC NOPs; COP1/
- * COP2/fp-mem/unknown exit EXIT_UNDEF. SPEC 2.1 GPRs in w0..w15, x19 =
- * xCtx, x20 = xG, x18 untouched; exits flush, advance pc, set w0/w1, ret.
  */
-
 #include <stddef.h>
 #include <stdint.h>
 #include "mips32rt.h"
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
-
 /* Cached guest GPR -> host W register (SPEC 2.1 order). */
 static const int8_t kGprHost[32] = {
     -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
@@ -25,9 +16,7 @@ static const int8_t kGprHost[32] = {
 static const uint8_t kCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
-
 static int gpr_host(unsigned g) { return (g < 32U) ? (int)kGprHost[g] : -1; }
-
 /* Guest GPR value into a host register (cached host, wzr, or tmp load). */
 static unsigned op_val(a64_buf_t *b, unsigned g, unsigned tmp)
 {
@@ -394,6 +383,16 @@ static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         old = op_val(b, d->rd, A64_TMP2);
         a64_emit_csel_w(b, A64_TMP1, rsr, old, cond);
         put_rd(b, d->rd, A64_TMP1);
+        return 0;
+    }
+    case 0x01u: { /* MOVCI cc=(rt>>2)&7 tf=rt&1 */
+        unsigned cc = ((unsigned)d->rt >> 2u) & 7u, fcc = (cc == 0u) ? 23u : 24u + cc, rsr = op_val(b, d->rs, A64_TMP1), old;
+        int h = 0;
+        if (d->rd == MIPS32_REG_ZERO) return 0;
+        a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_FCSR_OFFSET); a64_emit_ubfm_w(b, A64_TMP2, A64_TMP2, fcc, fcc);
+        a64_emit_mov_imm32(b, A64_TMP3, (unsigned)d->rt & 1u); a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP3, A64_SHIFT_LSL, 0u);
+        h = gpr_host(d->rd); if (h >= 0) { a64_emit_csel_w(b, (unsigned)h, rsr, (unsigned)h, A64_COND_EQ); return 0; }
+        old = op_val(b, d->rd, A64_TMP3); a64_emit_csel_w(b, A64_TMP1, rsr, old, A64_COND_EQ); put_rd(b, d->rd, A64_TMP1);
         return 0;
     }
     case MIPS_FUNCT_SYSCALL:
