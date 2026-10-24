@@ -143,7 +143,15 @@ int mips_hostfault_run(mips32_ctx_t *ctx, void *code, uint32_t *reasonp)
 {
     hf_ctx = ctx;
     hf_armed = 1;
-    if (sigsetjmp(hf_jb, 1) != 0) {
+    /* H3: savemask=0. The checkpoint used to save the signal mask here,
+     * costing one rt_sigprocmask syscall per dispatched block (the top
+     * syscall in CoreMark profiles). The mask is invariant across the
+     * armed window -- this handler is installed with SA_NODEFER and an
+     * empty sa_mask so delivery never alters it, and neither the
+     * trampoline nor emitted code issues mask-changing calls -- so
+     * there is nothing to save or restore; the longjmp revival observes
+     * the same mask either way. */
+    if (sigsetjmp(hf_jb, 0) != 0) {
         /* Recovered from a host fault inside emitted code.  The ctx
          * parameter is NOT reliable here: longjmp restores machine
          * state to checkpoint time, and the compiler may hold the
