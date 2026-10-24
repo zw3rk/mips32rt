@@ -104,6 +104,9 @@
 /* Thread pointer (SPEC 2.2: sets ctx->ulr) */
 #define MIPS32_NR_set_thread_area 4283 /* o32 index 283: sys_set_thread_area */
 
+/* Cache maintenance (Phase 7 SMC: invalidate translated blocks) */
+#define MIPS32_NR_cacheflush 4225 /* o32 index 225: sys_cacheflush */
+
 /* Process wait (Phase 4 fork/exec/wait4) */
 #define MIPS32_NR_waitpid 4007 /* o32 index 7:   sys_waitpid */
 #define MIPS32_NR_wait4 4114 /* o32 index 114: sys_wait4 */

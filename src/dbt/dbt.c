@@ -312,6 +312,32 @@ static void dbt_ibtc_fill(uint32_t pc, void *code, uint32_t smc)
     dbt_cache->ibtc[idx].smc_version = smc;
 }
 
+/* Strong backend for the rt32 weak hook (SMC): bridge guest mm/cache
+ * maintenance onto per-page translation versions. Wide ranges fall back
+ * to a full flush instead of a long per-page walk. */
+void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
+                                 uint32_t end)
+{
+    uint64_t span;
+    uint32_t page;
+
+    if (ctx == NULL || dbt_cache == NULL || end <= start) {
+        if (ctx != NULL && dbt_cache != NULL && end != start) {
+            dbt_flush_all();
+        }
+        return;
+    }
+    span = (uint64_t)end - (uint64_t)start;
+    if (span > (uint64_t)DBT_SMC_TABLE_SIZE * MIPS32_PAGE_SIZE) {
+        dbt_flush_all();
+        return;
+    }
+    for (page = mips32_page_down(start); page < end;
+         page += MIPS32_PAGE_SIZE) {
+        dbt_smc_bump(ctx, page);
+    }
+}
+
 static void *dbt_pool_lookup(uint32_t pc, uint32_t smc)
 {
     size_t i;

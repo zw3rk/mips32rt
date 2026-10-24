@@ -21,6 +21,13 @@
 
 static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d);
 
+/* Cross-lane hook (same weak-reference pattern as src/os/proc.c): the
+ * Phase 2 DBT provides mips32_dbt_invalidate_range; without it
+ * (interp-only link) SYNCI stays a pure NOP. */
+__attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
+                                                      uint32_t start,
+                                                      uint32_t end);
+
 static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
 {
     if (ctx->trace_enabled) {
@@ -420,8 +427,14 @@ static int exec_regimm_trap(mips32_ctx_t *ctx, uint32_t cur_pc,
     case 0x0Eu: /* TNEI */
         fire = (int32_t)rs != d->simm;
         break;
-    case 0x1Fu: /* SYNCI: cache maintenance hint, NOP here */
+    case 0x1Fu: { /* SYNCI: invalidate the line's page (Phase 7 SMC) */
+        uint32_t ea = ctx->gpr[d->rs] + (uint32_t)d->simm;
+
+        if (mips32_dbt_invalidate_range != NULL) {
+            mips32_dbt_invalidate_range(ctx, ea, ea + 1U);
+        }
         return 0;
+    }
     default:
         return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
