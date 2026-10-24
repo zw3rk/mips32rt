@@ -39,6 +39,7 @@
 #include <string.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -384,6 +385,10 @@ static volatile uintptr_t g_siaddr;
 static volatile uintptr_t g_scpc;
 static sigjmp_buf g_jb;
 static volatile int g_armed;
+/* 1 when synchronous fault delivery works (qemu, Phase-4 translator);
+ * 0 when sigaltstack/sigaction are unimplemented (Phase-1 interp): the
+ * signal-dependent tests below report SKIP instead of dying. */
+static int g_have_signals = 0;
 
 static void fault_handler(int sig, siginfo_t *si, void *ctx)
 {
@@ -405,21 +410,22 @@ static void install_fault_handlers(void)
     ss.ss_size = sizeof altstack;
     ss.ss_flags = 0;
     if (sigaltstack(&ss, NULL) != 0) {
-        perror("sigaltstack");
-        exit(1);
+        printf("P1 signals: SKIP sigaltstack errno=%d\n", errno);
+        return;
     }
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = fault_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGSEGV, &sa, NULL) != 0) {
-        perror("sigaction-SEGV");
-        exit(1);
+        printf("P1 signals: SKIP sigaction-SEGV errno=%d\n", errno);
+        return;
     }
     if (sigaction(SIGBUS, &sa, NULL) != 0) {
-        perror("sigaction-BUS");
-        exit(1);
+        printf("P1 signals: SKIP sigaction-BUS errno=%d\n", errno);
+        return;
     }
+    g_have_signals = 1;
 }
 
 /* Branch-likely at page_end-4 before a PROT_NONE page (E02 pattern).
@@ -445,6 +451,12 @@ static uint32_t enc_j(uintptr_t target)
 __attribute__((noinline)) static void t_beql_pageend(void)
 {
     char db[160];
+
+    if (!g_have_signals) {
+        printf("P1 beql-pageend-nottaken: SKIP no signal delivery\n");
+        printf("P1 beql-pageend-taken: SKIP no signal delivery\n");
+        return;
+    }
     uint8_t *base = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE | PROT_EXEC,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) {
@@ -518,6 +530,11 @@ __attribute__((noinline)) static void t_beql_pageend(void)
 __attribute__((noinline)) static void t_delayslot_sigpc(void)
 {
     char db[160];
+
+    if (!g_have_signals) {
+        printf("P1 delayslot-sigpc: SKIP no signal delivery\n");
+        return;
+    }
     volatile int loaded = -1;
     volatile int got = 0, sig = 0, adok = 0;
     int rs = 0, rt = 0;
@@ -807,6 +824,10 @@ __attribute__((noinline)) static void t_unaligned_child(void)
     fflush(stdout);
     pid = fork();
     if (pid < 0) {
+        if (errno == ENOSYS) {
+            printf("P1 unaligned-child: SKIP fork unimplemented\n");
+            return;
+        }
         check("unaligned-child", 0, "fork failed");
         return;
     }

@@ -26,9 +26,12 @@
 #include "rt32/rt32.h"
 
 #include <stddef.h>
+#include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 int guest_mem_init(mips32_ctx_t *ctx)
 {
@@ -86,6 +89,14 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
     ctx->llbit       = 0U; /* SPEC 2.2: any helper exit clears the LL bit */
     ctx->exit_reason = MIPS32_EXIT_FAULT;
     ctx->exit_info   = addr;
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x fault-addr %08x\n", ctx->pc, addr);
+    }
+    /* Phase-1 mechanism (no guest handlers exist yet): die by SIGSEGV like
+     * qemu-user for an unhandled fetch/AdE fault.  Phase 4 (L4a) replaces
+     * this with real guest signal delivery (rt_sigframe + handler). */
+    (void)raise(SIGSEGV);
+    _Exit(139);
 }
 
 int guest_ld8(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)

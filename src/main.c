@@ -24,12 +24,19 @@ extern char **environ;
 
 #define MIPS32RT_VERSION "0.0-phase0"
 
-/* Engine stubs: the real interp_main/dbt_main arrive in Phases 1 and 2. */
+/* Phase 1: the reference interpreter drives the guest to exit(2) or to a
+ * synchronous fault (which raises SIGSEGV, see mips_fault).  interp_run
+ * returns only if an engine-level stop reason was recorded. */
 int interp_main(mips32_ctx_t *ctx)
 {
-    (void)ctx;
-    (void)fprintf(stderr, "mips32rt: interpreter not yet implemented (Phase 1)\n");
-    return 2;
+    int rc = interp_run(ctx);
+
+    if (rc != 0) {
+        (void)fprintf(stderr, "mips32rt: interp stopped (reason %u, info 0x%x)\n",
+                      ctx->exit_reason, ctx->exit_info);
+        return 1;
+    }
+    return 0;
 }
 
 int dbt_main(mips32_ctx_t *ctx)
@@ -217,10 +224,18 @@ static int run_guest(mips32_ctx_t *ctx)
         return -1;
     }
 
+    /* ELF + stack recorded regions in the VMA table; mirror them into
+     * ctx->regions for the guest accessors (mem.c walks the mirror). */
+    rt32_vm_sync_ctx(ctx);
+
     /* Flat O32 Linux initial state (engines consume it from Phase 1 on). */
     ctx->gpr[MIPS32_REG_SP] = sp;
     ctx->pc = ctx->elf_entry;
     ctx->next_pc = ctx->pc + 4U;
+    /* Endianness + NaN mode from the ELF admission probe (SPEC 1.1, E03). */
+    ctx->cp0_config1 = info.is_be ? 1U : 0U;
+    ctx->nan2008 = info.nan2008 ? 1U : 0U;
+    ctx->fr_mode = 0U;
 
     if (ctx->engine < 0) {
         ctx->engine = MIPS32_ENGINE_INTERP; /* default oracle (Phase 1) */

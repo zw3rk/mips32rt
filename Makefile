@@ -23,7 +23,7 @@ LDFLAGS ?= -static-pie -Wl,-z,max-page-size=4096
 
 # src/main.c plus every vendored rt32 core file (Lane L0a).  Later phases
 # append src/interp, src/dbt, and src/os (beyond src/os/syscall_nr.h).
-SRCS := src/main.c $(wildcard src/rt32/*.c) src/rt32/safe_syscall_a64.S
+SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) src/rt32/safe_syscall_a64.S
 HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
@@ -51,8 +51,14 @@ $(OBJ_DIR)/rt32/safe_syscall_a64.o: src/rt32/safe_syscall_a64.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: ## Run the test suite (ABI suite lands with lane L0b; fixtures in Phase 1)
-	@echo "phase 0: no tests yet"
+test: ## Run the host-native test suites (ABI invariants + decoder self-test)
+	@mkdir -p $(BUILD_DIR)
+	@if [ -f tests/check_abi_invariants.c ]; then \
+		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc tests/check_abi_invariants.c -o $(BUILD_DIR)/check_abi_invariants && ./$(BUILD_DIR)/check_abi_invariants; \
+	fi
+	@if [ -f tests/test_decode.c ]; then \
+		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc tests/test_decode.c src/interp/decode.c -o $(BUILD_DIR)/test_decode && ./$(BUILD_DIR)/test_decode; \
+	fi
 
 check: test check-line-limits check-abi-invariants ## Run all Phase 0 checks
 

@@ -5,10 +5,12 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Only src/interp/interp.c includes this header.  All cross-lane
- * interaction goes through the frozen contracts in src/mips32rt.h
- * (mips_decode/mips_fetch, guest_ld/st, mips_syscall, mips_fault,
- * mips_is_be).  No FP/COP1 state is touched here (Phase 3 owns it).
+ * Only the interpreter sources include this header.  All cross-lane interaction
+ * goes through the frozen contracts in src/mips32rt.h (mips_decode/
+ * mips_fetch, guest_ld/st, mips_syscall, mips_fault, mips_is_be).
+ * COP1 data movement (LWC1/SWC1/LDC1/SDC1, MFC1/MTC1/CFC1/CTC1) lives in
+ * fpmove.c as uninterpreted 64-bit moves; FP arithmetic still faults
+ * for Phase 3 (fp.c).
  *
  * Interface assumptions (implemented by lanes L1a/L1c, recorded here so
  * the RC1 integration can verify them):
@@ -16,10 +18,10 @@
  * - guest_ld/st return 0 on success and MIPS_FAULT on fault; the
  *   aligned-only variants fault on misaligned input, so interp checks
  *   alignment first and reports mips_fault with the data address.
- * - mips_syscall performs the O32 call including its $v0/$a3 writeback,
- *   leaves ctx->pc alone for a continuing call (interp advances it), and
- *   either sets ctx->exit_reason (guest exit / fatal fault) or returns
- *   nonzero status on failure.
+ * - mips_syscall performs the O32 call including its $v0/$a3 writeback
+ *   and leaves ctx->pc alone for a continuing call (interp advances
+ *   it); the int32 return is opaque (guest errors are in $v0/$a3).
+ *   ctx->exit_reason stops the run (guest exit / fatal fault).
  *
  * interp_step/interp_run return contract:
  * - 0 continues, MIPS_FAULT stops after mips_fault recorded EXIT_FAULT,
@@ -40,6 +42,17 @@ static inline void interp_set_reg(mips32_ctx_t *ctx, unsigned r, uint32_t v)
         ctx->gpr[r] = v;
     }
 }
+
+/* Unaligned merge helpers (src/interp/unaligned.c, E05 rules). */
+int do_lwl(mips32_ctx_t *ctx, uint32_t addr, unsigned rt);
+int do_lwr(mips32_ctx_t *ctx, uint32_t addr, unsigned rt);
+int do_swl(mips32_ctx_t *ctx, uint32_t addr, uint32_t rtval);
+int do_swr(mips32_ctx_t *ctx, uint32_t addr, uint32_t rtval);
+
+/* FPR data movement, no arithmetic (src/interp/fpmove.c).  0 ok,
+ * MIPS_FAULT for anything else (caller maps it with fault_at). */
+int fpmove_mem(mips32_ctx_t *ctx, const mips_dec_t *d);
+int fpmove_cop1(mips32_ctx_t *ctx, const mips_dec_t *d);
 
 /* True when the decoded instruction transfers control with a delay slot:
  * J/JAL, all (likely and non-likely) integer branches, JR/JALR.  Traps,

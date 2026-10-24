@@ -40,6 +40,19 @@
 #define RT32_AT_RANDOM  25U
 #define RT32_AT_EXECFN  31U
 
+/* Guest byte order for stack words: the host is LE, so BE (mips)
+ * guests need every 32-bit stack word byte-swapped (E05). */
+static uint32_t guest_swap32(uint32_t v)
+{
+    return ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |
+           ((v & 0x00FF0000U) >> 8) | ((v & 0xFF000000U) >> 24);
+}
+
+static uint32_t guest_word(const rt32_elf_info_t *info, uint32_t v)
+{
+    return (info->is_be != 0U) ? guest_swap32(v) : v;
+}
+
 static uint32_t push_bytes(mips32_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
     if (*sp < ctx->stack_base || len > (size_t)(*sp - ctx->stack_base)) {
@@ -151,14 +164,19 @@ int rt32_stack_setup(mips32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
 
     uint32_t *w = (uint32_t *)mips32_guest_ptr(ctx, final_sp);
     size_t pos = 0;
-    w[pos++] = (uint32_t)argc;
-    memcpy(&w[pos], arg_ptrs, (size_t)argc * sizeof(uint32_t));
-    pos += (size_t)argc;
+    size_t i;
+    w[pos++] = guest_word(elf_info, (uint32_t)argc);
+    for (i = 0u; i < (size_t)argc; i++) {
+        w[pos++] = guest_word(elf_info, arg_ptrs[i]);
+    }
     w[pos++] = 0U;
-    memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
-    pos += (size_t)envc;
+    for (i = 0u; i < (size_t)envc; i++) {
+        w[pos++] = guest_word(elf_info, env_ptrs[i]);
+    }
     w[pos++] = 0U;
-    memcpy(&w[pos], auxv, aux_idx * sizeof(uint32_t));
+    for (i = 0u; i < aux_idx; i++) {
+        w[pos++] = guest_word(elf_info, auxv[i]);
+    }
 
     ctx->guest_argc = argc;
     ctx->guest_argv = guest_argv;

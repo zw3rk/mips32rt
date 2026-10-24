@@ -13,6 +13,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include "mips32rt.h"
 #include "interp/interp.h"
@@ -21,6 +22,9 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d);
 
 static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
 {
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x at %08x\n", ctx->pc, addr);
+    }
     mips_fault(ctx, addr);
     return MIPS_FAULT;
 }
@@ -35,6 +39,9 @@ static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
             mips_fault(ctx, pc);
         }
         return MIPS_FAULT;
+    }
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "I %08x %08x\n", pc, word);
     }
     mips_decode(word, d);
     return 0;
@@ -61,157 +68,19 @@ static uint32_t rot_right(uint32_t v, unsigned n)
     return (v >> n) | (v << ((32u - n) & 31u));
 }
 
-/* Byte position p (0 = LSB) of a 32-bit value. */
-static uint32_t get_pos(uint32_t v, unsigned p)
-{
-    return (v >> (8u * p)) & 0xFFu;
-}
-
-static uint32_t set_pos(uint32_t v, unsigned p, uint32_t b)
-{
-    return (v & ~((uint32_t)0xFFu << (8u * p))) | ((b & 0xFFu) << (8u * p));
-}
-
-/* Load the 4 bytes of the aligned word PA (endianness-neutral). */
-static int load_bytes(mips32_ctx_t *ctx, uint32_t pa, uint8_t m[4])
-{
-    unsigned i;
-
-    for (i = 0u; i < 4u; i++) {
-        uint32_t v = 0u;
-
-        if (guest_ld8(ctx, pa + i, &v) != 0) {
-            if (ctx->exit_reason == MIPS32_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
-            return MIPS_FAULT;
-        }
-        m[i] = (uint8_t)v;
-    }
-    return 0;
-}
-
-/* Store m[lo..hi] to PA+lo..PA+hi (endianness-neutral). */
-static int store_bytes(mips32_ctx_t *ctx, uint32_t pa, const uint8_t m[4],
-                       unsigned lo, unsigned hi)
-{
-    unsigned i;
-
-    for (i = lo; i <= hi; i++) {
-        if (guest_st8(ctx, pa + i, m[i]) != 0) {
-            if (ctx->exit_reason == MIPS32_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
-            return MIPS_FAULT;
-        }
-    }
-    return 0;
-}
-
-/* LWL/LWR merge rules from the E05 tables (M[j] = byte at PA+j): LE LWL
- * fills positions (3-k+i), LE LWR (i-k), BE LWL 3-(i-k), BE LWR (k-i). */
-static int do_lwl(mips32_ctx_t *ctx, uint32_t addr, unsigned rt)
-{
-    uint32_t pa = addr & ~3u;
-    unsigned k = addr & 3u;
-    uint8_t m[4] = { 0u, 0u, 0u, 0u };
-    uint32_t v = ctx->gpr[rt];
-    unsigned i;
-
-    if (load_bytes(ctx, pa, m) != 0) {
-        return MIPS_FAULT;
-    }
-    if (mips_is_be(ctx)) {
-        for (i = k; i < 4u; i++) {
-            v = set_pos(v, 3u - (i - k), m[i]);
-        }
-    } else {
-        for (i = 0u; i <= k; i++) {
-            v = set_pos(v, 3u - k + i, m[i]);
-        }
-    }
-    interp_set_reg(ctx, rt, v);
-    return 0;
-}
-
-static int do_lwr(mips32_ctx_t *ctx, uint32_t addr, unsigned rt)
-{
-    uint32_t pa = addr & ~3u;
-    unsigned k = addr & 3u;
-    uint8_t m[4] = { 0u, 0u, 0u, 0u };
-    uint32_t v = ctx->gpr[rt];
-    unsigned i;
-
-    if (load_bytes(ctx, pa, m) != 0) {
-        return MIPS_FAULT;
-    }
-    if (mips_is_be(ctx)) {
-        for (i = 0u; i <= k; i++) {
-            v = set_pos(v, k - i, m[i]);
-        }
-    } else {
-        for (i = k; i < 4u; i++) {
-            v = set_pos(v, i - k, m[i]);
-        }
-    }
-    interp_set_reg(ctx, rt, v);
-    return 0;
-}
-
-/* SWL/SWR store rules mirror the loads (same rt positions). */
-static int do_swl(mips32_ctx_t *ctx, uint32_t addr, uint32_t rtval)
-{
-    uint32_t pa = addr & ~3u;
-    unsigned k = addr & 3u;
-    uint8_t m[4] = { 0u, 0u, 0u, 0u };
-    unsigned i;
-
-    if (mips_is_be(ctx)) {
-        for (i = k; i < 4u; i++) {
-            m[i] = (uint8_t)get_pos(rtval, 3u - (i - k));
-        }
-        return store_bytes(ctx, pa, m, k, 3u);
-    }
-    for (i = 0u; i <= k; i++) {
-        m[i] = (uint8_t)get_pos(rtval, 3u - k + i);
-    }
-    return store_bytes(ctx, pa, m, 0u, k);
-}
-
-static int do_swr(mips32_ctx_t *ctx, uint32_t addr, uint32_t rtval)
-{
-    uint32_t pa = addr & ~3u;
-    unsigned k = addr & 3u;
-    uint8_t m[4] = { 0u, 0u, 0u, 0u };
-    unsigned i;
-
-    if (mips_is_be(ctx)) {
-        for (i = 0u; i <= k; i++) {
-            m[i] = (uint8_t)get_pos(rtval, k - i);
-        }
-        return store_bytes(ctx, pa, m, 0u, k);
-    }
-    for (i = k; i < 4u; i++) {
-        m[i] = (uint8_t)get_pos(rtval, i - k);
-    }
-    return store_bytes(ctx, pa, m, k, 3u);
-}
-
-/* SYSCALL: clears llbit; dispatcher owns $v0/$a3 writeback.  Returns 0
- * (caller advances pc), 2 (dispatcher moved pc: keep it), 1 (stop). */
+/* SYSCALL: clears llbit; dispatcher owns $v0/$a3 writeback (including
+ * legitimate nonzero guest results like brk addresses and byte counts).
+ * The dispatcher's int32 return is opaque here: guest-visible errors are
+ * already in $v0/$a3.  Returns 0 (caller advances pc), 2 (dispatcher
+ * moved pc: keep it), 1 (stop). */
 static int exec_syscall(mips32_ctx_t *ctx)
 {
     uint32_t before = ctx->pc;
-    int32_t sr;
 
     ctx->llbit = 0;
-    sr = mips_syscall(ctx);
+    (void)mips_syscall(ctx);
     if (ctx->exit_reason != MIPS32_EXIT_NONE) {
         return 1;
-    }
-    if (sr != 0) {
-        mips_fault(ctx, ctx->pc);
-        return MIPS_FAULT;
     }
     return (ctx->pc != before) ? 2 : 0;
 }
@@ -480,8 +349,8 @@ static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
         default:
             return fault_at(ctx, cur_pc);
         }
-    case 0x3Bu: /* RDHWR */
-        if (d->rs != MIPS32_RDHWR_ULR) {
+    case 0x3Bu: /* RDHWR rt, rd: rd selects, rt receives (MIPS32r2). */
+        if (d->rd != MIPS32_RDHWR_ULR) {
             return fault_at(ctx, cur_pc);
         }
         interp_set_reg(ctx, d->rt, ctx->ulr);
@@ -705,10 +574,23 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x30u: /* LL */
     case 0x38u: /* SC */
         return exec_mem(ctx, cur_pc, d);
+    case 0x31u: /* LWC1 */
+    case 0x35u: /* LDC1 */
+    case 0x39u: /* SWC1 */
+    case 0x3Du: /* SDC1 */
+        if (fpmove_mem(ctx, d) != 0) {
+            return fault_at(ctx, cur_pc);
+        }
+        return 0;
+    case 0x11u: /* COP1 moves (arithmetic faults for Phase 3) */
+        if (fpmove_cop1(ctx, d) != 0) {
+            return fault_at(ctx, cur_pc);
+        }
+        return 0;
     case 0x2Fu: /* CACHE */
     case 0x33u: /* PREF */
         return 0;
-    default: /* COP1/COP2/COP1X, FPU loads/stores, MIPS64, reserved */
+    default: /* COP2/COP1X, MIPS64, reserved */
         return fault_at(ctx, cur_pc);
     }
 }

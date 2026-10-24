@@ -267,7 +267,10 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
     copy_uts_field(dst + 2U * MIPS_UTS_FIELD, un.release);
     copy_uts_field(dst + 3U * MIPS_UTS_FIELD, un.version);
     copy_uts_field(dst + 4U * MIPS_UTS_FIELD, un.machine);
-#ifdef __linux__
+#if defined(__linux__) && !defined(__GLIBC__)
+    /* musl spells the sixth utsname field with leading underscores. */
+    copy_uts_field(dst + 5U * MIPS_UTS_FIELD, un.__domainname);
+#elif defined(__linux__)
     copy_uts_field(dst + 5U * MIPS_UTS_FIELD, un.domainname);
 #else
     memset(dst + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
@@ -341,6 +344,16 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         ctx->clear_child_tid = tidptr;
         /* Single-threaded Phase 1: pid is the tid (real tids in Phase 4). */
         return sc_ret(ctx, (int32_t)getpid());
+    }
+    case MIPS32_NR_set_thread_area: {
+        /* O32 takes the TLS base directly in $a0 (E06); rdhwr $29 reads
+         * it back as ctx->ulr.  LL reservations are already clear here. */
+        uint32_t tp = o32_arg(ctx, sp, 0, &ok);
+        if (!ok) {
+            return sc_ret(ctx, -EFAULT);
+        }
+        ctx->ulr = tp;
+        return sc_ret(ctx, 0);
     }
     default:
         break;
