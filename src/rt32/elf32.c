@@ -459,6 +459,107 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
     return 0;
 }
 
+/* Phase 5 (lane L5a): measure a PT_INTERP file's PT_LOAD span so the
+ * interpreter lands at a verified non-colliding base.  Reads only the ELF
+ * and program headers (same admission rules as load_elf32_image, which
+ * revalidates everything on the real load); returns the PT_LOAD span
+ * length, or -1 when the file is not an admissible MIPS ELF.  Standard
+ * MIPS ld.so.1 is ET_DYN with min_vaddr 0, so the picked base applies as
+ * the load bias; any other shape still passes through load_elf32_image's
+ * own overlap checks unchanged. */
+static int interp_measure_span(int fd, uint64_t *out_span)
+{
+    elf32_ehdr_t ehdr;
+    elf32_phdr_t phdrs[64];
+    size_t phdr_bytes;
+    bool is_be;
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0ULL;
+    uint16_t i;
+
+    if (pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
+        return -1;
+    }
+    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
+        ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F' ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
+        (ehdr.e_ident[EI_DATA] != ELFDATA2LSB &&
+         ehdr.e_ident[EI_DATA] != ELFDATA2MSB)) {
+        return -1;
+    }
+    is_be = ehdr.e_ident[EI_DATA] == ELFDATA2MSB;
+    if (is_be) {
+        ehdr.e_machine  = swap16(ehdr.e_machine);
+        ehdr.e_phoff    = swap32(ehdr.e_phoff);
+        ehdr.e_phentsize = swap16(ehdr.e_phentsize);
+        ehdr.e_phnum    = swap16(ehdr.e_phnum);
+    }
+    if (ehdr.e_machine != EM_MIPS || ehdr.e_phentsize != sizeof(elf32_phdr_t) ||
+        ehdr.e_phnum == 0U || ehdr.e_phnum > 64U) {
+        return -1;
+    }
+    phdr_bytes = (size_t)ehdr.e_phnum * sizeof(elf32_phdr_t);
+    if (pread_full(fd, phdrs, phdr_bytes, (off_t)ehdr.e_phoff) != 0) {
+        return -1;
+    }
+    for (i = 0; i < ehdr.e_phnum; i++) {
+        uint64_t seg_lo;
+        uint64_t seg_hi;
+        if (is_be) {
+            phdrs[i].p_type   = swap32(phdrs[i].p_type);
+            phdrs[i].p_vaddr  = swap32(phdrs[i].p_vaddr);
+            phdrs[i].p_memsz  = swap32(phdrs[i].p_memsz);
+        }
+        if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_memsz == 0U) {
+            continue;
+        }
+        seg_lo = (uint64_t)(phdrs[i].p_vaddr & ~0xFFFU);
+        seg_hi = ((uint64_t)phdrs[i].p_vaddr + (uint64_t)phdrs[i].p_memsz +
+                  0xFFFULL) & ~0xFFFULL;
+        if (seg_hi <= seg_lo) {
+            return -1;
+        }
+        if (seg_lo < lo) {
+            lo = seg_lo;
+        }
+        if (seg_hi > hi) {
+            hi = seg_hi;
+        }
+    }
+    if (lo == UINT64_MAX || hi > (uint64_t)MIPS32_TASK_SIZE_TOP) {
+        return -1;
+    }
+    *out_span = hi - lo;
+    return 0;
+}
+
+/* Phase 5 (lane L5a): first-fit 64 KiB-aligned interpreter base at or above
+ * max(brk, 0x3F000000) whose [base, base+span) overlaps no recorded region.
+ * Returns 0 when no window fits (caller fails the load). */
+static uint32_t interp_pick_base(mips32_ctx_t *ctx, uint64_t span)
+{
+    uint64_t base = ctx->brk_base > 0x3F000000U ? (uint64_t)ctx->brk_base : 0x3F000000ULL;
+    size_t r;
+
+    base = (base + 0xFFFFULL) & ~0xFFFFULL;
+    while (base + span <= (uint64_t)MIPS32_TASK_SIZE_TOP) {
+        uint32_t lo = (uint32_t)base;
+        uint32_t end = (uint32_t)(base + span);
+        int clash = 0;
+        for (r = 0U; r < ctx->region_count; r++) {
+            if (lo < ctx->regions[r].end && end > ctx->regions[r].start) {
+                clash = 1;
+                break;
+            }
+        }
+        if (!clash) {
+            return lo;
+        }
+        base += 0x10000ULL;
+    }
+    return 0U;
+}
+
 int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_info_t *out_info)
 {
     if (!ctx || !out_info) {
@@ -502,8 +603,19 @@ int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_inf
         }
 
         rt32_elf_info_t interp_info;
-        uint32_t interp_base = (ctx->brk_base > 0x3F000000U) ? ctx->brk_base : 0x3F000000U;
-        int irc = load_elf32_image(ctx, ifd, interp_base, out_info->interp_path, &interp_info);
+        uint64_t interp_span = 0ULL;
+        uint32_t interp_base;
+        int irc;
+        /* Size the interpreter before mapping it so the base is verified
+         * free; load_elf32_image re-checks every segment on the way in. */
+        if (interp_measure_span(ifd, &interp_span) != 0 ||
+            (interp_base = interp_pick_base(ctx, interp_span)) == 0U) {
+            fprintf(stderr, "mips32rt: no room for interpreter '%s'\n",
+                    out_info->interp_path);
+            close(ifd);
+            return -1;
+        }
+        irc = load_elf32_image(ctx, ifd, interp_base, out_info->interp_path, &interp_info);
         close(ifd);
         if (irc != 0) {
             return -1;
