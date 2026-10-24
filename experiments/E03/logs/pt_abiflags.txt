@@ -1,0 +1,20 @@
+### experiments/E03/bin/probe_le_legacy
+  [ 1] .MIPS.abiflags    MIPS_ABIFLAGS   00400118 000118 000018 18   A  0   0  8
+-- segments:
+  LOAD           0x000000 0x00400000 0x00400000 0x8ac64 0x8ac64 R E 0x10000
+  LOAD           0x08b000 0x0049b000 0x0049b000 0x04dbc 0x07be0 RW  0x10000
+### experiments/E03/bin/probe_le_fp64
+  [ 1] .MIPS.abiflags    MIPS_ABIFLAGS   00400118 000118 000018 18   A  0   0  8
+-- segments:
+  LOAD           0x000000 0x00400000 0x00400000 0x8ac64 0x8ac64 R E 0x10000
+  LOAD           0x08b000 0x0049b000 0x0049b000 0x04dbc 0x07be0 RW  0x10000
+### experiments/E03/bin/probe_be_legacy
+  [ 1] .MIPS.abiflags    MIPS_ABIFLAGS   00400118 000118 000018 18   A  0   0  8
+-- segments:
+  LOAD           0x000000 0x00400000 0x00400000 0x8a7d4 0x8a7d4 R E 0x10000
+  LOAD           0x08b000 0x0049b000 0x0049b000 0x04dbc 0x07be0 RW  0x10000
+### experiments/E03/bin/probe_le_nan2008flag
+  [ 1] .MIPS.abiflags    MIPS_ABIFLAGS   00400118 000118 000018 18   A  0   0  8
+-- segments:
+  LOAD           0x000000 0x00400000 0x00400000 0x8ac64 0x8ac64 R E 0x10000
+  LOAD           0x08b000 0x0049b000 0x0049b000 0x04dbc 0x07be0 RW  0x10000
