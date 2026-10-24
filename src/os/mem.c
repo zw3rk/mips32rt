@@ -81,8 +81,14 @@ static int range_covered(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
     return (uint64_t)cur >= end64;
 }
 
+/* Lane L4a query (src/os/signals.c): true when signo has a real guest
+ * handler.  mips_raise_guest is declared by the frozen src/mips32rt.h. */
+extern int mips_signal_has_handler(int signo);
+
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
 {
+    int signo;
+
     if (ctx == NULL) {
         return;
     }
@@ -92,9 +98,18 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
     if (ctx->trace_enabled) {
         (void)fprintf(stderr, "F %08x fault-addr %08x\n", ctx->pc, addr);
     }
-    /* Phase-1 mechanism (no guest handlers exist yet): die by SIGSEGV like
-     * qemu-user for an unhandled fetch/AdE fault.  Phase 4 (L4a) replaces
-     * this with real guest signal delivery (rt_sigframe + handler). */
+    /* Phase 4 (L4a): reroute to guest delivery when a handler is
+     * installed.  Misaligned data addresses fault as AdEL/AdES
+     * (SIGBUS); aligned ones as TLB miss/permission faults (SIGSEGV).
+     * mips_raise_guest clears exit_reason on delivery so the engine can
+     * resume at the handler; on -1 fall through to the Phase-1 death. */
+    signo = ((addr & 3U) != 0U) ? 10 : 11;
+    if (mips_signal_has_handler(signo) &&
+        mips_raise_guest(ctx, signo, addr) == 0) {
+        return;
+    }
+    /* Phase-1 mechanism (no guest handler): die by SIGSEGV like
+     * qemu-user for an unhandled fetch/AdE fault. */
     (void)raise(SIGSEGV);
     _Exit(139);
 }
