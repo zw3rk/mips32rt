@@ -1,0 +1,9 @@
+dec=42 neg=-7 zero=0
+uns=42 big=4294967295
+hex=deadbeef HEX=DEADBEEF oct=777
+chr=Q str=mips32 empty=[]
+width=[     123] zero=[00000123] left=[123     ]
+prec=[005] strprec=[ab]
+u64=18446744073709551615 neg64=-1
+mix: answer=42 (0x2a)
+D2-EXIT=0

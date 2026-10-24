@@ -1,0 +1,2 @@
+hello mips32rt
+D2-EXIT=0
