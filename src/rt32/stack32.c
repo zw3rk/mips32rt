@@ -5,10 +5,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Vendored from ../i686rt/src/rt32/rt32_stack32.c: retyped on mips32_ctx_t
- * with the O32 stack top (SPEC 1.1, 0x7fff0000).  The auxv is the minimal
- * O32 set (PHDR/PHENT/PHNUM/ENTRY/UID/GID/HWCAP/CLKTCK/RANDOM/EXECFN);
- * the .MIPS.abiflags-derived entries (FR mode, NaN mode, FP ABI) and the
- * synthetic sigtramp/vdso pair arrive with the Phase 4/5 loader work.
+ * with the O32 stack top (SPEC 1.1, 0x7fff0000).  Phase 5 (lane L5a) builds
+ * the complete O32 auxv: PHDR/PHENT/PHNUM, PAGESZ, BASE (dynamic only),
+ * FLAGS, ENTRY, UID/EUID/GID/EGID, HWCAP, CLKTCK, RANDOM (16 stack bytes),
+ * SECURE, HWCAP2, EXECFN, AT_NULL.  The .MIPS.abiflags-derived entries
+ * (FR mode, FP ABI) stay Phase 6+ work; there is no vdso on this target.
  */
 
 #define _GNU_SOURCE
@@ -30,6 +31,8 @@
 #define RT32_AT_PHENT   4U
 #define RT32_AT_PHNUM   5U
 #define RT32_AT_PAGESZ  6U
+#define RT32_AT_BASE    7U
+#define RT32_AT_FLAGS   8U
 #define RT32_AT_ENTRY   9U
 #define RT32_AT_UID     11U
 #define RT32_AT_EUID    12U
@@ -37,7 +40,9 @@
 #define RT32_AT_EGID    14U
 #define RT32_AT_HWCAP   16U
 #define RT32_AT_CLKTCK  17U
+#define RT32_AT_SECURE  23U
 #define RT32_AT_RANDOM  25U
+#define RT32_AT_HWCAP2  26U
 #define RT32_AT_EXECFN  31U
 
 /* Guest byte order for stack words: the host is LE, so BE (mips)
@@ -135,24 +140,40 @@ int rt32_stack_setup(mips32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
 
     sp &= ~0xFU;
 
-    /* Minimal O32 auxv; key/value pairs followed by AT_NULL. */
-    uint32_t auxv[] = {
-        RT32_AT_PHDR,   elf_info->phdr_vaddr,
-        RT32_AT_PHENT,  elf_info->phent,
-        RT32_AT_PHNUM,  elf_info->phnum,
-        RT32_AT_PAGESZ, 4096U,
-        RT32_AT_ENTRY,  elf_info->entry,
-        RT32_AT_UID,    (uint32_t)getuid(),
-        RT32_AT_EUID,   (uint32_t)geteuid(),
-        RT32_AT_GID,    (uint32_t)getgid(),
-        RT32_AT_EGID,   (uint32_t)getegid(),
-        RT32_AT_HWCAP,  0U,
-        RT32_AT_CLKTCK, 100U,
-        RT32_AT_RANDOM, at_random_va,
-        RT32_AT_EXECFN, at_execfn_va,
-        RT32_AT_NULL,   0U,
-    };
-    size_t aux_idx = sizeof(auxv) / sizeof(auxv[0]);
+    /* Phase 5 complete O32 auxv (kernel order: PHDR..ENTRY, ids, HWCAP,
+     * CLKTCK, RANDOM, SECURE, HWCAP2, EXECFN, AT_NULL).  AT_BASE is present
+     * only for dynamic binaries (interp_base != 0); AT_ENTRY is always the
+     * exe entry even when control starts at the interpreter.  Values are
+     * host-order here; the frame writer swaps them for BE (mips) guests
+     * while ctx->auxv_data keeps the host-order copy for /proc/self/auxv
+     * (src/os/proc.c swaps on read for BE).  18 pairs fit in auxv[40]. */
+    uint32_t auxv[40];
+    size_t aux_idx = 0;
+#define RT32_PUT_AT(k, v) do { auxv[aux_idx++] = (uint32_t)(k); auxv[aux_idx++] = (uint32_t)(v); } while (0)
+    RT32_PUT_AT(RT32_AT_PHDR, elf_info->phdr_vaddr);
+    RT32_PUT_AT(RT32_AT_PHENT, elf_info->phent);
+    RT32_PUT_AT(RT32_AT_PHNUM, elf_info->phnum);
+    RT32_PUT_AT(RT32_AT_PAGESZ, 4096U);
+    if (elf_info->interp_base != 0U) {
+        RT32_PUT_AT(RT32_AT_BASE, elf_info->interp_base);
+    }
+    RT32_PUT_AT(RT32_AT_FLAGS, 0U);
+    RT32_PUT_AT(RT32_AT_ENTRY, elf_info->entry);
+    RT32_PUT_AT(RT32_AT_UID, (uint32_t)getuid());
+    RT32_PUT_AT(RT32_AT_EUID, (uint32_t)geteuid());
+    RT32_PUT_AT(RT32_AT_GID, (uint32_t)getgid());
+    RT32_PUT_AT(RT32_AT_EGID, (uint32_t)getegid());
+    RT32_PUT_AT(RT32_AT_HWCAP, 0U);
+    RT32_PUT_AT(RT32_AT_CLKTCK, 100U);
+    RT32_PUT_AT(RT32_AT_RANDOM, at_random_va);
+    RT32_PUT_AT(RT32_AT_SECURE, 0U);
+    RT32_PUT_AT(RT32_AT_HWCAP2, 0U);
+    RT32_PUT_AT(RT32_AT_EXECFN, at_execfn_va);
+    RT32_PUT_AT(RT32_AT_NULL, 0U);
+#undef RT32_PUT_AT
+    if (aux_idx > sizeof(auxv) / sizeof(auxv[0])) {
+        return -1;
+    }
 
     /* Frame layout: argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv[] */
     size_t total_words   = 1U + ((size_t)argc + 1U) + ((size_t)envc + 1U) + aux_idx;

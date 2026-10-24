@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -529,4 +530,351 @@ int32_t mips_proc_waitpid(mips32_ctx_t *ctx, uint32_t sp)
         return (int32_t)-EFAULT;
     }
     return proc_wait_common(ctx, sp, 0);
+}
+
+/* ---- Phase 5 (lane L5a): /proc/self/{exe,maps,cmdline,stat,auxv} ----
+ *
+ * Guest-view synthesis for the five /proc/self nodes the lane card names:
+ * exe reads back the guest path, maps renders the recorded window VMAs,
+ * cmdline joins the guest argv, stat synthesizes the 52-field kernel
+ * layout, auxv replays the stack auxv (BE-swapped for mips guests).
+ *
+ * WIRING (coordinator, RC5 integration): the syscall layer that owns
+ * open/openat/readlink (src/os/syscalls.c, src/os/syscalls_meta.c) does
+ * not call here yet.  Wire two hooks, declarations into
+ * src/os/syscalls_priv.h:
+ *
+ *   int  mips_proc_classify(const char *path);
+ *   int  mips_proc_open(mips32_ctx_t *ctx, int kind, int flags);
+ *   long mips_proc_readlink(mips32_ctx_t *ctx, int kind,
+ *                           char *buf, unsigned long bufsz);
+ *
+ *   - in sc_openat, after the guest path is fetched: kind =
+ *     mips_proc_classify(path); when kind != MIPS_PROC_NONE, return
+ *     mips_sc_ret(ctx, mips_proc_open(ctx, kind, host_flags) < 0 ?
+ *     -errno : fd).
+ *   - in mips_sc_readlinkat, same classify; when kind != MIPS_PROC_NONE,
+ *     copy out mips_proc_readlink(ctx, kind, host_buf, bufsiz) bytes
+ *     (negative errno on error).
+ *
+ * Only exact absolute /proc/self/<node> and /proc/<pid>/<node> (own pid)
+ * names intercept; every other path falls through to the host untouched.
+ * Unit-tested by tests/run_p5.sh (host-native probe, no guest needed).
+ */
+
+#define MIPS_PROC_NONE    0
+#define MIPS_PROC_EXE     1
+#define MIPS_PROC_MAPS    2
+#define MIPS_PROC_CMDLINE 3
+#define MIPS_PROC_STAT    4
+#define MIPS_PROC_AUXV    5
+
+static int proc_node_kind(const char *node)
+{
+    if (strcmp(node, "exe") == 0) {
+        return MIPS_PROC_EXE;
+    }
+    if (strcmp(node, "maps") == 0) {
+        return MIPS_PROC_MAPS;
+    }
+    if (strcmp(node, "cmdline") == 0) {
+        return MIPS_PROC_CMDLINE;
+    }
+    if (strcmp(node, "stat") == 0) {
+        return MIPS_PROC_STAT;
+    }
+    if (strcmp(node, "auxv") == 0) {
+        return MIPS_PROC_AUXV;
+    }
+    return MIPS_PROC_NONE;
+}
+
+int mips_proc_classify(const char *path)
+{
+    static const char self_prefix[] = "/proc/self/";
+    const char *node;
+    size_t i;
+    unsigned long pid;
+
+    if (path == NULL) {
+        return MIPS_PROC_NONE;
+    }
+    if (strncmp(path, self_prefix, sizeof(self_prefix) - 1U) == 0) {
+        node = path + sizeof(self_prefix) - 1U;
+        if (*node == '\0' || strchr(node, '/') != NULL) {
+            return MIPS_PROC_NONE;
+        }
+        return proc_node_kind(node);
+    }
+    if (strncmp(path, "/proc/", 6U) != 0) {
+        return MIPS_PROC_NONE;
+    }
+    pid = 0UL;
+    i = 6U;
+    while (path[i] >= '0' && path[i] <= '9') {
+        pid = pid * 10UL + (unsigned long)(path[i] - '0');
+        i++;
+    }
+    if (i == 6U || path[i] != '/' || pid != (unsigned long)getpid()) {
+        return MIPS_PROC_NONE;
+    }
+    node = path + i + 1U;
+    if (*node == '\0' || strchr(node, '/') != NULL) {
+        return MIPS_PROC_NONE;
+    }
+    return proc_node_kind(node);
+}
+
+/* Render the window VMA table in kernel maps(5) form.  Returns the byte
+ * count (excluding NUL) or a negative errno. */
+int mips_proc_maps_text(mips32_ctx_t *ctx, char *buf, unsigned long cap)
+{
+    unsigned long pos = 0UL;
+    size_t i;
+
+    if (ctx == NULL || buf == NULL || cap == 0UL) {
+        return -EFAULT;
+    }
+    for (i = 0; i < ctx->region_count; i++) {
+        const mips32_region_t *r = &ctx->regions[i];
+        char line[160];
+        int n = snprintf(line, sizeof(line), "%08x-%08x %c%c%c%c %08x 00:00 0%s%s\n",
+                         r->start, r->end,
+                         (r->prot & (uint32_t)PROT_READ) != 0U ? 'r' : '-',
+                         (r->prot & (uint32_t)PROT_WRITE) != 0U ? 'w' : '-',
+                         (r->prot & (uint32_t)PROT_EXEC) != 0U ? 'x' : '-',
+                         'p', 0U,
+                         r->name[0] != '\0' ? " " : "", r->name);
+        if (n < 0 || (unsigned long)n >= (unsigned long)sizeof(line)) {
+            return -EIO;
+        }
+        if (pos + (unsigned long)n + 1UL > cap) {
+            return -ENOMEM;
+        }
+        memcpy(buf + pos, line, (size_t)n);
+        pos += (unsigned long)n;
+    }
+    buf[pos] = '\0';
+    return (int)pos;
+}
+
+/* Basename without libgen (stays in string.h). */
+static const char *proc_comm_name(const char *path)
+{
+    const char *base;
+    const char *slash;
+
+    if (path == NULL || *path == '\0') {
+        return "mips32rt";
+    }
+    base = path;
+    for (slash = path; *slash != '\0'; slash++) {
+        if (*slash == '/') {
+            base = slash + 1;
+        }
+    }
+    return (*base == '\0') ? "mips32rt" : base;
+}
+
+/* Synthesize the 52-field /proc/self/stat layout (proc(5) order): the
+ * identity fields (pid, comm, state, ppid, pgrp, session) are truthful,
+ * counters and clocks read zero in this user-mode view. */
+static int proc_stat_text(mips32_ctx_t *ctx, char *buf, unsigned long cap)
+{
+    int pid = (int)getpid();
+    int ppid = (int)getppid();
+    int pgrp = (int)getpgrp();
+    int session = getsid(0);
+    int n;
+
+    (void)ctx;
+    if (buf == NULL || cap == 0UL) {
+        return -EFAULT;
+    }
+    if (session < 0) {
+        session = pid;
+    }
+    n = snprintf(buf, cap,
+                 "%d (%s) R %d %d %d 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                 pid, proc_comm_name(ctx != NULL ? ctx->exec_path : NULL),
+                 ppid, pgrp, session);
+    if (n < 0 || (unsigned long)n >= cap) {
+        return -ENOMEM;
+    }
+    return n;
+}
+
+/* NUL-joined guest argv in kernel cmdline form (trailing NUL, no newline).
+ * Returns the byte count or a negative errno. */
+static int proc_cmdline_bytes(mips32_ctx_t *ctx, char *buf, unsigned long cap)
+{
+    unsigned long pos = 0UL;
+    int i;
+
+    if (ctx == NULL || buf == NULL || cap == 0UL) {
+        return -EFAULT;
+    }
+    for (i = 0; i < ctx->guest_argc; i++) {
+        const char *arg = (ctx->guest_argv != NULL && ctx->guest_argv[i] != NULL)
+            ? ctx->guest_argv[i] : "";
+        size_t len = strlen(arg) + 1U;
+        if (pos + (unsigned long)len > cap) {
+            return -ENOMEM;
+        }
+        memcpy(buf + pos, arg, len);
+        pos += (unsigned long)len;
+    }
+    return (int)pos;
+}
+
+static int proc_auxv_bytes(mips32_ctx_t *ctx, char *buf, unsigned long cap)
+{
+    size_t i;
+    unsigned long pos = 0UL;
+
+    if (ctx == NULL || buf == NULL || cap == 0UL) {
+        return -EFAULT;
+    }
+    if (ctx->auxv_bytes > cap || (ctx->auxv_bytes % 4U) != 0U) {
+        return -ENOMEM;
+    }
+    for (i = 0; i < ctx->auxv_bytes; i += 4U) {
+        uint32_t w;
+        memcpy(&w, (const char *)ctx->auxv_data + i, 4U);
+        if (mips_is_be(ctx)) {
+            w = proc_swap32(w);
+        }
+        memcpy(buf + pos, &w, 4U);
+        pos += 4UL;
+    }
+    return (int)pos;
+}
+
+/* Write the whole buffer (EINTR-safe); 0 on success, -errno otherwise. */
+static int proc_write_all(int fd, const void *data, unsigned long len)
+{
+    const char *p = (const char *)data;
+    while (len > 0UL) {
+        ssize_t n = write(fd, p, (size_t)len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -errno;
+        }
+        if (n == 0) {
+            return -EIO;
+        }
+        p += n;
+        len -= (unsigned long)n;
+    }
+    return 0;
+}
+
+/* Materialize content as a seekable read-only host fd.  Write-mode opens
+ * fail with EACCES exactly like the kernel nodes. */
+static int proc_synth_fd(const char *tag, const void *data, unsigned long len,
+                         int flags)
+{
+    int fd;
+    int rc;
+
+    if (((flags & O_ACCMODE) != O_RDONLY) || ((flags & O_TRUNC) != 0)) {
+        return -EACCES;
+    }
+    fd = memfd_create(tag, (flags & O_CLOEXEC) != 0 ? MFD_CLOEXEC : 0);
+    if (fd < 0) {
+        return -errno;
+    }
+    rc = proc_write_all(fd, data, len);
+    if (rc != 0) {
+        close(fd);
+        return rc;
+    }
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        close(fd);
+        return -errno;
+    }
+    return fd;
+}
+
+/* Open a readable handle for a classified node: host fd or -errno.
+ * exe prefers a real read-only handle on the guest executable (kernel
+ * read semantics serve ELF bytes) and falls back to the path string. */
+int mips_proc_open(mips32_ctx_t *ctx, int kind, int flags)
+{
+    char text[8192];
+    int n;
+
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
+    switch (kind) {
+    case MIPS_PROC_EXE: {
+        const char *exe = (ctx->exec_path != NULL) ? ctx->exec_path : "";
+        if (((flags & O_ACCMODE) != O_RDONLY) || ((flags & O_TRUNC) != 0)) {
+            return -EACCES;
+        }
+        if (exe[0] != '\0') {
+            int fd = rt32_open_guest_ro(ctx, exe);
+            if (fd >= 0) {
+                return fd;
+            }
+        }
+        return proc_synth_fd("exe", exe, (unsigned long)strlen(exe), flags);
+    }
+    case MIPS_PROC_MAPS:
+        n = mips_proc_maps_text(ctx, text, sizeof(text));
+        if (n < 0) {
+            return n;
+        }
+        return proc_synth_fd("maps", text, (unsigned long)n, flags);
+    case MIPS_PROC_CMDLINE:
+        n = proc_cmdline_bytes(ctx, text, sizeof(text));
+        if (n < 0) {
+            return n;
+        }
+        return proc_synth_fd("cmdline", text, (unsigned long)n, flags);
+    case MIPS_PROC_STAT:
+        n = proc_stat_text(ctx, text, sizeof(text));
+        if (n < 0) {
+            return n;
+        }
+        return proc_synth_fd("stat", text, (unsigned long)n, flags);
+    case MIPS_PROC_AUXV:
+        n = proc_auxv_bytes(ctx, text, sizeof(text));
+        if (n < 0) {
+            return n;
+        }
+        return proc_synth_fd("auxv", text, (unsigned long)n, flags);
+    default:
+        break;
+    }
+    return -ENOENT;
+}
+
+/* readlink on the classified node: only exe is a symlink (the guest path);
+ * the file nodes fail with EINVAL exactly like the kernel ones.  Returns
+ * the byte count or a negative errno. */
+long mips_proc_readlink(mips32_ctx_t *ctx, int kind, char *buf,
+                        unsigned long bufsz)
+{
+    const char *exe;
+    unsigned long n;
+
+    if (ctx == NULL || buf == NULL) {
+        return -EFAULT;
+    }
+    if (kind != MIPS_PROC_EXE) {
+        return (kind == MIPS_PROC_NONE) ? -ENOENT : -EINVAL;
+    }
+    exe = (ctx->exec_path != NULL) ? ctx->exec_path : "";
+    n = (unsigned long)strlen(exe);
+    if (n > bufsz) {
+        n = bufsz;
+    }
+    if (n > 0UL) {
+        memcpy(buf, exe, (size_t)n);
+    }
+    return (long)n;
 }
