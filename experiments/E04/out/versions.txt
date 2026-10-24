@@ -1,0 +1,5 @@
+=== toolchain ===
+mipsel-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+mips-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+qemu-mipsel version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
+qemu-mips version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
