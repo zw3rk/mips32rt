@@ -23,33 +23,33 @@
  * - MIPS errno: EFAULT 14 / EINVAL 22 (asm-generic values); ENOSYS 89
  *   (MIPS asm/errno.h, cf. src/os/syscall_min.c).
  *
- * Wiring note for the RC4 coordinator: this file is self-contained (it
- * reads O32 arguments straight from ctx->gpr / the guest stack and
- * applies the $a3 convention itself). The dispatchers in
- * src/os/syscall_min.c and src/os/syscalls.c still point rt_sigaction at
- * -ENOSYS and rt_sigprocmask at the Phase-2 accept-and-ignore stub
- * (which validates how as 0..2, but MIPS defines 1..3); RC4 must rewire
- * both to mips_sc_rt_sigaction / mips_l4a_rt_sigprocmask and call
- * mips_rt_sigreturn directly WITHOUT wrapping it in sc_ret (success
- * restores $v0/$a3 from the frame; failure sets them to EFAULT/1 here).
- * Engine resume is also RC4 work: interp_run stops when the faulting
- * step returns MIPS_FAULT, so after delivery clears exit_reason to NONE
- * the loop must resume stepping at the handler instead of exiting.
- * FPU traps (src/interp/fp.c) pass only the faulting pc to mips_fault,
- * so they cannot be told apart from fetch faults at the mem.c hook;
- * delivering SIGFPE for them needs a direct mips_raise_guest(ctx, 8, pc)
- * call from the fp trap path (likewise SIGILL from undef paths).
+ * Wiring (RC4, done): this file is self-contained (it reads O32
+ * arguments straight from ctx->gpr / the guest stack and applies the
+ * $a3 convention itself). The dispatchers in src/os/syscall_min.c and
+ * src/os/syscalls.c route rt_sigaction to mips_sc_rt_sigaction,
+ * rt_sigprocmask to mips_l4a_rt_sigprocmask, sigaltstack to
+ * mips_sc_sigaltstack, and call mips_rt_sigreturn directly WITHOUT
+ * wrapping it in sc_ret (success restores $v0/$a3 from the frame;
+ * failure sets them to EFAULT/1 here). Engine resume: interp_run and
+ * the DBT loop keep stepping when delivery cleared exit_reason to NONE.
+ * FPU traps (src/interp/fp.c) call mips_trap(ctx, 8, pc) directly so a
+ * trap-enabled Invalid operation delivers SIGFPE, not the SEGV the
+ * fetch-fault path would classify; undef encodings use mips_trap(4),
+ * BREAK/traps mips_trap(5), integer overflow mips_trap(8).
  */
 
 #include "mips32rt.h"
 
 #include "os/sigframe_mips32rt.h"
 #include "os/syscall_nr.h"
+#include "rt32/rt32.h"
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* ---- MIPS signal numbers (UAPI asm/signal.h) ---- */
 #define L4A_SIGILL  4U
@@ -86,6 +86,13 @@
 /* ---- MIPS errnos ---- */
 #define L4A_EFAULT 14
 #define L4A_EINVAL 22
+#define L4A_ENOMEM 12
+#define L4A_EPERM  1
+
+/* ---- sigaltstack(2) (asm-generic values, shared by the MIPS O32 UAPI) ---- */
+#define L4A_SS_ONSTACK  1U
+#define L4A_SS_DISABLE 2U
+#define L4A_MINSIGSTKSZ 2048U
 
 /* ---- Nested-delivery bound (lane card: max depth 8, else kill) ---- */
 #define L4A_MAX_DEPTH 8U
@@ -442,14 +449,9 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
     void *got;
     uint8_t *h;
     int be;
-    size_t pos;
-    size_t i;
 
     if (l4a_range_ok(ctx, MIPS32_SIGTRAMP, 8U, (uint32_t)PROT_READ)) {
         return 0;
-    }
-    if (ctx->region_count >= MIPS32_MAX_REGIONS) {
-        return -1;
     }
     want = (void *)(uintptr_t)(ctx->guest_base + (uint64_t)MIPS32_SIGTRAMP);
     got = mmap(want, (size_t)MIPS32_PAGE_SIZE,
@@ -482,24 +484,16 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
     if (mprotect(want, (size_t)MIPS32_PAGE_SIZE, PROT_READ) != 0) {
         return -1;
     }
-    pos = ctx->region_count;
-    for (i = 0; i < ctx->region_count; i++) {
-        if (ctx->regions[i].start > MIPS32_SIGTRAMP) {
-            pos = i;
-            break;
-        }
+    /* Register in the authoritative VMA table (not the ctx mirror: the
+     * next vm op refreshes the mirror from the table and would drop a
+     * mirror-only entry, faulting the handler return).  The host
+     * mapping stays PROT_READ (engines fetch through the window; the
+     * host never executes guest bytes, per W^X). */
+    if (rt32_vm_record_region(ctx, MIPS32_SIGTRAMP,
+            MIPS32_SIGTRAMP + MIPS32_PAGE_SIZE,
+            (uint32_t)(PROT_READ | PROT_EXEC), 0U, "sigtramp") != 0) {
+        return -1;
     }
-    if (pos < ctx->region_count) {
-        memmove(&ctx->regions[pos + 1U], &ctx->regions[pos],
-            (ctx->region_count - pos) * sizeof(ctx->regions[0]));
-    }
-    ctx->regions[pos].start = MIPS32_SIGTRAMP;
-    ctx->regions[pos].end = MIPS32_SIGTRAMP + MIPS32_PAGE_SIZE;
-    ctx->regions[pos].prot = (uint32_t)(PROT_READ | PROT_EXEC);
-    ctx->regions[pos].flags = 0U;
-    memcpy(ctx->regions[pos].name, "sigtramp",
-        sizeof("sigtramp"));
-    ctx->region_count++;
     return 0;
 }
 
@@ -549,16 +543,31 @@ int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
     if (g_depth >= L4A_MAX_DEPTH) {
         return -1;
     }
-    if ((ctx->gpr[MIPS32_REG_SP] & 7U) != 0U) {
-        ctx->gpr[MIPS32_REG_SP] &= (uint32_t)~7U;
+    act = g_actions[(unsigned)signo];
+    {
+        uint32_t sp = ctx->gpr[MIPS32_REG_SP];
+        uint32_t base = sp;
+
+        /* SA_ONSTACK: deliver on the alternate stack when one is
+         * enabled and the thread is not already running on it
+         * (nested delivery then uses the current stack). */
+        if ((act.flags & L4A_SA_ONSTACK) != 0U &&
+            (ctx->sigalt_flags & L4A_SS_DISABLE) == 0U &&
+            ctx->sigalt_size != 0U &&
+            (sp < ctx->sigalt_sp ||
+             sp >= ctx->sigalt_sp + ctx->sigalt_size)) {
+            base = ctx->sigalt_sp + ctx->sigalt_size;
+        }
+        newsp = (base - (uint32_t)sizeof(mips_rt_sigframe_t)) &
+                (uint32_t)~7U;
+        if ((ctx->gpr[MIPS32_REG_SP] & 7U) != 0U) {
+            ctx->gpr[MIPS32_REG_SP] &= (uint32_t)~7U;
+        }
     }
-    newsp = (ctx->gpr[MIPS32_REG_SP] - (uint32_t)sizeof(mips_rt_sigframe_t)) &
-            (uint32_t)~7U;
     if (!l4a_range_ok(ctx, newsp, (uint32_t)sizeof(mips_rt_sigframe_t),
             (uint32_t)PROT_WRITE)) {
         return -1;
     }
-    act = g_actions[(unsigned)signo];
     if (act.restorer != 0U) {
         ra = act.restorer;
     } else {
@@ -608,6 +617,10 @@ int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
     ctx->gpr[MIPS32_REG_A0] = (uint32_t)signo;
     ctx->gpr[MIPS32_REG_A1] = newsp + 24U;
     ctx->gpr[MIPS32_REG_A2] = newsp + 152U;
+    /* PIC call convention: the handler prologue ($gp recompute via
+     * .cpload) needs $t9 = own function address, exactly as a direct
+     * jalr through t9 would provide (matches qemu-user). */
+    ctx->gpr[25] = act.handler;
     ctx->gpr[MIPS32_REG_RA] = ra;
     ctx->gpr[MIPS32_REG_SP] = newsp;
     ctx->gpr[MIPS32_REG_ZERO] = 0U;
@@ -663,18 +676,23 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
         return -L4A_EFAULT;
     }
     be = mips_is_be(ctx);
+    /* The frame stores GPRs, sc_pc, hi and lo as 8-byte big- or
+     * little-endian words (see mips_raise_guest); read them back as
+     * 64-bit and truncate.  A 32-bit read loads the zero upper half
+     * on BE and wipes the restored register. */
     for (i = 1; i < 32U; i++) {
-        ctx->gpr[i] = l4a_get32(ctx, sp + 192U + 8U * i, be);
+        ctx->gpr[i] =
+            (uint32_t)l4a_get64(ctx, sp + 192U + 8U * i, be);
     }
     ctx->gpr[MIPS32_REG_ZERO] = 0U;
     for (i = 0; i < 32U; i++) {
         ctx->fpr[i] = l4a_get64(ctx, sp + 448U + 8U * i, be);
     }
-    ctx->pc = l4a_get32(ctx, sp + 184U, be);
+    ctx->pc = (uint32_t)l4a_get64(ctx, sp + 184U, be);
     ctx->next_pc = ctx->pc + 4U;
     ctx->fcsr = l4a_get32(ctx, sp + 708U, be);
-    ctx->hi = l4a_get32(ctx, sp + 728U, be);
-    ctx->lo = l4a_get32(ctx, sp + 736U, be);
+    ctx->hi = (uint32_t)l4a_get64(ctx, sp + 728U, be);
+    ctx->lo = (uint32_t)l4a_get64(ctx, sp + 736U, be);
     for (i = 0; i < 4U; i++) {
         saved.sig[i] = l4a_get32(ctx, sp + 768U + 4U * i, be);
     }
@@ -686,4 +704,120 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
     ctx->exit_reason = MIPS32_EXIT_NONE;
     ctx->exit_info = 0U;
     return 0;
+}
+
+/* Deliver signo synchronously or die by it. When a real guest handler
+ * is installed the frame is built and the caller resumes at the
+ * handler (exit_reason cleared to NONE by mips_raise_guest); otherwise
+ * the host process dies by the same signal number (MIPS and AArch64
+ * Linux share asm-generic numbers for 4/5/8/10/11). Never returns. */
+void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr)
+{
+    if (ctx != NULL && mips_signal_has_handler(signo) &&
+        mips_raise_guest(ctx, signo, addr) == 0) {
+        return;
+    }
+    (void)raise(signo);
+    _Exit(128 + (signo & 0x7F));
+}
+
+/* True when the live guest sp runs on the alternate stack. */
+static int l4a_on_altstack(const mips32_ctx_t *ctx)
+{
+    uint32_t sp;
+
+    if (ctx == NULL || ctx->sigalt_size == 0U ||
+        (ctx->sigalt_flags & L4A_SS_DISABLE) != 0U) {
+        return 0;
+    }
+    sp = ctx->gpr[MIPS32_REG_SP];
+    return sp >= ctx->sigalt_sp &&
+           sp < ctx->sigalt_sp + ctx->sigalt_size;
+}
+
+/* sigaltstack(ss, oss): O32 stack_t is 12 bytes {sp, flags, size}. */
+int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
+{
+    int ok = 1;
+    int be;
+    uint32_t ss_va;
+    uint32_t oss_va;
+
+    if (ctx == NULL) {
+        return -L4A_EFAULT;
+    }
+    ss_va = l4a_arg(ctx, sp, 0, &ok);
+    oss_va = l4a_arg(ctx, sp, 1, &ok);
+    if (!ok) {
+        return l4a_ret(ctx, -L4A_EFAULT);
+    }
+    be = mips_is_be(ctx);
+    if (oss_va != 0U) {
+        uint32_t flags;
+
+        if (!l4a_range_ok(ctx, oss_va, 12U, (uint32_t)PROT_WRITE)) {
+            return l4a_ret(ctx, -L4A_EFAULT);
+        }
+        flags = ((ctx->sigalt_flags & L4A_SS_DISABLE) != 0U ||
+                 ctx->sigalt_size == 0U)
+                    ? L4A_SS_DISABLE
+                    : (l4a_on_altstack(ctx) ? L4A_SS_ONSTACK : 0U);
+        l4a_put32(ctx, oss_va, ctx->sigalt_sp, be);
+        l4a_put32(ctx, oss_va + 4U, flags, be);
+        l4a_put32(ctx, oss_va + 8U, ctx->sigalt_size, be);
+    }
+    if (ss_va != 0U) {
+        uint32_t nsp;
+        uint32_t nflags;
+        uint32_t nsize;
+
+        if (!l4a_range_ok(ctx, ss_va, 12U, (uint32_t)PROT_READ)) {
+            return l4a_ret(ctx, -L4A_EFAULT);
+        }
+        nsp = l4a_get32(ctx, ss_va, be);
+        nflags = l4a_get32(ctx, ss_va + 4U, be);
+        nsize = l4a_get32(ctx, ss_va + 8U, be);
+        if (nflags != L4A_SS_DISABLE && nflags != 0U &&
+            nflags != L4A_SS_ONSTACK) {
+            return l4a_ret(ctx, -L4A_EINVAL);
+        }
+        if (nflags == L4A_SS_DISABLE) {
+            ctx->sigalt_flags = L4A_SS_DISABLE;
+            ctx->sigalt_size = 0U;
+            ctx->sigalt_sp = 0U;
+            return l4a_ret(ctx, 0);
+        }
+        if (l4a_on_altstack(ctx)) {
+            return l4a_ret(ctx, -L4A_EPERM);
+        }
+        if (nsize < L4A_MINSIGSTKSZ) {
+            return l4a_ret(ctx, -L4A_ENOMEM);
+        }
+        ctx->sigalt_sp = nsp;
+        ctx->sigalt_size = nsize;
+        ctx->sigalt_flags = 0U;
+    }
+    return l4a_ret(ctx, 0);
+}
+
+/* execve: drop every disposition, mask, live frame and altstack
+ * (satisfies the weak reference in src/os/proc.c). */
+void mips32_signals_reset_for_exec(mips32_ctx_t *ctx)
+{
+    size_t i;
+
+    for (i = 0; i <= L4A_NSIG; i++) {
+        g_actions[i].installed = 0;
+        g_actions[i].handler = L4A_SIG_DFL;
+        g_actions[i].flags = 0U;
+        g_actions[i].restorer = 0U;
+        memset(g_actions[i].mask.sig, 0, sizeof(g_actions[i].mask.sig));
+    }
+    memset(g_blocked.sig, 0, sizeof(g_blocked.sig));
+    g_depth = 0;
+    if (ctx != NULL) {
+        ctx->sigalt_sp = 0U;
+        ctx->sigalt_size = 0U;
+        ctx->sigalt_flags = L4A_SS_DISABLE;
+    }
 }

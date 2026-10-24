@@ -10,8 +10,8 @@
  * experiments/E03/FINDINGS.md (qemu-mipsel 7.2 ground truth), selected
  * by ctx->nan2008: Legacy quiet bit = fraction MSB clear, 2008 quiet
  * bit = fraction MSB set; sNaN arithmetic input raises Invalid
- * (Cause.V + Flags.V, trap via mips_fault when Enable.V is set, else
- * the operand quieted in-mode with payload preserved).
+ * (Cause.V + Flags.V, trap via mips_trap SIGFPE when Enable.V is set,
+ * else the operand quieted in-mode with payload preserved).
  *
  * Deliberate E03-over-SPEC point: SPEC 2.2 calls ABS/NEG arithmetic
  * that signals Invalid on sNaN, but qemu 7.2 never signals for
@@ -49,13 +49,14 @@ static void fp_raise(struct fp_st *s, unsigned e)
 }
 
 /* Commit causes/flags. Trap-enabled: Cause sticks, Flags do not (E03:
- * post-trap FCSR keeps Cause.V with no Flags.V), dest unwritten,
- * mips_fault records EXIT_FAULT at the faulting pc. */
+ * post-trap FCSR keeps Cause.V with no Flags.V), dest unwritten.
+ * RC4: a trap-enabled Invalid operation is a synchronous SIGFPE
+ * delivered (or fatal) via mips_trap, never a SEGV-class fault. */
 static int fp_commit(struct fp_st *s)
 {
     s->ctx->fcsr |= s->cause;
     if (s->trap) {
-        mips_fault(s->ctx, s->pc);
+        mips_trap(s->ctx, 8, s->pc);
         return MIPS_FAULT;
     }
     s->ctx->fcsr |= s->fl;
@@ -706,7 +707,7 @@ static uint64_t fp_cvt_fmt(struct fp_st *s, unsigned df, uint64_t w)
 static int fp_even(mips32_ctx_t *ctx, uint32_t pc, unsigned r)
 {
     if (ctx->fr_mode == 0u && (r & 1u) != 0u) {
-        mips_fault(ctx, pc);
+        mips_trap(ctx, 4, pc); /* Reserved: odd 64-bit lane in FR=0. */
         return MIPS_FAULT;
     }
     return 0;
@@ -773,7 +774,7 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
             v = 0x7FFFFFFFFFFFFFFFULL;
         return fp_write_d(&s, fd, v);
     default:
-        mips_fault(ctx, pc);
+        mips_trap(ctx, 4, pc); /* Reserved S/D funct. */
         return MIPS_FAULT;
     }
     /* Arithmetic cases 0..4 break out with v set; shared format write. */
@@ -794,7 +795,7 @@ static int fp_fmt_wl(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
 
     if ((func != 32u && func != 33u) || (ctx->fr_mode == 0u &&
         ((src64 && (fs & 1u)) || (func == 33u && (fd & 1u))))) {
-        mips_fault(ctx, pc);
+        mips_trap(ctx, 4, pc); /* Reserved W/L funct or FR=0 lane. */
         return MIPS_FAULT;
     }
     v = src64 ? (int64_t)ctx->fpr[fs] : (int64_t)(int32_t)ctx->fpr[fs];
@@ -852,7 +853,7 @@ static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 {
     if (d->op != 0x11u) {
-        mips_fault(ctx, pc);
+        mips_trap(ctx, 4, pc); /* Reserved COP1-adjacent encoding. */
         return MIPS_FAULT;
     }
     switch (d->rs) {
@@ -877,7 +878,7 @@ int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
         break;
     }
     /* MFC1/MTC1/CFC1/CTC1 are claimed by fpmove_cop1; DMFC1/DMTC1 have
-     * no 64-bit GPRs on MIPS32 and PS is unimplemented: fault. */
-    mips_fault(ctx, pc);
+     * no 64-bit GPRs on MIPS32 and PS is unimplemented: SIGILL. */
+    mips_trap(ctx, 4, pc);
     return MIPS_FAULT;
 }

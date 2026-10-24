@@ -98,6 +98,7 @@
 #define MIPS32_NR_kill          4037 /* o32 index 37:  sys_kill */
 #define MIPS32_NR_rt_sigaction  4194 /* o32 index 194: sys_rt_sigaction */
 #define MIPS32_NR_rt_sigreturn  4193 /* o32 index 193: sys_rt_sigreturn */
+#define MIPS32_NR_sigaltstack 4206 /* o32 index 206: sys_sigaltstack */
 #define MIPS32_NR_rt_sigprocmask 4195 /* o32 index 195: sys_rt_sigprocmask */
 
 /* Thread pointer (SPEC 2.2: sets ctx->ulr) */

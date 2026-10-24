@@ -26,6 +26,9 @@
  * interp_step/interp_run return contract:
  * - 0 continues, MIPS_FAULT stops after mips_fault recorded EXIT_FAULT,
  *   1 stops with ctx->exit_reason already set (guest exit path).
+ * - RC4: when a fault is delivered to a guest handler, exit_reason is
+ *   cleared to NONE and interp_run resumes stepping at the handler
+ *   instead of stopping; delivery failure dies inside mips_trap.
  */
 
 #ifndef MIPS32RT_INTERP_H

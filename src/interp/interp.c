@@ -6,7 +6,7 @@
  *
  * Step-by-step oracle for the SPEC 2 integer subset: ALU/shifts, MULT/DIV
  * via hi/lo, branches with delay slots and likely-annul, J/JAL/JR/JALR
- * (ra = pc+8), SYSCALL via the L1c dispatcher, BREAK/traps via mips_fault,
+ * (ra = pc+8), SYSCALL via the L1c dispatcher, BREAK/traps via mips_trap,
  * aligned loads/stores, LWL/LWR/SWL/SWR per E05, LL/SC, RDHWR $29 and
  * MFC0/DMFC0 ulr alias, CACHE/PREF/SYNCI as NOP.  FP/COP1/COP2 and unknown
  * encodings fault; $0 stays 0; syscall exits clear llbit.
@@ -27,6 +27,19 @@ static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
         (void)fprintf(stderr, "F %08x at %08x\n", ctx->pc, addr);
     }
     mips_fault(ctx, addr);
+    return MIPS_FAULT;
+}
+
+/* Synchronous trap with an explicit signal (RC4): reserved encodings
+ * deliver SIGILL, BREAK/traps SIGTRAP, integer overflow SIGFPE. Only
+ * call this when no fault is recorded yet; mips_trap delivers or dies. */
+static int fault_signo_at(mips32_ctx_t *ctx, uint32_t addr, int signo)
+{
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x trap %d at %08x\n", ctx->pc, signo,
+                      addr);
+    }
+    mips_trap(ctx, signo, addr);
     return MIPS_FAULT;
 }
 
@@ -150,7 +163,7 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return exec_syscall(ctx);
     case 0x0Du: /* BREAK */
     case 0x3Fu: /* SDBBP */
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 5); /* SIGTRAP */
     case 0x0Fu: /* SYNC */
         return 0;
     case 0x10u: /* MFHI */
@@ -196,7 +209,7 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x20u: /* ADD */
         out = rs + rt;
         if (add_overflows(rs, rt, out)) {
-            return fault_at(ctx, cur_pc);
+            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
@@ -206,7 +219,7 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x22u: /* SUB */
         out = rs - rt;
         if (sub_overflows(rs, rt, out)) {
-            return fault_at(ctx, cur_pc);
+            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
@@ -232,19 +245,19 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rd, rs < rt ? 1u : 0u);
         return 0;
     case 0x30u: /* TGE */
-        return (int32_t)rs >= (int32_t)rt ? fault_at(ctx, cur_pc) : 0;
+        return (int32_t)rs >= (int32_t)rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     case 0x31u: /* TGEU */
-        return rs >= rt ? fault_at(ctx, cur_pc) : 0;
+        return rs >= rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     case 0x32u: /* TLT */
-        return (int32_t)rs < (int32_t)rt ? fault_at(ctx, cur_pc) : 0;
+        return (int32_t)rs < (int32_t)rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     case 0x33u: /* TLTU */
-        return rs < rt ? fault_at(ctx, cur_pc) : 0;
+        return rs < rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     case 0x34u: /* TEQ */
-        return rs == rt ? fault_at(ctx, cur_pc) : 0;
+        return rs == rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     case 0x36u: /* TNE */
-        return rs != rt ? fault_at(ctx, cur_pc) : 0;
+        return rs != rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
 }
 
@@ -300,7 +313,7 @@ static int exec_special2(mips32_ctx_t *ctx, uint32_t cur_pc,
         interp_set_reg(ctx, d->rd, clz32(~rs));
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
 }
 
@@ -348,16 +361,16 @@ static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
                            (uint32_t)(int32_t)(int16_t)(rt & 0xFFFFu));
             return 0;
         default:
-            return fault_at(ctx, cur_pc);
+            return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
         }
     case 0x3Bu: /* RDHWR rt, rd: rd selects, rt receives (MIPS32r2). */
         if (d->rd != MIPS32_RDHWR_ULR) {
-            return fault_at(ctx, cur_pc);
+            return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
         }
         interp_set_reg(ctx, d->rt, ctx->ulr);
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
 }
 
@@ -369,7 +382,7 @@ static int exec_cop0(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt, ctx->ulr);
         return 0;
     }
-    return fault_at(ctx, cur_pc);
+    return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
 }
 
 static int exec_regimm_trap(mips32_ctx_t *ctx, uint32_t cur_pc,
@@ -400,9 +413,9 @@ static int exec_regimm_trap(mips32_ctx_t *ctx, uint32_t cur_pc,
     case 0x1Fu: /* SYNCI: cache maintenance hint, NOP here */
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
-    return fire ? fault_at(ctx, cur_pc) : 0;
+    return fire ? fault_signo_at(ctx, cur_pc, 5) : 0; /* SIGTRAP */
 }
 
 static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
@@ -412,8 +425,9 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
 
     switch (d->op) {
     case 0x20u: /* LB */
+        /* guest_* records the fault itself; just propagate. */
         if (guest_ld8(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, (uint32_t)(int32_t)(int8_t)(v & 0xFFu));
         return 0;
@@ -422,7 +436,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, (uint32_t)(int32_t)(int16_t)(v & 0xFFFFu));
         return 0;
@@ -433,13 +447,13 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, v);
         return 0;
     case 0x24u: /* LBU */
         if (guest_ld8(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, v & 0xFFu);
         return 0;
@@ -448,7 +462,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, v & 0xFFFFu);
         return 0;
@@ -456,7 +470,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return do_lwr(ctx, addr, d->rt);
     case 0x28u: /* SB */
         if (guest_st8(ctx, addr, ctx->gpr[d->rt] & 0xFFu) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         return 0;
     case 0x29u: /* SH */
@@ -464,7 +478,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_st16(ctx, addr, ctx->gpr[d->rt] & 0xFFFFu) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         return 0;
     case 0x2Au: /* SWL */
@@ -474,7 +488,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_st32(ctx, addr, ctx->gpr[d->rt]) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         return 0;
     case 0x2Eu: /* SWR */
@@ -484,32 +498,40 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
+            return MIPS_FAULT;
         }
         ctx->llbit = 1;
         ctx->lladdr = addr;
         ctx->llval = v;
         interp_set_reg(ctx, d->rt, v);
         return 0;
-    case 0x38u: /* SC */
+    case 0x38u: { /* SC */
+        int sc_ok = 0;
+
         if ((addr & 3u) != 0u) {
             return fault_at(ctx, addr);
         }
-        if (guest_ld32(ctx, addr, &v) != 0) {
-            return fault_at(ctx, addr);
-        }
-        if (ctx->llbit != 0u && ctx->lladdr == addr && v == ctx->llval) {
-            if (guest_st32(ctx, addr, ctx->gpr[d->rt]) != 0) {
-                return fault_at(ctx, addr);
+        if (ctx->llbit != 0u && ctx->lladdr == addr) {
+            /* RC4 threads: the re-read/store pair must be one atomic
+             * step, otherwise two threads both observe the LL value
+             * and both succeed (mutex owner corruption).  The host
+             * CAS linearizes concurrent SCs; validation inside
+             * preserves the fault side effect. */
+            if (guest_sc32(ctx, addr, ctx->llval, ctx->gpr[d->rt],
+                           &sc_ok) != 0) {
+                return MIPS_FAULT;
             }
-            interp_set_reg(ctx, d->rt, 1u);
-        } else {
-            interp_set_reg(ctx, d->rt, 0u);
+        } else if (guest_ld32(ctx, addr, &v) != 0) {
+            /* Dead reservation still faults on a bad address (matches
+             * the LDXR side effect in the DBT emitter). */
+            return MIPS_FAULT;
         }
+        interp_set_reg(ctx, d->rt, (uint32_t)sc_ok);
         ctx->llbit = 0;
         return 0;
+    }
     default:
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
 }
 
@@ -527,7 +549,7 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         rs = ctx->gpr[d->rs];
         out = rs + (uint32_t)d->simm;
         if (add_overflows(rs, (uint32_t)d->simm, out)) {
-            return fault_at(ctx, cur_pc);
+            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
         }
         interp_set_reg(ctx, d->rt, out);
         return 0;
@@ -579,10 +601,8 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x35u: /* LDC1 */
     case 0x39u: /* SWC1 */
     case 0x3Du: /* SDC1 */
-        if (fpmove_mem(ctx, d) != 0) {
-            return fault_at(ctx, cur_pc);
-        }
-        return 0;
+        /* fpmove_mem records mapping faults itself; just propagate. */
+        return fpmove_mem(ctx, d);
     case 0x11u: /* COP1: moves via fpmove.c, arithmetic/BC1 via fp.c (L3a) */
         if (fpmove_cop1(ctx, d) != 0) {
             return fp_exec(ctx, cur_pc, d);
@@ -592,7 +612,7 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x33u: /* PREF */
         return 0;
     default: /* COP2/COP1X, MIPS64, reserved */
-        return fault_at(ctx, cur_pc);
+        return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
 }
 
@@ -692,7 +712,7 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
             taken = (int32_t)rs >= 0;
             break;
         default:
-            return fault_at(ctx, pc);
+            return fault_signo_at(ctx, pc, 4); /* SIGILL */
         }
         break;
     case 0x00u: /* JR / JALR */
@@ -702,11 +722,11 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
             link = 1;
             link_rd = d->rd;
         } else if (d->funct != 0x08u) {
-            return fault_at(ctx, pc);
+            return fault_signo_at(ctx, pc, 4); /* SIGILL */
         }
         break;
     default:
-        return fault_at(ctx, pc);
+        return fault_signo_at(ctx, pc, 4); /* SIGILL */
     }
 
     if (link) {
@@ -717,7 +737,11 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
         ctx->next_pc = pc + 12u;
         return 0;
     }
+    /* SPEC 2.2: the slot runs with ctx->pc at the slot, so a fault there
+     * reports branch_pc = pc (slot - 4) and sigreturn re-executes the
+     * branch and its delay slot. */
     ctx->in_delay_slot = 1;
+    ctx->pc = pc + 4u;
     {
         mips_dec_t s;
         int rc;
@@ -773,6 +797,14 @@ int interp_run(mips32_ctx_t *ctx)
     for (;;) {
         int rc = interp_step(ctx);
         if (rc != 0) {
+            /* RC4: a fault delivered to a guest handler clears
+             * exit_reason to NONE and redirects pc to the handler;
+             * resume stepping there instead of stopping.  Delivery
+             * failure dies inside mips_trap, so MIPS_FAULT with a
+             * surviving engine always means "delivered". */
+            if (rc == MIPS_FAULT && ctx->exit_reason == MIPS32_EXIT_NONE) {
+                continue;
+            }
             return rc;
         }
     }

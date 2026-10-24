@@ -9,7 +9,7 @@
  * pipe/pipe2, readv/writev, fcntl/fcntl64, ioctl (basic), stat64 family,
  * statx, getdents64, readlink/readlinkat, access, close_range, nanosleep,
  * clock_gettime(-64), getpid family, getrandom, futex (single-threaded),
- * rt_sigprocmask (mask accepted, not tracked), rt_sigaction (-ENOSYS),
+ * rt_sigaction/rt_sigprocmask/rt_sigreturn/sigaltstack (Phase 4),
  * set/get_robust_list.  Unknown syscalls keep -ENOSYS with $a3=1.
  *
  * Companion file src/os/syscalls_meta.c holds the fcntl/ioctl/stat/time
@@ -34,14 +34,12 @@
  * -EFAULT instead of raising, so unaligned guest buffers cannot trip
  * the aligned-only guest_ld/st32 fault path.
  *
- * Single-threaded honesty notes (Phase 4 wires the real machinery):
+ * Phase 4 notes (lanes L4a/L4b, see src/os/signals.c, src/os/threads.c):
  *  - futex: FUTEX_WAIT/FUTEX_WAKE (+PRIVATE) via the host futex; the
  *    wait is unconditional once *uaddr matches (no thread table yet).
- *  - rt_sigprocmask: validates how/setsize, zeroes the old mask (nothing
- *    is ever blocked here), returns 0; no mask is stored (Phase 4 owns
- *    the 128-bit guest masks).
- *  - rt_sigaction: -ENOSYS; static libc startup tolerates it because no
- *    handler can be installed before Phase 4 signal delivery exists.
+ *  - rt_sigaction / rt_sigprocmask record into the guest-owned 128-bit
+ *    tables; rt_sigreturn restores from the live frame (never wrapped);
+ *    sigaltstack manages the ctx alternate-stack fields.
  *  - set/get_robust_list: recorded in ctx (fields already exist); the
  *    kernel only wakes robust futexes on thread exit (Phase 4).
  */
@@ -858,9 +856,14 @@ int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
     case (uint32_t)MIPS32_NR_futex:
         return mips_sc_futex_thread(ctx, sp);
     case (uint32_t)MIPS32_NR_rt_sigprocmask:
-        return mips_sc_rt_sigprocmask(ctx, sp);
+        return mips_l4a_rt_sigprocmask(ctx, sp);
     case (uint32_t)MIPS32_NR_rt_sigaction:
-        return mips_sc_ret(ctx, -ENOSYS); /* delivered by Phase 4 (L4a) */
+        return mips_sc_rt_sigaction(ctx, sp);
+    case (uint32_t)MIPS32_NR_rt_sigreturn:
+        /* Restores $v0/$a3 from the live frame itself: never wrapped. */
+        return mips_rt_sigreturn(ctx);
+    case (uint32_t)MIPS32_NR_sigaltstack:
+        return mips_sc_sigaltstack(ctx, sp);
     case (uint32_t)MIPS32_NR_set_robust_list:
         return mips_sc_robust(ctx, sp, 1);
     case (uint32_t)MIPS32_NR_get_robust_list:

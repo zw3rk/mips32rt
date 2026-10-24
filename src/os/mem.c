@@ -81,9 +81,11 @@ static int range_covered(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
     return (uint64_t)cur >= end64;
 }
 
-/* Lane L4a query (src/os/signals.c): true when signo has a real guest
- * handler.  mips_raise_guest is declared by the frozen src/mips32rt.h. */
+/* Lane L4a queries (src/os/signals.c): true when signo has a real
+ * guest handler; mips_trap delivers or dies by the signal.  Both are
+ * declared by src/mips32rt.h. */
 extern int mips_signal_has_handler(int signo);
+extern void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr);
 
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
 {
@@ -102,16 +104,10 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
      * installed.  Misaligned data addresses fault as AdEL/AdES
      * (SIGBUS); aligned ones as TLB miss/permission faults (SIGSEGV).
      * mips_raise_guest clears exit_reason on delivery so the engine can
-     * resume at the handler; on -1 fall through to the Phase-1 death. */
+     * resume at the handler; without one the process dies by signal
+     * (139 for SIGSEGV, matching the Phase-1 exit shape). */
     signo = ((addr & 3U) != 0U) ? 10 : 11;
-    if (mips_signal_has_handler(signo) &&
-        mips_raise_guest(ctx, signo, addr) == 0) {
-        return;
-    }
-    /* Phase-1 mechanism (no guest handler): die by SIGSEGV like
-     * qemu-user for an unhandled fetch/AdE fault. */
-    (void)raise(SIGSEGV);
-    _Exit(139);
+    mips_trap(ctx, signo, addr);
 }
 
 int guest_ld8(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
@@ -249,5 +245,45 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
     memcpy(mips32_guest_ptr(ctx, va), b, 4U);
+    return 0;
+}
+
+int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
+               uint32_t new_val, int *ok)
+{
+    uint32_t  exp_pat;
+    uint32_t  new_pat;
+    uint32_t *hp;
+    int       swapped;
+
+    if (ctx == NULL || ok == NULL) {
+        return MIPS_FAULT;
+    }
+    if ((va & 3U) != 0U) {
+        mips_fault(ctx, va);
+        return MIPS_FAULT;
+    }
+    if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+        mips_fault(ctx, va);
+        return MIPS_FAULT;
+    }
+    /* Value-domain compare like LL/SC: the host mapping holds the
+     * guest-order byte pattern, so swap both sides on BE. */
+    if (mips_is_be(ctx)) {
+        exp_pat = ((exp_val >> 24) & 0xFFU) | ((exp_val >> 8) & 0xFF00U) |
+                  ((exp_val << 8) & 0xFF0000U) | ((exp_val << 24) & 0xFF000000U);
+        new_pat = ((new_val >> 24) & 0xFFU) | ((new_val >> 8) & 0xFF00U) |
+                  ((new_val << 8) & 0xFF0000U) | ((new_val << 24) & 0xFF000000U);
+    } else {
+        exp_pat = exp_val;
+        new_pat = new_val;
+    }
+    hp = (uint32_t *)(void *)mips32_guest_ptr(ctx, va);
+    swapped = 0;
+    if (__atomic_compare_exchange_n(hp, &exp_pat, new_pat, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        swapped = 1;
+    }
+    *ok = swapped;
     return 0;
 }

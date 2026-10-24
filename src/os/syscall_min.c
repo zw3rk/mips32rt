@@ -50,6 +50,13 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+/* Raw host syscalls without _GNU_SOURCE (which would reshuffle musl's
+ * struct utsname spelling above): syscall(2) is a stable ABI. */
+extern long syscall(long __n, ...);
+#endif
+
 /* Locally frozen: __NR_set_tid_address = __NR_Linux + 252 (see above). */
 #define MIPS32_NR_TID_ADDRESS 4252U
 
@@ -239,6 +246,14 @@ static int32_t sc_mmap(mips32_ctx_t *ctx, uint32_t sp, int is_mmap2)
         }
         pgoff = off >> 12;
     }
+    /* MIPS MAP_ANONYMOUS is 0x800 (classic MAP_ANON, UAPI
+     * arch/mips/include/uapi/asm/mman.h), not the asm-generic 0x20
+     * the RT32 VMA layer matches; normalize at the O32 boundary so
+     * the window layer stays in host form.  SHARED/PRIVATE/FIXED and
+     * FIXED_NOREPLACE already match. */
+    if ((flags & 0x800U) != 0U) {
+        flags = (flags & ~0x800U) | 0x20U;
+    }
     res = rt32_vm_mmap2(ctx, addr, len, prot, flags, (int)(int32_t)fd_u,
                         pgoff);
     return sc_ret(ctx, (int32_t)res);
@@ -309,8 +324,25 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_exit_group: {
         uint32_t status = o32_arg(ctx, sp, 0, &ok);
         (void)ok;
-        exit((int)(status & 0xFFU));
-        return sc_ret(ctx, 0);
+        /* RC4: a CLONE_VM thread ending via plain exit() leaves the
+         * group alive (raw SYS_exit + CLEARTID wake in threads.c);
+         * exit_group always tears the whole group down.  Group
+         * teardown is a raw SYS_exit_group, never libc exit(): clone
+         * children die via raw SYS_exit while possibly holding libc
+         * locks (malloc arena, stdio), so running the translator's
+         * own atexit/flush teardown hangs or crashes intermittently.
+         * The guest already ran its own exit handlers; the translator
+         * holds no buffered guest output. */
+        if (nr == (uint32_t)MIPS32_NR_exit && ctx->is_thread_clone) {
+            mips_thread_exit(ctx, (int)(status & 0xFFU));
+            return sc_ret(ctx, 0); /* unreachable */
+        }
+#if defined(__linux__) && defined(SYS_exit_group)
+        (void)syscall(SYS_exit_group, (int)(status & 0xFFU));
+#else
+        _Exit((int)(status & 0xFFU));
+#endif
+        return sc_ret(ctx, 0); /* unreachable */
     }
     case MIPS32_NR_read:
         return sc_read(ctx, sp);
@@ -407,6 +439,8 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_futex:
     case MIPS32_NR_rt_sigprocmask:
     case MIPS32_NR_rt_sigaction:
+    case MIPS32_NR_rt_sigreturn:
+    case MIPS32_NR_sigaltstack:
     case MIPS32_NR_set_robust_list:
     case MIPS32_NR_get_robust_list:
     case MIPS32_NR_unlink:

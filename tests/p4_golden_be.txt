@@ -1,0 +1,9 @@
+P4 sigreturn-recover: ok sig=11 count=1 addr-ok=1 val=0
+P4 frame-modify-skip: ok sig=11 count=1 addr-ok=1 kept=a5a5a5a5
+P4 sigbus-misaligned: ok sig=10 addr-ok=1 kept=deadbeef
+P4 threads: ok shared=4000 llsc=4000 loc=2000+2000
+P4 fork-wait: ok exited=1 code=43
+P4 execve-enoent: ok errno=2
+P4 checks: 6 pass, 0 fail
+P4-RESULT: PASS
+P4-EXIT=0

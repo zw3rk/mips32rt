@@ -114,7 +114,6 @@ int32_t mips_sc_clock_gettime(mips32_ctx_t *ctx, uint32_t sp, int wide);
 int32_t mips_sc_getrandom(mips32_ctx_t *ctx, uint32_t sp);
 int32_t mips_sc_futex(mips32_ctx_t *ctx, uint32_t sp);
 int32_t mips_sc_getxid(mips32_ctx_t *ctx, uint32_t nr);
-int32_t mips_sc_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp);
 int32_t mips_sc_robust(mips32_ctx_t *ctx, uint32_t sp, int is_set);
 
 #endif /* MIPS32_SYSCALLS_PRIV_H */

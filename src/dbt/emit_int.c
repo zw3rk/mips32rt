@@ -4,18 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Frozen dbt_emit_int via a64_emit.h only: ALU, shifts, MULT/DIV/MADD/
- * MSUB/MUL/CLZ/CLO, hi/lo, EXT/INS/BSHFL, RDHWR ulr (+ MFC0/DMFC0 alias),
- * branches/jumps + likely-annul (delay slot inline, link ra = pc + 8),
- * aligned loads/stores (LWL/LWR/SWL/SWR per E05, LL/SC via LDXR/STXR),
- * CACHE/PREF/SYNCI/SYNC NOPs. COP1/COP2/fp-mem and unknown encodings exit
- * EXIT_UNDEF (dispatcher interp_step fallback).
- *
- * SPEC 2.1: cached GPRs in w0..w15 ($0 is wzr), x19 = xCtx, x20 = xG,
- * scratch w16/w17/w21, w22 = guest EA, x23 = indirect target, x24 = scratch;
- * x18 never touched. hi/lo/ulr/ll stay in ctx. Exits flush the cached set,
- * advance ctx->pc, set w0 = reason and w1 = info, then ret (block ABI in
- * src/dbt/dbt.h). Misaligned LW/SW/LL/SC exit EXIT_FAULT inline.
+ * Frozen dbt_emit_int via a64_emit.h: ALU/shifts/MULT/DIV, hi/lo, EXT/INS/
+ * BSHFL, RDHWR ulr, branches + likely-annul (slot inline, ra = pc + 8),
+ * mem incl. E05 unaligned + LDXR/STXR LL/SC, CACHE/PREF/SYNC NOPs; COP1/
+ * COP2/fp-mem/unknown exit EXIT_UNDEF. SPEC 2.1 GPRs in w0..w15, x19 =
+ * xCtx, x20 = xG, x18 untouched; exits flush, advance pc, set w0/w1, ret.
  */
 
 #include <stddef.h>
@@ -123,6 +116,13 @@ static void emit_flush(a64_buf_t *b)
     for (i = 0U; i < 16U; i++)
         a64_emit_str_imm_w(b, (unsigned)kGprHost[kCached[i]], A64_XCTX,
                            (uint32_t)kCached[i] * 4U);
+}
+/* RC4: flush cached GPRs + record fpc in ctx->pc before a guest-memory access that can host-fault (delivery reads ctx). */
+static void emit_sync_pc(a64_buf_t *b, uint32_t fpc)
+{
+    emit_flush(b);
+    a64_emit_mov_imm32(b, A64_TMP1, fpc);
+    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
 }
 static void emit_pc_imm(a64_buf_t *b, uint32_t pc, uint32_t npc)
 {
@@ -545,6 +545,7 @@ static void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d,
                              uint32_t fpc, int be)
 {
     unsigned rt = d->rt, v, dst;
+    emit_sync_pc(b, fpc);
     int h = gpr_host(rt);
     dst = (h >= 0) ? (unsigned)h : A64_TMP1;
     switch (d->op) {
@@ -597,9 +598,10 @@ static unsigned merge_pos(unsigned op, int be, unsigned i, unsigned k)
 }
 
 /* LWL/LWR/SWL/SWR: 4-way k dispatch, straight-line byte paths (E05). */
-static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, int be)
+static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
 {
     unsigned rt = d->rt, lo, hi, i, k, o;
+    emit_sync_pc(b, fpc);
     int is_load = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_LWR);
     int left = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_SWL);
     size_t ph_cbz[3], ph_end[3];
@@ -650,7 +652,7 @@ static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, int be)
     for (o = 0U; o < 3U; o++) a64_patch_b_cond(b, ph_end[o], b->count);
 }
 
-/* LL: aligned load + llbit/lladdr/llval record. */
+/* LL: aligned load + llbit/lladdr/llval record (align guard syncs). */
 static void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
 {
     emit_align_fault(b, 1U, fpc);
@@ -663,8 +665,8 @@ static void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
     a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_LLVAL_OFFSET);
 }
 
-/* SC: LDXR first (fault side effect even when llbit is clear, matching the
- * interpreter), then llbit/llval check, STXR retry loop in x24/w16. */
+/* SC: LDXR first (fault side effect even when llbit is clear, matching
+ * interp), then llbit/llval check, STXR retry loop in x24/w16. */
 static void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
 {
     unsigned data = op_val(b, d->rt, A64_TMP3);
@@ -716,8 +718,7 @@ static void emit_link_imm(a64_buf_t *b, unsigned rd, uint32_t val)
     else { a64_emit_mov_imm32(b, A64_TMP1, val); a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, rd * 4U); }
 }
 
-/* Branch + inline delay slot. Flags are set before the link write; the
- * indirect target is saved in x23 before the slot runs. */
+/* Branch + inline delay slot (flags before link write; x23 holds the indirect target across the slot). */
 static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
                         const mips_dec_t *s, uint32_t cur, int be)
 {
@@ -800,7 +801,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         return 0;
     case MIPS_OP_LWL: case MIPS_OP_LWR: case MIPS_OP_SWL: case MIPS_OP_SWR:
         emit_ea(b, d->rs, d->simm);
-        emit_mem_unaligned(b, d, be);
+        emit_mem_unaligned(b, d, fpc, be);
         return 0;
     case MIPS_OP_LL: case MIPS_OP_SC:
         emit_ea(b, d->rs, d->simm);
@@ -849,8 +850,7 @@ static int slot_ok(const mips_dec_t *d)
     }
 }
 
-/* Frozen contract: insns[0..count) at guest pc into out[0..cap). A
- * mid-block decline exits EXIT_UNDEF with *out_end past the prefix. */
+/* Frozen contract: insns[0..count) at guest pc into out[0..cap); a mid-block decline exits EXIT_UNDEF with *out_end past the prefix. */
 int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
                  unsigned count, uint8_t *out, size_t cap,
                  size_t *out_len, uint32_t *out_end)

@@ -14,14 +14,16 @@
  *   so this lane needs no header extension.
  *
  * Clone (O32 args: flags=$a0, child_stack=$a1, ptid=$a2, tls=$a3,
- * ctid=stack slot 5): CLONE_VM-family guest threads run on host clone(2)
- * sharing the [G, G + 4 GiB) window (CLONE_VM shares the address space,
- * so mips32_guest_ptr addresses stay valid in every thread).  The child
- * gets its own host stack plus a copy of mips32_ctx_t resumed past the
- * syscall (pc = child return, v0 = 0, a3 = 0), TLS from CLONE_SETTLS,
- * ptid writeback for CLONE_PARENT_SETTID, ctid writeback for
- * CLONE_CHILD_SETTID, and a 0-write plus FUTEX_WAKE for
- * CLONE_CHILD_CLEARTID on thread exit.  CLONE_UNTRACED is ignored.
+ * ctid=stack slot 5): CLONE_VM-family guest threads run on detached
+ * host pthreads sharing the [G, G + 4 GiB) window (CLONE_VM shares the
+ * address space, so mips32_guest_ptr addresses stay valid in every
+ * thread), each with its own musl TLS so __thread engine/guard state
+ * stays per-thread.  The child gets its own host stack plus a copy of
+ * mips32_ctx_t resumed past the syscall (pc = child return, v0 = 0,
+ * a3 = 0), guest TLS from CLONE_SETTLS (ctx->ulr), ptid writeback for
+ * CLONE_PARENT_SETTID, ctid writeback for CLONE_CHILD_SETTID, and a
+ * 0-write plus FUTEX_WAKE for CLONE_CHILD_CLEARTID on thread exit.
+ * CLONE_UNTRACED is ignored.
  * Flags without CLONE_VM, namespace flags (NEWNS/NEWCGROUP/NEWUTS/
  * NEWIPC/NEWUSER/NEWPID/NEWNET), and CLONE_PIDFD return -EINVAL.
  *
@@ -34,11 +36,12 @@
  * copies are retained after thread death for the L4c wait4 reaper.
  *
  * Futex (O32 args: uaddr=$a0, op=$a1, val=$a2, timeout=$a3,
- * uaddr2=slot 5, val3=slot 6): FUTEX_WAIT/WAKE with FUTEX_PRIVATE_FLAG,
- * FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, and FUTEX_WAKE_OP pass through to the
- * host futex on the validated guest uaddr (misaligned -> -EINVAL,
- * unmapped -> -EFAULT).  llbit is cleared across every op.  Anything else
- * (bitset, fd, NUMA, TRYLOCK variants) returns -ENOSYS.
+ * uaddr2=slot 5, val3=slot 6): FUTEX_WAIT/WAKE/WAIT_BITSET/WAKE_BITSET
+ * with FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME, FUTEX_REQUEUE,
+ * FUTEX_CMP_REQUEUE, and FUTEX_WAKE_OP pass through to the host futex
+ * on the validated guest uaddr (misaligned -> -EINVAL, unmapped ->
+ * -EFAULT).  llbit is cleared across every op.  Anything else
+ * (PI, fd, NUMA, TRYLOCK variants) returns -ENOSYS.
  *
  * Non-Linux hosts: clone and futex report -ENOSYS (same $a3 convention).
  */
@@ -54,6 +57,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -101,6 +105,9 @@
 #define MIPS_FUTEX_REQUEUE     3
 #define MIPS_FUTEX_CMP_REQUEUE 4
 #define MIPS_FUTEX_WAKE_OP     5
+#define MIPS_FUTEX_WAIT_BITSET 9
+#define MIPS_FUTEX_WAKE_BITSET 10
+#define MIPS_FUTEX_CLOCK_REALTIME 256
 
 /* ---- Thread record (heap; ownership passes to the L4c wait4 reaper) ---- */
 
@@ -112,6 +119,11 @@ struct mips_thread {
     uint32_t     ctid;
     int          want_child_set;
     int          want_clear;
+    /* Parent/child handshake: the child publishes its host tid, then
+     * wakes the parent, which needs the tid for the guest clone
+     * return value before resuming. */
+    _Atomic int  started;
+    _Atomic int  child_tid;
 };
 
 #if defined(__linux__) && defined(SYS_futex) && defined(SYS_clone) && \
@@ -167,15 +179,55 @@ static int mips_thread_main(void *arg)
     return 1; /* unreachable; keeps noreturn-less compilers quiet */
 }
 
+/* Guest exit() inside a CLONE_VM thread (RC4): end this host thread
+ * alone, mirroring the engine-return path above (CLEARTID 0-write plus
+ * FUTEX_WAKE, live-clone accounting, raw SYS_exit).  The group stays
+ * alive; exit_group still tears everything down.  Does not return. */
+void mips_thread_exit(mips32_ctx_t *ctx, int status)
+{
+    if (ctx->clear_child_tid != 0U) {
+        (void)thread_write_tid(ctx, ctx->clear_child_tid, 0U);
+        (void)syscall(SYS_futex, mips32_guest_ptr(ctx, ctx->clear_child_tid),
+                      (int)MIPS_FUTEX_WAKE, (uint32_t)INT_MAX, NULL, NULL,
+                      (uint32_t)0);
+    }
+    (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
+                                    memory_order_relaxed);
+    (void)syscall(SYS_exit, status);
+    _Exit(status); /* unreachable; raw SYS_exit never returns */
+}
+
+/* Host thread entry for CLONE_VM-family guest threads (RC4): runs on
+ * a musl-owned pthread (detached, on the mmap'd stack below) so the
+ * child gets a real per-thread TLS block.  An earlier revision used a
+ * raw SYS_clone child path without CLONE_SETTLS, which left the child
+ * sharing the parent's TLS: the child's __thread guard/cache state
+ * (hf_armed, hf_jb, dbt_cache, ...) aliased the parent's, so one
+ * thread's disarm/recovery corrupted the other's in-flight block and
+ * faulted unarmed pool code.  Guest-visible clone effects (TLS via
+ * ulr, ptid/ctid writeback, CLEARTID wake) stay emulated in-band in
+ * mips_thread_main; the host thread is only a VM-sharing vehicle and
+ * never returns (engines exit the thread via raw SYS_exit). */
+static void *mips_host_thread_entry(void *arg)
+{
+    struct mips_thread *t = (struct mips_thread *)arg;
+
+    atomic_store_explicit(&t->child_tid,
+                          (int)syscall(SYS_gettid), memory_order_relaxed);
+    atomic_store_explicit(&t->started, 1, memory_order_release);
+    (void)syscall(SYS_futex, &t->started, (int)MIPS_FUTEX_WAKE,
+                  (uint32_t)INT_MAX, NULL, NULL, (uint32_t)0);
+    (void)mips_thread_main(t);
+    return NULL; /* unreachable; mips_thread_main exits the thread */
+}
+
 /* CLONE_VM-family clone; called with ctx->pc on the syscall instruction. */
 int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
 {
     struct mips_thread *t = NULL;
     void               *stack = NULL;
-    void               *stack_top;
     int                 ok = 1;
     int                 mmap_flags;
-    int                 host_flags;
     uint32_t            flags;
     uint32_t            child_stack;
     uint32_t            ptid;
@@ -193,11 +245,14 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     }
     ctx->llbit = 0U; /* SPEC 2.2: clone clears the LL reservation */
     flags &= ~MIPS_CLONE_UNTRACED; /* ptrace never attaches: ignored */
-    if ((flags & MIPS_CLONE_VM) == 0U) {
-        return mips_sc_ret(ctx, -EINVAL); /* non-VM clone: no address space */
-    }
     if ((flags & (MIPS_CLONE_NEWNS_ALL | MIPS_CLONE_PIDFD)) != 0U) {
         return mips_sc_ret(ctx, -EINVAL); /* namespaces/pidfd unsupported */
+    }
+    if ((flags & MIPS_CLONE_VM) == 0U) {
+        /* No address space shared: fork semantics (CoW). glibc implements
+         * fork() as clone without CLONE_VM; vfork likewise arrives here. */
+        extern int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp);
+        return mips_proc_fork(ctx, sp);
     }
     if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U &&
         !mips_sc_range_ok(ctx, ptid, 4U, (uint32_t)PROT_WRITE)) {
@@ -261,25 +316,45 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     t->want_clear      = (ctid != 0U &&
                          (flags & MIPS_CLONE_CHILD_CLEARTID) != 0U);
 
-    /* Emulate SETTLS/SETTID/CLEARTID in-band; the host clone only carries
-     * the sharing and scheduling flags.  CLONE_THREAD groups need a zero
-     * exit signal, matching pthread_create. */
-    host_flags = (int)(flags & ~(MIPS_CLONE_SETTLS |
-                                 MIPS_CLONE_PARENT_SETTID |
-                                 MIPS_CLONE_CHILD_SETTID |
-                                 MIPS_CLONE_CHILD_CLEARTID));
-    if ((flags & MIPS_CLONE_THREAD) != 0U) {
-        host_flags &= ~0xFF;
-    }
-    stack_top = (void *)((uintptr_t)stack + MIPS_THREAD_STACK_SIZE);
-    r = (long)clone(mips_thread_main, stack_top, host_flags, t, NULL, NULL,
-                    NULL);
-    if (r < 0) {
-        int e = errno;
+    /* Emulate SETTLS/SETTID/CLEARTID in-band; the host thread only
+     * carries the sharing (see mips_host_thread_entry). */
+    /* Detached musl pthread on the mmap'd stack (see
+     * mips_host_thread_entry): real per-thread TLS for the child.
+     * The parent waits for the child's tid handshake before
+     * returning it to the guest. */
+    {
+        pthread_t      th;
+        pthread_attr_t at;
+        int            pr;
 
-        (void)munmap(stack, MIPS_THREAD_STACK_SIZE);
-        free(t);
-        return mips_sc_ret(ctx, -(int32_t)e);
+        atomic_init(&t->started, 0);
+        atomic_init(&t->child_tid, 0);
+        pr = pthread_attr_init(&at);
+        if (pr == 0) {
+            pr = pthread_attr_setstack(&at, stack,
+                                       MIPS_THREAD_STACK_SIZE);
+        }
+        if (pr == 0) {
+            pr = pthread_attr_setdetachstate(&at,
+                                             PTHREAD_CREATE_DETACHED);
+        }
+        if (pr == 0) {
+            pr = pthread_create(&th, &at, mips_host_thread_entry, t);
+        }
+        (void)pthread_attr_destroy(&at);
+        if (pr != 0) {
+            (void)munmap(stack, MIPS_THREAD_STACK_SIZE);
+            free(t);
+            return mips_sc_ret(ctx, -(int32_t)pr);
+        }
+        (void)th;
+        while (atomic_load_explicit(&t->started,
+                                    memory_order_acquire) == 0) {
+            (void)syscall(SYS_futex, &t->started, (int)MIPS_FUTEX_WAIT,
+                          (uint32_t)0, NULL, NULL, (uint32_t)0);
+        }
+        r = (long)atomic_load_explicit(&t->child_tid,
+                                       memory_order_relaxed);
     }
     if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U &&
         thread_write_tid(ctx, ptid, (uint32_t)r) != 0) {
@@ -313,8 +388,10 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
     int      ok = 1;
     int      be;
     int      priv;
+    int      clk;
     int      rc;
     int      base_op;
+    int      host_op;
     uint8_t  cur[4];
     uint32_t uaddr;
     uint32_t op;
@@ -337,10 +414,18 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
         return mips_sc_ret(ctx, rc);
     }
     priv    = ((op & (uint32_t)MIPS_FUTEX_PRIVATE_FLAG) != 0U);
-    base_op = (int)(op & ~(uint32_t)MIPS_FUTEX_PRIVATE_FLAG);
+    clk     = ((op & (uint32_t)MIPS_FUTEX_CLOCK_REALTIME) != 0U);
+    base_op = (int)(op & ~((uint32_t)MIPS_FUTEX_PRIVATE_FLAG |
+                           (uint32_t)MIPS_FUTEX_CLOCK_REALTIME));
     be      = mips_is_be(ctx);
+    /* Host futex numbering is arch-independent: base op, PRIVATE and
+     * CLOCK_REALTIME flags map 1:1. */
+    host_op = (int)(((priv ? (uint32_t)MIPS_FUTEX_PRIVATE_FLAG : 0U) |
+                     (clk ? (uint32_t)MIPS_FUTEX_CLOCK_REALTIME : 0U)) |
+                    (uint32_t)base_op);
     switch (base_op) {
-    case (int)MIPS_FUTEX_WAIT: {
+    case (int)MIPS_FUTEX_WAIT:
+    case MIPS_FUTEX_WAIT_BITSET: {
         struct timespec to;
         struct timespec *top = NULL;
 
@@ -354,22 +439,41 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
             if (mips_sc_read_ts(ctx, to_va, &to) != 0) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
+            /* WAIT takes a relative timeout; WAIT_BITSET takes an
+             * absolute one (CLOCK_REALTIME selects the clock).  Both
+             * need a normalized nsec field; the host validates the
+             * rest against its own clock. */
             if (to.tv_sec < 0 || to.tv_nsec < 0 ||
                 to.tv_nsec >= 1000000000L) {
                 return mips_sc_ret(ctx, -EINVAL);
             }
             top = &to;
         }
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
-                    (int)(priv ? MIPS_FUTEX_PRIVATE_FLAG : MIPS_FUTEX_WAIT),
-                    (uint32_t)val, top, NULL, (uint32_t)0);
+        if (base_op == (int)MIPS_FUTEX_WAIT) {
+            r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
+                        (uint32_t)val, top, NULL, (uint32_t)0);
+        } else {
+            val3 = mips_sc_arg(ctx, sp, 5, &ok);
+            if (!ok) {
+                return mips_sc_ret(ctx, -EFAULT);
+            }
+            r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
+                        (uint32_t)val, top, NULL, (uint32_t)val3);
+        }
         break;
     }
     case (int)MIPS_FUTEX_WAKE:
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
-                    (int)((priv ? (uint32_t)MIPS_FUTEX_PRIVATE_FLAG : 0U) |
-                          (uint32_t)MIPS_FUTEX_WAKE),
-                    (uint32_t)val, NULL, NULL, (uint32_t)0);
+    case MIPS_FUTEX_WAKE_BITSET:
+        if (base_op == MIPS_FUTEX_WAKE_BITSET) {
+            val3 = mips_sc_arg(ctx, sp, 5, &ok);
+            if (!ok) {
+                return mips_sc_ret(ctx, -EFAULT);
+            }
+        } else {
+            val3 = 0U;
+        }
+        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
+                    (uint32_t)val, NULL, NULL, (uint32_t)val3);
         break;
     case MIPS_FUTEX_REQUEUE:
     case MIPS_FUTEX_CMP_REQUEUE:
@@ -383,9 +487,7 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
             return mips_sc_ret(ctx, rc);
         }
         /* The relative-timeout slot is unused by both requeue ops. */
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
-                    (int)((priv ? (uint32_t)MIPS_FUTEX_PRIVATE_FLAG : 0U) |
-                          (uint32_t)base_op),
+        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
                     (uint32_t)val, NULL, mips32_guest_ptr(ctx, uaddr2),
                     (uint32_t)val3);
         break;
@@ -399,9 +501,7 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
         if (rc != 0) {
             return mips_sc_ret(ctx, rc);
         }
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
-                    (int)((priv ? (uint32_t)MIPS_FUTEX_PRIVATE_FLAG : 0U) |
-                          (uint32_t)MIPS_FUTEX_WAKE_OP),
+        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
                     (uint32_t)val, NULL, mips32_guest_ptr(ctx, uaddr2),
                     (uint32_t)val3);
         break;
@@ -431,6 +531,13 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
     (void)sp;
     ctx->llbit = 0U;
     return mips_sc_ret(ctx, -ENOSYS);
+}
+
+/* Unreachable off Linux (clone reports -ENOSYS, so no thread ctx exists). */
+void mips_thread_exit(mips32_ctx_t *ctx, int status)
+{
+    (void)ctx;
+    _Exit(status);
 }
 
 #endif

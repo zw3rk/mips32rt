@@ -82,7 +82,12 @@ typedef struct dbt_cache {
     int         last_valid;
 } dbt_cache_t;
 
-static dbt_cache_t *dbt_cache;
+/* RC4 threads: one cache per host thread.  A shared cache would race
+ * concurrent compiles (bump allocator, block/ibtc/ras tables, SMC
+ * flush) and corrupt execution; translations are guest-pc-keyed so
+ * per-thread duplication stays correct.  Each thread's pool is
+ * registered with the (likewise per-thread) hostfault range. */
+static __thread dbt_cache_t *dbt_cache;
 
 /* True when the decoded instruction transfers control with a delay slot:
  * J/JAL, integer branches (plain and likely), JR/JALR, and COP1 branches. */
@@ -426,7 +431,11 @@ static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
 
 int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
 {
-    static uint8_t staging[DBT_STAGING_SIZE];
+    /* RC4 threads: the staging buffer must be per-thread.  Caches and
+     * pools are already __thread, but a shared static buffer let two
+     * threads' concurrent compiles interleave bytes, publishing
+     * corrupt blocks (observed as host SIGILL in zeroed pool gaps). */
+    static __thread uint8_t staging[DBT_STAGING_SIZE];
     mips_dec_t insns[MIPS32_DBT_MAX_INSNS];
     uint32_t cur = pc;
     unsigned count = 0;
@@ -583,6 +592,12 @@ static int dbt_step_fallback(mips32_ctx_t *ctx)
     ctx->exit_reason = MIPS32_EXIT_NONE;
     ctx->exit_info = 0;
     rc = interp_step(ctx);
+    /* RC4: interp delivered a synchronous fault to a guest handler
+     * (MIPS_FAULT with exit_reason cleared to NONE); resume the DBT
+     * loop at the handler instead of stopping. */
+    if (rc == MIPS_FAULT && ctx->exit_reason == MIPS32_EXIT_NONE) {
+        return 0;
+    }
     if (rc != 0 || ctx->exit_reason != MIPS32_EXIT_NONE) {
         (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
             ctx->exit_reason, ctx->exit_info);
@@ -596,6 +611,9 @@ int dbt_main(mips32_ctx_t *ctx)
     if (ctx == NULL || dbt_cache_ensure(ctx) != 0) {
         return 1;
     }
+    /* RC4: translate host SIGSEGV/SIGBUS inside emitted code into guest
+     * fault delivery (src/os/hostfault.c). */
+    mips_hostfault_install(dbt_cache->pool, DBT_CODE_POOL_SIZE);
     for (;;) {
         uint32_t pc = ctx->pc;
         const dbt_block_t *b = NULL;
@@ -615,6 +633,12 @@ int dbt_main(mips32_ctx_t *ctx)
             int cr = dbt_compile(ctx, pc);
 
             if (cr == MIPS_FAULT) {
+                /* RC4: the fetch/compile fault may have been delivered
+                 * to a guest handler (exit_reason cleared to NONE);
+                 * resume dispatching at the handler. */
+                if (ctx->exit_reason == MIPS32_EXIT_NONE) {
+                    continue;
+                }
                 (void)fprintf(stderr,
                     "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
                     ctx->exit_reason, ctx->exit_info);
@@ -643,7 +667,14 @@ int dbt_main(mips32_ctx_t *ctx)
                 break;
             }
         }
-        reason = dbt_trampoline_enter(ctx, code);
+        /* RC4: run the block under the host-fault guard, which owns
+         * both the checkpoint frame and the trampoline call (the
+         * frame must stay ancestral to the block).  A converted
+         * fault delivers and reports 1 (resume dispatching at the
+         * handler); a normal return leaves the reason in reason. */
+        if (mips_hostfault_run(ctx, code, &reason) != 0) {
+            continue;
+        }
         ctx->blocks_executed++;
         if (have_b != 0 && ctx->trace_enabled) {
             dbt_trace_block(ctx, b, dbt_cache->block_likely[bi]);
@@ -676,7 +707,20 @@ int dbt_main(mips32_ctx_t *ctx)
                 return 1;
             }
             continue;
-        case MIPS32_EXIT_FAULT:
+        case MIPS32_EXIT_FAULT: {
+            /* RC4: inline alignment/mapping exits carry the data address
+             * in exit_info; deliver like the mem layer (AdEL/AdES bus
+             * when misaligned, segv otherwise) and resume, else stop. */
+            int signo = ((ctx->exit_info & 3U) != 0U) ? 10 : 11;
+
+            if (mips_signal_has_handler(signo) &&
+                mips_raise_guest(ctx, signo, ctx->exit_info) == 0) {
+                continue;
+            }
+            (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
+                ctx->exit_reason, ctx->exit_info);
+            return 1;
+        }
         default:
             (void)fprintf(stderr, "mips32rt: dbt stopped (reason %u, info 0x%x)\n",
                 ctx->exit_reason, ctx->exit_info);

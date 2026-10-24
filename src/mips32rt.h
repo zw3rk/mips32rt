@@ -152,6 +152,10 @@ typedef struct mips32_ctx {
     uint32_t robust_list_len;
     int      host_tid;
     bool     is_thread_clone;
+    /* Alternate signal stack (sigaltstack(2); 0 == disabled). */
+    uint32_t sigalt_sp;
+    uint32_t sigalt_size;
+    uint32_t sigalt_flags;
 
     /* Guest startup metadata for /proc/self/{cmdline,auxv,exe} (Phase 5) */
     int      guest_argc;
@@ -314,6 +318,13 @@ int guest_ld32(mips32_ctx_t *ctx, uint32_t va, uint32_t *out);   /* aligned-only
 int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val);
 int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val);    /* aligned-only */
 int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val);    /* aligned-only */
+/* Atomic store-conditional (src/os/mem.c, RC4 threads): single-copy host
+ * CAS of the value-domain word (endianness-aware like ld/st); sets *ok to
+ * 1 on success, 0 on value mismatch, MIPS_FAULT on fault.  At most one of
+ * concurrent threads' SCs observes the LL value, so mutex/counter
+ * sequences linearize exactly. */
+int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
+               uint32_t new_val, int *ok);                          /* aligned-only */
 /* Synchronous fault: records EXIT_FAULT (lane L1c; signals in Phase 4). */
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr);
 
@@ -363,5 +374,31 @@ void  mips_dump_regs(const mips32_ctx_t *ctx, FILE *out);
  */
 int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr);
 int32_t mips_rt_sigreturn(mips32_ctx_t *ctx);
+int mips_signal_has_handler(int signo);
+/* Synchronous trap delivery for non-memory faults (src/os/signals.c):
+ * delivers signo (SIGILL/SIGFPE/SIGTRAP/...) or dies by it. */
+void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr);
+/* O32 signal syscalls (src/os/signals.c, wired in Phase 4): rt_sigaction
+ * and rt_sigprocmask record into the guest-owned tables; sigaltstack
+ * manages ctx sigalt fields; sigreturn restores from the live frame. */
+int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp);
+int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp);
+int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp);
+/* execve drops every disposition, mask, live frame and altstack. */
+void mips32_signals_reset_for_exec(mips32_ctx_t *ctx);
+/* Host-fault translation for DBT-emitted code (src/os/hostfault.c):
+ * install once with the RX code-pool range, then arm around each
+ * trampoline entry; a host SIGSEGV/SIGBUS whose faulting host PC lies
+ * inside the pool becomes a guest fault delivery (SIGSEGV/SIGBUS
+ * preserved from the host signal). */
+/* Guest exit() inside a CLONE_VM thread ends that host thread alone
+ * (CLEARTID wake + raw SYS_exit); does not return. */
+void mips_thread_exit(mips32_ctx_t *ctx, int status);
+void mips_hostfault_install(const void *pool, size_t len);
+/* Runs one emitted block under the host-fault guard (see hostfault.c
+ * for the ancestral-frame contract).  Returns 0 with *reasonp set, or
+ * 1 when a converted fault was delivered and dispatch must continue. */
+int mips_hostfault_run(mips32_ctx_t *ctx, void *code, uint32_t *reasonp);
+void mips_hostfault_disarm(void);
 
 #endif /* MIPS32RT_H */

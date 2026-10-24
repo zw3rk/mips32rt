@@ -744,45 +744,10 @@ int32_t mips_sc_getxid(mips32_ctx_t *ctx, uint32_t nr)
     return mips_sc_ret(ctx, (int32_t)v);
 }
 
-/* ---- rt_sigprocmask (accepted, not tracked) / rt_sigaction (-ENOSYS) ----
- * Single-threaded Phase 2 has no handlers and never blocks a signal, so
- * zeroing the old mask is truthful; Phase 4 (L4a) owns the 128-bit guest
- * masks and the action table and reimplements both calls. */
-
-int32_t mips_sc_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
-{
-    uint8_t  zero[MIPS_SIGSET_SIZE];
-    int      ok = 1;
-    uint32_t how;
-    uint32_t set_va;
-    uint32_t old_va;
-    uint32_t setsize;
-
-    how     = mips_sc_arg(ctx, sp, 0, &ok);
-    set_va  = mips_sc_arg(ctx, sp, 1, &ok);
-    old_va  = mips_sc_arg(ctx, sp, 2, &ok);
-    setsize = mips_sc_arg(ctx, sp, 3, &ok);
-    if (!ok) {
-        return mips_sc_ret(ctx, -EFAULT);
-    }
-    if (how > 2U) {
-        return mips_sc_ret(ctx, -EINVAL); /* SIG_BLOCK/UNBLOCK/SETMASK only */
-    }
-    if (setsize != MIPS_SIGSET_SIZE) {
-        return mips_sc_ret(ctx, -EINVAL); /* MIPS sigset_t is 16 bytes */
-    }
-    if (set_va != 0U &&
-        !mips_sc_range_ok(ctx, set_va, MIPS_SIGSET_SIZE, (uint32_t)PROT_READ)) {
-        return mips_sc_ret(ctx, -EFAULT);
-    }
-    if (old_va != 0U) {
-        memset(zero, 0, sizeof(zero));
-        if (mips_sc_copy_to(ctx, old_va, zero, MIPS_SIGSET_SIZE) != 0) {
-            return mips_sc_ret(ctx, -EFAULT);
-        }
-    }
-    return mips_sc_ret(ctx, 0);
-}
+/* ---- rt_sigprocmask / rt_sigaction (Phase 4, lane L4a) ----
+ * The Phase-2 accept-and-ignore stub is retired: the dispatcher routes
+ * both calls to the guest-owned 128-bit tables in src/os/signals.c
+ * (mips_l4a_rt_sigprocmask / mips_sc_rt_sigaction). */
 
 /* ---- set/get_robust_list (recorded in ctx; woken by Phase 4) ---- */
 
