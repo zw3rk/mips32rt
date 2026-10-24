@@ -1,0 +1,65 @@
+--- toolchain ---
+mipsel-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+qemu-mipsel version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
+--- build LE ---
+  Class:                             ELF32
+  Data:                              2's complement, little endian
+  Machine:                           MIPS R3000
+--- run LE under qemu-mipsel ---
+P1 endian: LE
+P1 alu-addsub: PASS add=127 sub=73 addu=0x0 subu=0x2
+P1 alu-logic: PASS and=0xf000f0 or=0xfff0fff0 xor=0xedcba987 nor=0xf000f
+P1 alu-slt-lui: PASS slt=1/0 sltu=1 slti=1 lui=0x12340000
+P1 shift-imm: PASS sll=0x34567800 srl=0x8000000 sra=0xf8000000
+P1 shift-var: PASS sllv=0xc00 srlv=0x8000000 srav=0xf8000000
+P1 mult: PASS mult lo=83810205 hi=0
+P1 multu: PASS multu lo=0x1 hi=0xfffffffe
+P1 div: PASS div q=14 r=2
+P1 divu: PASS divu q=0xfffffff r=0xf
+P1 mthi-mtlo: PASS mthi/mtlo lo=0xaabbccdd hi=0x11223344
+P1 beq-taken: PASS d=1 f=0 t=7
+P1 beq-nottaken: PASS d=1 f=200 t=0
+P1 bne-taken: PASS d=1 f=0 t=7
+P1 bne-nottaken: PASS d=1 f=200 t=0
+P1 blez-taken: PASS d=1 f=0 t=7
+P1 blez-nottaken: PASS d=1 f=200 t=0
+P1 bgtz-taken: PASS d=1 f=0 t=7
+P1 bgtz-nottaken: PASS d=1 f=200 t=0
+P1 bltz-taken: PASS d=1 f=0 t=7
+P1 bltz-nottaken: PASS d=1 f=200 t=0
+P1 bgez-taken: PASS d=1 f=0 t=7
+P1 bgez-nottaken: PASS d=1 f=200 t=0
+P1 beql-taken: PASS d=1 f=0 t=7
+P1 beql-nottaken: PASS d=0 f=200 t=0
+P1 bnel-taken: PASS d=1 f=0 t=7
+P1 bnel-nottaken: PASS d=0 f=200 t=0
+P1 blezl-taken: PASS d=1 f=0 t=7
+P1 blezl-nottaken: PASS d=0 f=200 t=0
+P1 bgtzl-taken: PASS d=1 f=0 t=7
+P1 bgtzl-nottaken: PASS d=0 f=200 t=0
+P1 bltzl-taken: PASS d=1 f=0 t=7
+P1 bltzl-nottaken: PASS d=0 f=200 t=0
+P1 bgezl-taken: PASS d=1 f=0 t=7
+P1 bgezl-nottaken: PASS d=0 f=200 t=0
+P1 annul-trio: PASS beq-nt=1 beql-nt=0 beql-t=1
+P1 j: PASS d=1 f=0 t=7
+P1 jal-link: PASS marker=0x51 ra==land=1
+P1 jalr: PASS marker=0x33 ra==land=1
+P1 jr: PASS d=1 f=0 t=7
+P1 beql-pageend-nottaken: PASS qemu-fetch sig=11 branch-pc=1 p2base=1
+P1 beql-pageend-taken: PASS qemu-fetch sig=11 branch-pc=1 p2base=1
+P1 delayslot-sigpc: PASS sig=11 null-addr=1 loaded=-1
+P1 llsc-success: PASS 1000x add1 cell=1000
+P1 llsc-interfere-fail: PASS scres=0 cell=0x11111111
+P1 lwl-lwr: PASS lwl/lwr x4 match=1
+P1 swl-swr: PASS swl/swr x4 match=1
+P1 ulw-idiom: PASS ulw-idiom x4 match=1
+P1 rdhwr: PASS agree=1 nonzero=1
+P1 set-thread-area: PASS set-rc=0 set-match=1 restore-rc=0 restore-match=1 tls=42
+qemu: uncaught target signal 10 (Bus error) - core dumped
+P1 unaligned-child: PASS child termsig=10 (qemu AdEL->SIGBUS=10; translator fault contract: exit 139)
+P1-RAW-WRITE: ok
+P1 raw-write: PASS raw-write ret=17 a3=0
+P1 checks: 51 pass, 0 fail
+P1-RESULT: PASS
+LE-EXIT=0
