@@ -387,6 +387,8 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_rt_sigaction:
     case MIPS32_NR_set_robust_list:
     case MIPS32_NR_get_robust_list:
+    case MIPS32_NR_unlink:
+    case MIPS32_NR_unlinkat:
         return mips_syscall_extra(ctx, sp);
     case MIPS32_NR_set_thread_area: {
         /* O32 takes the TLS base directly in $a0 (E06); rdhwr $29 reads

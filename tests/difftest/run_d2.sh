@@ -18,8 +18,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 D="$ROOT/tests/difftest"
 NAME="mips32rt-l2d-$$"
 IMG="debian:bookworm-slim"
-# RC2: ENGINES="interp dbt" (dbt half explicitly deferred to RC2).
-ENGINES="interp"
+# RC2: both engines live (interp-vs-qemu AND dbt-vs-qemu per fixture).
+ENGINES="interp dbt"
 FIXTURES="hello printf malloc qsort fileio"
 
 fail() {
@@ -92,11 +92,11 @@ docker exec -e ENGINES="$ENGINES" -e FIXTURES="$FIXTURES" "$NAME" sh -c '
     echo "=== D2 difftest self-consistency (interp vs interp) ==="
     sh /w/tests/difftest/run_difftest.sh /tmp/d2-le-qsort interp interp || fails=$((fails + 1))
     [ "$fails" -eq 0 ] || { echo "D2: $fails failures"; exit 1; }
-    echo "D2: all fixtures match on engines: $ENGINES (dbt deferred to RC2)"
+    echo "D2: all fixtures match qemu goldens on engines: $ENGINES"
 '
 
 echo "=== D2 container cleanup ==="
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker ps
 trap - EXIT INT TERM
-echo "D2 PASS: interp matches qemu on all fixtures LE+BE (dbt deferred to RC2)"
+echo "D2 PASS: engines match qemu on all fixtures LE+BE"

@@ -40,6 +40,7 @@
 #define MIPS_O_PATH      0x200000U /* 010000000 octal */
 
 #define MIPS_AT_FDCWD            (-100)
+#define MIPS_AT_REMOVEDIR        0x200
 #define MIPS_AT_SYMLINK_NOFOLLOW 0x100
 #define MIPS_AT_EMPTY_PATH       0x1000
 

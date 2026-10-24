@@ -26,8 +26,8 @@
 
 /* Cached guest GPR -> host W register (SPEC 2.1 order). */
 static const int8_t kGprHost[32] = {
-    -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, -1, 15
+    -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
+    12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, -1, 15
 };
 static const uint8_t kCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
@@ -315,7 +315,7 @@ static int emit_muldiv(a64_buf_t *b, const mips_dec_t *d)
         break;
     case MIPS_FUNCT_DIV:
     case MIPS_FUNCT_DIVU: {
-        size_t ph = a64_emit_cbz_w_placeholder(b, true, rb);
+        size_t ph = a64_emit_cbz_w_placeholder(b, false, rb); /* skip div-by-0 */
         if (d->funct == MIPS_FUNCT_DIV)
             a64_emit_sdiv_w(b, A64_TMP1, ra, rb);
         else a64_emit_udiv_w(b, A64_TMP1, ra, rb);
@@ -461,12 +461,10 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
     unsigned lsb, msb, size, src, dst;
     int h;
     switch (d->funct) {
-    case 0x00U: /* EXT */
+    case 0x00U: /* EXT: size = rd + 1 (rd holds size-1). */
         lsb = d->sa & 31U;
-        msb = d->rd & 31U;
+        size = (unsigned)d->rd + 1U;
         if (d->rt == MIPS32_REG_ZERO) return 0;
-        if (msb < lsb) { a64_emit_mov_imm32(b, A64_TMP1, 0U); put_rd(b, d->rt, A64_TMP1); return 0; }
-        size = msb - lsb + 1U;
         src = op_val(b, d->rs, A64_TMP1);
         h = gpr_host(d->rt);
         dst = (h >= 0) ? (unsigned)h : A64_TMP1;
@@ -490,8 +488,8 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
         a64_emit_bfm_w(b, A64_TMP1, src, (32U - lsb) & 31U, size - 1U);
         put_rd(b, d->rt, A64_TMP1);
         return 0;
-    case 0x20U: /* BSHFL */
-        src = op_val(b, d->rs, A64_TMP1);
+    case 0x20U: /* BSHFL: source is rt (rs is unused, always $0). */
+        src = op_val(b, d->rt, A64_TMP1);
         h = gpr_host(d->rd);
         dst = (h >= 0) ? (unsigned)h : A64_TMP1;
         if (d->sa == 2U) a64_emit_rev16_w(b, dst, src);
@@ -572,7 +570,7 @@ static void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d,
         a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
         return;
     case MIPS_OP_SH: case MIPS_OP_SW:
-        v = op_val(b, rt, A64_TMP1);
+        v = op_val(b, rt, A64_TMP2); /* TMP2: the check below clobbers TMP1. */
         emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc);
         if (be == 0) {
             if (d->op == MIPS_OP_SH)
@@ -601,7 +599,7 @@ static unsigned merge_pos(unsigned op, int be, unsigned i, unsigned k)
 /* LWL/LWR/SWL/SWR: 4-way k dispatch, straight-line byte paths (E05). */
 static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, int be)
 {
-    unsigned rt = d->rt, lo, hi, i, k;
+    unsigned rt = d->rt, lo, hi, i, k, o;
     int is_load = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_LWR);
     int left = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_SWL);
     size_t ph_cbz[3], ph_end[3];
@@ -614,7 +612,7 @@ static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, int be)
         ph_cbz[k] = a64_emit_cbz_w_placeholder(b, false, A64_TMP1);
         a64_emit_sub_imm_w(b, true, A64_TMP1, A64_TMP1, 1U, 0U);
     }
-    for (k = 0U; k < 4U; k++) {
+    for (o = 0U, k = 3U; o < 4U; o++, k = (o == 1U) ? 0U : k + 1U) { /* k=3,0,1,2: fall-through enters k=3. */
         if (k < 3U) a64_patch_cbz_w(b, ph_cbz[k], b->count);
         if (left != 0) { lo = (be != 0) ? k : 0U; hi = (be != 0) ? 3U : k; }
         else { lo = (be != 0) ? 0U : k; hi = (be != 0) ? k : 3U; }
@@ -647,9 +645,9 @@ static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, int be)
                 a64_emit_guest_strb_w(b, A64_TMP1, A64_ADDR);
             }
         }
-        if (k < 3U) ph_end[k] = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        if (o < 3U) ph_end[o] = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     }
-    for (k = 0U; k < 3U; k++) a64_patch_b_cond(b, ph_end[k], b->count);
+    for (o = 0U; o < 3U; o++) a64_patch_b_cond(b, ph_end[o], b->count);
 }
 
 /* LL: aligned load + llbit/lladdr/llval record. */
@@ -670,9 +668,10 @@ static void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
 static void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
 {
     unsigned data = op_val(b, d->rt, A64_TMP3);
-    size_t ph_fail1, ph_fail2, ph_done, ph_retry, retry;
+    size_t ph_fail1, ph_fail2, ph_done, ph_retry, retry_ldxr;
     emit_align_fault(b, 1U, fpc);
     a64_emit_add_uxtw_x(b, 24U, A64_XG, A64_ADDR);
+    retry_ldxr = b->count; /* STXR failure clears it: restart at LDXR. */
     a64_emit_ldxr_w(b, A64_TMP1, 24U);
     a64_emit_ldrb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
     ph_fail1 = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
@@ -685,10 +684,9 @@ static void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
         a64_emit_rev_w(b, A64_TMP3, data);
         data = A64_TMP3;
     }
-    retry = b->count;
     a64_emit_stxr_w(b, A64_TMP1, data, 24U);
     ph_retry = a64_emit_cbz_w_placeholder(b, true, A64_TMP1);
-    a64_patch_cbz_w(b, ph_retry, retry);
+    a64_patch_cbz_w(b, ph_retry, retry_ldxr);
     a64_emit_mov_imm32(b, A64_TMP1, 1U);
     ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, ph_fail1, b->count);

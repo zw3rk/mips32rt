@@ -311,11 +311,11 @@ static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
     uint32_t rt = ctx->gpr[d->rt];
 
     switch (d->funct) {
-    case 0x00u: /* EXT rt, rs, lsb, msb */
+    case 0x00u: /* EXT rt, rs: size = rd + 1 bits from lsb (rd holds
+        * size-1, unlike INS where rd holds msb). */
         {
             unsigned lsb = d->sa & 31u;
-            unsigned msb = d->rd & 31u;
-            unsigned size = (msb >= lsb) ? (msb - lsb + 1u) : 0u;
+            unsigned size = (unsigned)d->rd + 1u;
             uint64_t mask = (size >= 32u) ? (uint64_t)0xFFFFFFFFu :
                                             (((uint64_t)1u << size) - 1u);
             interp_set_reg(ctx, d->rt, (uint32_t)(((uint64_t)(rs >> lsb)) & mask));
@@ -333,18 +333,18 @@ static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
                            (uint32_t)((rt & ~((uint32_t)(mask << lsb))) | field));
         }
         return 0;
-    case 0x20u: /* BSHFL */
+    case 0x20u: /* BSHFL: source is rt (rs is unused, always $0). */
         switch (d->sa) {
         case 2u: /* WSBH */
             interp_set_reg(ctx, d->rd,
-                           ((rs & 0x00FF00FFu) << 8) | ((rs & 0xFF00FF00u) >> 8));
+                           ((rt & 0x00FF00FFu) << 8) | ((rt & 0xFF00FF00u) >> 8));
             return 0;
         case 16u: /* SEB */
-            interp_set_reg(ctx, d->rd, (uint32_t)(int32_t)(int8_t)(rs & 0xFFu));
+            interp_set_reg(ctx, d->rd, (uint32_t)(int32_t)(int8_t)(rt & 0xFFu));
             return 0;
         case 24u: /* SEH */
             interp_set_reg(ctx, d->rd,
-                           (uint32_t)(int32_t)(int16_t)(rs & 0xFFFFu));
+                           (uint32_t)(int32_t)(int16_t)(rt & 0xFFFFu));
             return 0;
         default:
             return fault_at(ctx, cur_pc);

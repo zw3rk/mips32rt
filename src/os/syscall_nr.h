@@ -36,6 +36,8 @@
 #define MIPS32_NR_write  4004 /* o32 index 4: sys_write */
 #define MIPS32_NR_open   4005 /* o32 index 5: sys_open (compat_sys_open) */
 #define MIPS32_NR_openat 4288 /* o32 index 288: sys_openat */
+#define MIPS32_NR_unlink 4010 /* o32 index 10: sys_unlink (asm/unistd_o32.h) */
+#define MIPS32_NR_unlinkat 4294 /* o32 index 294: sys_unlinkat (asm/unistd_o32.h) */
 #define MIPS32_NR_close  4006 /* o32 index 6: sys_close */
 #define MIPS32_NR_lseek  4019 /* o32 index 19: sys_lseek */
 #define MIPS32_NR_llseek 4140 /* o32 index 140: sys_llseek (__NR__llseek) */

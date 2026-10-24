@@ -200,6 +200,37 @@ __attribute__((noinline)) static void t_muldiv(void)
     }
 }
 
+/* BSHFL/EXT/INS (SPECIAL3): source registers are rt for BSHFL and rs for
+ * EXT/INS.  The BSHFL-from-$0 mixup (interp + emitter) printed lowercase
+ * %X in glibc; these checks pin the encoding (regression collateral). */
+__attribute__((noinline)) static void t_bshfl(void)
+{
+    char db[160];
+    uint32_t r;
+    __asm__ volatile("seb %0,%1" : "=r"(r) : "r"(0x00000082u));
+    uint32_t r_seb_lo = r;
+    __asm__ volatile("seb %0,%1" : "=r"(r) : "r"(0x0000007Fu));
+    uint32_t r_seb_hi = r;
+    __asm__ volatile("seh %0,%1" : "=r"(r) : "r"(0x0000ABCDu));
+    uint32_t r_seh = r;
+    snprintf(db, sizeof db, "seb=0x%x/0x%x seh=0x%x",
+             r_seb_lo, r_seb_hi, r_seh);
+    check("sign-extend", r_seb_lo == 0xFFFFFF82u && r_seb_hi == 0x7Fu &&
+          r_seh == 0xFFFFABCDu, db);
+    __asm__ volatile("wsbh %0,%1" : "=r"(r) : "r"(0x12345678u));
+    uint32_t r_wsbh = r;
+    snprintf(db, sizeof db, "wsbh=0x%x", r_wsbh);
+    check("wsbh", r_wsbh == 0x34127856u, db);
+    __asm__ volatile("ext %0,%1,4,6" : "=r"(r) : "r"(0xABCDEF12u));
+    uint32_t r_ext = r;
+    snprintf(db, sizeof db, "ext=0x%x", r_ext);
+    check("ext", r_ext == 0x31u, db);
+    r = 0x12345678u;
+    __asm__ volatile("ins %0,%1,8,8" : "+r"(r) : "r"(0x000000F0u));
+    snprintf(db, sizeof db, "ins=0x%x", r);
+    check("ins", r == 0x1234F078u, db);
+}
+
 /* ================= branches with delay slots =================
  * TBR2/TBR1: normal branches (delay slot always executes).
  * TBL2/TBL1: branch-likely (delay slot annulled when not taken).
@@ -883,6 +914,7 @@ int main(void)
     t_alu();
     t_shifts();
     t_muldiv();
+    t_bshfl();
     t_beq();
     t_bne();
     t_blez();

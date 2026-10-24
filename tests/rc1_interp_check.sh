@@ -59,7 +59,7 @@ check_one() {
     grep -q "^$up-EXIT=0$" "$out" || fail "$tag: bad exit"
     grep -q "^P1-RESULT: PASS$" "$out" || fail "$tag: no P1-RESULT PASS"
     grep -q ": FAIL" "$out" && fail "$tag: FAIL line present"
-    grep -q "^P1 checks: 47 pass, 0 fail$" "$out" || fail "$tag: bad summary"
+    grep -q "^P1 checks: 51 pass, 0 fail$" "$out" || fail "$tag: bad summary"
     for skip in "P1 signals: SKIP" \
                 "P1 beql-pageend-nottaken: SKIP" \
                 "P1 beql-pageend-taken: SKIP" \

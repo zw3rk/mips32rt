@@ -11,8 +11,8 @@
 # dumps. Prints "DIFFTEST: 0 divergences" on a match or the first
 # divergence otherwise.
 #
-# The default interp-vs-interp run is the self-consistency gate and must
-# pass now; interp-vs-dbt goes live at RC2 when the DBT engine lands.
+# The default interp-vs-interp run is the self-consistency gate;
+# interp-vs-dbt went live at RC2 (both must report 0 divergences).
 # Run this script where _build/mips32rt executes (AArch64 Linux host or
 # the bounded debian container used by run_d2.sh).
 set -eu

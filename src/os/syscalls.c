@@ -406,6 +406,42 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
     return mips_sc_ret(ctx, (int32_t)fd);
 }
 
+/* ---- unlink/unlinkat ---- */
+
+static int32_t sc_unlinkat(mips32_ctx_t *ctx, uint32_t sp, int is_unlink)
+{
+    char     path[MIPS_PATH_MAX];
+    int      ok = 1;
+    uint32_t dirfd;
+    uint32_t path_va;
+    uint32_t flags;
+    int      rc;
+
+    dirfd  = (is_unlink != 0) ? (uint32_t)(int32_t)MIPS_AT_FDCWD
+                             : mips_sc_arg(ctx, sp, 0, &ok);
+    path_va = mips_sc_arg(ctx, sp, (unsigned)(is_unlink != 0 ? 0 : 1), &ok);
+    flags   = (is_unlink != 0) ? 0U : mips_sc_arg(ctx, sp, 2, &ok);
+    if (!ok) {
+        return mips_sc_ret(ctx, -EFAULT);
+    }
+    rc = mips_sc_read_cstr(ctx, path_va, path);
+    if (rc != 0) {
+        return mips_sc_ret(ctx, rc);
+    }
+    if ((flags & (uint32_t)MIPS_AT_REMOVEDIR) != 0U) {
+        rc = rmdir(path);
+    } else if (flags == 0U) {
+        rc = (is_unlink != 0) ? unlink(path)
+                              : unlinkat((int)(int32_t)dirfd, path, 0);
+    } else {
+        return mips_sc_ret(ctx, -EINVAL);
+    }
+    if (rc != 0) {
+        return mips_sc_ret(ctx, -(int32_t)errno);
+    }
+    return mips_sc_ret(ctx, 0);
+}
+
 static int32_t sc_close(mips32_ctx_t *ctx, uint32_t sp)
 {
     int      ok = 1;
@@ -755,6 +791,10 @@ int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
         return sc_openat(ctx, sp, 1);
     case (uint32_t)MIPS32_NR_openat:
         return sc_openat(ctx, sp, 0);
+    case (uint32_t)MIPS32_NR_unlink:
+        return sc_unlinkat(ctx, sp, 1);
+    case (uint32_t)MIPS32_NR_unlinkat:
+        return sc_unlinkat(ctx, sp, 0);
     case (uint32_t)MIPS32_NR_close:
         return sc_close(ctx, sp);
     case (uint32_t)MIPS32_NR_lseek:

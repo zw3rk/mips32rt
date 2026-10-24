@@ -23,11 +23,11 @@ LDFLAGS ?= -static-pie -Wl,-z,max-page-size=4096
 
 # src/main.c plus every vendored rt32 core file (Lane L0a).  Later phases
 # append src/interp, src/dbt, and src/os (beyond src/os/syscall_nr.h).
-SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) src/rt32/safe_syscall_a64.S
-HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h)
+SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
+HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
-OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) $(OBJ_DIR)/rt32/safe_syscall_a64.o
+OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) $(OBJ_DIR)/rt32/safe_syscall_a64.o $(OBJ_DIR)/dbt/trampoline_a64.o
 MIPS32RT_BIN := $(BUILD_DIR)/mips32rt
 
 help: ## Show available build and verification targets
@@ -48,6 +48,10 @@ $(OBJ_DIR)/%.o: src/%.c $(HDRS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/rt32/safe_syscall_a64.o: src/rt32/safe_syscall_a64.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/dbt/trampoline_a64.o: src/dbt/trampoline_a64.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

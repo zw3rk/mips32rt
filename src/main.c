@@ -39,12 +39,7 @@ int interp_main(mips32_ctx_t *ctx)
     return 0;
 }
 
-int dbt_main(mips32_ctx_t *ctx)
-{
-    (void)ctx;
-    (void)fprintf(stderr, "mips32rt: DBT not yet implemented (Phase 2)\n");
-    return 2;
-}
+/* dbt_main is provided by src/dbt/dbt.c (lane L2b). */
 
 static void usage(FILE *out)
 {
