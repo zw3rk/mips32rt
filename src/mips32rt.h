@@ -352,4 +352,16 @@ int   dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
 /* Exit-state dump for the RC2 difftest (src/main.c; both engines share it). */
 void  mips_dump_regs(const mips32_ctx_t *ctx, FILE *out);
 
+/*
+ * ---- Phase 4 frozen contracts (signals L4a, threads L4b, procs L4c) ----
+ *
+ * Synchronous fault delivery builds an O32 rt_sigframe (E04 layout,
+ * src/os/sigframe_mips32rt.h) on the guest stack and transfers control
+ * to the guest handler (ra = restorer or an internal sigreturn
+ * trampoline).  mips_fault keeps recording EXIT_FAULT first; L4a reroutes
+ * to delivery when a handler is installed, else the host-signal death.
+ */
+int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr);
+int32_t mips_rt_sigreturn(mips32_ctx_t *ctx);
+
 #endif /* MIPS32RT_H */

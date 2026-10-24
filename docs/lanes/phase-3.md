@@ -85,3 +85,24 @@ propagate per E03 tables. sNaN arithmetic input raises Invalid Operation
   ```sh
   sh tests/run_p3_fpu.sh && test -s tests/p3_golden_le.txt
   ```
+
+---
+
+## RC3 outcome (coordinator integration)
+
+P3 suite: 73 pass, 0 fail, exit 0 on interp LE+BE; interp-vs-dbt `--difftest`
+reports 0 divergences LE+BE; RC1 (52 shared PASS) and D2 gates still green.
+Signal/fork-dependent checks SKIP until Phase 4 (6 SKIP lines; the
+not-taken pageend line stays a documented SPEC-vs-qemu divergence).
+
+Bugs found at RC3 integration (all verified by the gates):
+- MFHC1/MTHC1 decoded as rs 9/11; the encoding is rs 3/7 (interp + noted;
+  DBT emitter already correct).
+- `fp_from_int` exponent base off by 3 (E init `mb` instead of `mb+3`),
+  making int->float results 8x too small (e.g. 12345 -> ~1543).
+- DBT emitter byte-swapped FPR *values* on BE (rev + half swap). The
+  register file is endian-neutral — only guest *memory* bytes reorder
+  (E05) — so all value revs/swaps removed; GPR 64-bit pair order kept
+  big-endian per E01.
+- CFC1 $0 (FIR) faulted; now returns qemu-observed 0x00739300,
+  CTC1 $0 is a NOP.
