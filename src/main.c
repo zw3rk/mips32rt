@@ -9,16 +9,27 @@
  * message.  --version and --help work without any guest binary.
  */
 
-/* POSIX 2008: setenv/environ under strict -std=c11 with musl. */
+/* _GNU_SOURCE: setenv/environ and getauxval(AT_EXECFD) under strict
+ * -std=c11 with musl (implies the POSIX 2008 feature set as well). */
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 
 #include "mips32rt.h"
 #include "rt32/rt32.h"
+
+/* Linux generic auxv key (see asm-generic <linux/auxvec.h>); musl's
+ * <sys/auxv.h> normally provides it, this is only a fallback. */
+#ifndef AT_EXECFD
+#define AT_EXECFD 2
+#endif
 
 extern char **environ;
 
@@ -48,14 +59,41 @@ static void usage(FILE *out)
         "\n"
         "Usage:\n"
         "  mips32rt [--window HEX] [--sysroot DIR] [--cache DIR]\n"
-        "           [--interp | --dbt] [--difftest] [--trace] -- PATH [ARGV0...]\n"
+        "           [--interp | --dbt] [--difftest] [--trace]\n"
+        "           [--execfn PATH] [--image-fd FD] -- PATH [ARGV0...]\n"
         "  mips32rt --help\n"
         "  mips32rt --version\n"
         "\n"
+        "  --execfn PATH loads PATH as the guest image and records it in\n"
+        "    AT_EXECFN, while every token after -- stays guest argv verbatim\n"
+        "    (custom argv[0] preserved).  Without --execfn, PATH is both the\n"
+        "    image path and guest argv[0].\n"
+        "  --image-fd FD loads the image from the open descriptor (preferred\n"
+        "    over AT_EXECFD from auxv; closed after mapping).  PATH is still\n"
+        "    required and feeds AT_EXECFN.\n"
+        "\n"
         "Environment: MIPS32RT_WINDOW, MIPS32RT_SYSROOT, MIPS32RT_CACHE,\n"
         "             MIPS32RT_ENGINE, MIPS32RT_TRACE, MIPS32RT_DIFFTEST,\n"
-        "             MIPS32RT_HOST\n";
+        "             MIPS32RT_HOST, MIPS32RT_EXECFN\n";
     fputs(msg, out);
+}
+
+/* AT_EXECFD presence (HOST-CONTRACT 3.1): descriptor 0 is a valid open
+ * file when stdin was closed before execve, so presence is decided by
+ * errno after getauxval, never by comparing the value against 0. */
+static int auxv_exec_fd(void)
+{
+    unsigned long v;
+
+    errno = 0;
+    v = getauxval((unsigned long)AT_EXECFD);
+    if (errno != 0) {
+        return -1;
+    }
+    if (v > (unsigned long)INT_MAX) {
+        return -1;
+    }
+    return (int)v;
 }
 
 static int parse_engine(const char *s, int *out)
@@ -71,8 +109,11 @@ static int parse_engine(const char *s, int *out)
     return -1;
 }
 
-/* Returns the index of the guest PATH in argv[], or -1 on error. */
-static int parse_args(mips32_ctx_t *ctx, int argc, char **argv)
+/* Returns the index of the guest PATH in argv[], or -1 on error.
+ * --execfn (when given) is stored in *out_execfn; --image-fd (when given)
+ * in *out_image_fd (caller initializes both). */
+static int parse_args(mips32_ctx_t *ctx, int argc, char **argv,
+                      const char **out_execfn, int *out_image_fd)
 {
     int i = 1;
 
@@ -110,8 +151,8 @@ static int parse_args(mips32_ctx_t *ctx, int argc, char **argv)
         }
         if (strcmp(argv[i], "--window") == 0) {
             char *end = NULL;
-            (void)strtoull(argv[i + 1], &end, 0);
-            if (end == argv[i + 1] || *end != '\0') {
+            unsigned long long v = strtoull(argv[i + 1], &end, 0);
+            if (end == argv[i + 1] || *end != '\0' || v == UINT64_MAX) {
                 return -1;
             }
             /* Consumed by rt32_vm_init via MIPS32RT_WINDOW (see below). */
@@ -124,6 +165,24 @@ static int parse_args(mips32_ctx_t *ctx, int argc, char **argv)
             if (parse_engine(argv[i + 1], &ctx->engine) != 0) {
                 return -1;
             }
+        } else if (strcmp(argv[i], "--execfn") == 0) {
+            if (argv[i + 1][0] == '\0') {
+                return -1;
+            }
+            *out_execfn = argv[i + 1];
+        } else if (strcmp(argv[i], "--image-fd") == 0) {
+            char *end = NULL;
+            long v;
+            errno = 0;
+            v = strtol(argv[i + 1], &end, 10);
+            /* Any nonnegative int is accepted (fd 0 is valid when stdin
+             * was closed before execve); only the descriptor itself is
+             * ever closed after mapping, never 0/1/2 or caller fds. */
+            if (errno != 0 || end == argv[i + 1] || *end != '\0' ||
+                v < 0 || v > INT_MAX) {
+                return -1;
+            }
+            *out_image_fd = (int)v;
         } else {
             return -1;
         }
@@ -189,12 +248,15 @@ static uint64_t env_window(void)
 }
 
 /* Phase 0 guest launch: reserve the window and admit the ELF only; the
- * engines that would run it arrive in Phases 1 (interp) and 2 (dbt). */
-static int run_guest(mips32_ctx_t *ctx)
+ * engines that would run it arrive in Phases 1 (interp) and 2 (dbt).
+ * exec_fd >= 0 (--image-fd, else AT_EXECFD from auxv) supplies the image
+ * bytes; rt32_elf_load consumes exactly that descriptor and closes it
+ * after mapping, leaving 0/1/2 and all other caller fds untouched. */
+static int run_guest(mips32_ctx_t *ctx, int exec_fd)
 {
     rt32_elf_info_t info;
     uint32_t sp = 0;
-    int fd;
+    int fd = exec_fd;
     int r;
 
     rt32_host_probe(ctx);
@@ -203,10 +265,12 @@ static int run_guest(mips32_ctx_t *ctx)
         return -1;
     }
 
-    fd = rt32_open_guest_ro(ctx, ctx->exec_path);
     if (fd < 0) {
-        (void)fprintf(stderr, "mips32rt: cannot open '%s'\n", ctx->exec_path);
-        return -1;
+        fd = rt32_open_guest_ro(ctx, ctx->exec_path);
+        if (fd < 0) {
+            (void)fprintf(stderr, "mips32rt: cannot open '%s'\n", ctx->exec_path);
+            return -1;
+        }
     }
     if (rt32_elf_load(ctx, fd, ctx->exec_path, &info) != 0) {
         (void)fprintf(stderr, "mips32rt: ELF load failed: %s\n", ctx->exec_path);
@@ -273,24 +337,47 @@ void mips_dump_regs(const mips32_ctx_t *ctx, FILE *out)
 int main(int argc, char **argv)
 {
     mips32_ctx_t ctx;
+    const char *execfn = NULL;
+    const char *exec_path;
+    const char *env_execfn;
     int path_idx;
+    int image_fd = -1;
+    int exec_fd;
     int st;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.engine = -1; /* unset: --interp/--dbt or MIPS32RT_ENGINE; INTERP default */
 
-    path_idx = parse_args(&ctx, argc, argv);
+    path_idx = parse_args(&ctx, argc, argv, &execfn, &image_fd);
     if (path_idx < 0) {
         usage(stderr);
         return 2;
     }
     apply_env(&ctx);
-    ctx.exec_path = argv[path_idx];
+    /* Wave 1 descriptor order (HOST-CONTRACT 3.1): an explicit --image-fd
+     * wins; otherwise the AT_EXECFD auxv entry (when present) supplies the
+     * image; otherwise the path is opened.  A value of 0 with errno == 0
+     * is a valid descriptor, so auxv_exec_fd decides by errno, not value. */
+    exec_fd = image_fd;
+    if (exec_fd < 0) {
+        exec_fd = auxv_exec_fd();
+    }
+    /* --execfn decouples the image path (AT_EXECFN) from guest argv[0]:
+     * every token after -- stays guest argv verbatim.  MIPS32RT_EXECFN is
+     * the env fallback; an explicit --execfn always wins. */
+    exec_path = argv[path_idx];
+    if (execfn != NULL) {
+        exec_path = execfn;
+    } else if ((env_execfn = getenv("MIPS32RT_EXECFN")) != NULL &&
+               env_execfn[0] != '\0') {
+        exec_path = env_execfn;
+    }
+    ctx.exec_path = exec_path;
     ctx.guest_argc = argc - path_idx;
     ctx.guest_argv = &argv[path_idx];
     ctx.host_envp = environ;
 
-    st = run_guest(&ctx);
+    st = run_guest(&ctx, exec_fd);
 
     if (st < 0) {
         return 1;
