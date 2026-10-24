@@ -104,6 +104,12 @@
 #define MIPS32_NR_set_thread_area 4283 /* o32 index 283: sys_set_thread_area */
 
 /* Process wait (Phase 4 fork/exec/wait4) */
+#define MIPS32_NR_waitpid 4007 /* o32 index 7:   sys_waitpid */
 #define MIPS32_NR_wait4 4114 /* o32 index 114: sys_wait4 */
+/*
+ * MIPS O32 defines no __NR_vfork (verified absent from unistd_o32.h):
+ * glibc vfork lowers to clone (lane L4b); see mips_proc_vfork in
+ * src/os/proc.c for the documented fork-equivalent.
+ */
 
 #endif /* MIPS32_SYSCALL_NR_H */
