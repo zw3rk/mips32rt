@@ -16,6 +16,7 @@
 #include <stdio.h>
 
 #include "mips32rt.h"
+#include "interp/fp.h"
 #include "interp/interp.h"
 
 static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d);
@@ -582,9 +583,9 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_at(ctx, cur_pc);
         }
         return 0;
-    case 0x11u: /* COP1 moves (arithmetic faults for Phase 3) */
+    case 0x11u: /* COP1: moves via fpmove.c, arithmetic/BC1 via fp.c (L3a) */
         if (fpmove_cop1(ctx, d) != 0) {
-            return fault_at(ctx, cur_pc);
+            return fp_exec(ctx, cur_pc, d);
         }
         return 0;
     case 0x2Fu: /* CACHE */
