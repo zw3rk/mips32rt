@@ -108,3 +108,33 @@ run `--difftest`.
   ```sh
   sh tests/difftest/run_d2.sh && test -s tests/difftest/golden_le_hello.txt
   ```
+
+---
+
+## RC2 outcome (coordinator integration)
+
+`tests/difftest/run_difftest.sh GUEST interp dbt` reports `0 divergences`
+on all 12 guests (test_p1_isa + 5 static-libc fixtures x LE/BE); D2
+(`run_d2.sh`) matches every qemu golden on both engines; RC1 still green
+after the integration (52 shared PASS lines per endian).
+
+Bugs found and fixed at RC2 (all verified by the gates above):
+- BSHFL source register: interp + emitter read `rs` (always `$0`)
+  instead of `rt` — broke `SEB` (glibc `%X` printed lowercase).
+  Regression test: `t_bshfl` in `tests/test_p1_isa.c` (goldens regen).
+- EXT field semantics: `rd` holds `size-1`, not `msb`
+  (`ext(0xABCDEF12,4,6)==0x31`); interp + emitter used `msb-lsb+1`.
+- DIVU/DIV zero check inverted (`CBNZ` skips on nonzero divisor);
+  must skip only on divisor zero.
+- Unaligned store clobbered `TMP1` (align check) before `str`;
+  now uses `TMP2` for the value.
+- Unaligned k=3 dispatch fell through to the k=0 path; fall-through
+  now enters k=3 first.
+- `kGprHost`/`kCached` disagreed on w12/w13 (`$t6`/`$t7` vs `$s0`/`$s1`);
+  every block exit zeroed `$s0`/`$s1`. Now SPEC-mapped (`w12`/`w13`).
+- STXR retry looped without a fresh LDXR (reservation stays cleared);
+  retries restart at LDXR.
+- Missing `unlink`/`unlinkat` (fileio fixture); wired through
+  `mips_syscall_extra`.
+- Makefile now builds `src/dbt/**` + trampoline; dropped the
+  `dbt_main` stub for L2b's engine.
