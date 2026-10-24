@@ -870,12 +870,14 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
     for (i = 0U; i < count; i++) {
         const mips_dec_t *d = &insns[i];
         int rc;
+        if (d->op == MIPS_OP_COP1) {
+            int dbt_emit_fp(a64_buf_t *, const mips_dec_t *, uint32_t, uint32_t, int, int, int);
+            if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode, ctx->nan2008)) { cur += 4U; continue; }
+        }
         if (is_ctl(d) != 0) {
-            if (d->op == MIPS_OP_COP1 || i + 1U >= count ||
-                slot_ok(&insns[i + 1]) == 0) {
+            if (d->op == MIPS_OP_COP1 || i + 1U >= count || slot_ok(&insns[i + 1]) == 0) {
                 emit_exit_imm(&b, MIPS32_EXIT_SINGLE_STEP, 0U, cur, cur + 4U);
-                *out_end = cur;
-                break;
+                *out_end = cur; break;
             }
             emit_branch(&b, d, &insns[i + 1], cur, be);
             *out_end = cur + 8U;
