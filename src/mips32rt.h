@@ -267,4 +267,56 @@ static inline int mips32_host_prot(const mips32_ctx_t *ctx, uint32_t guest_prot)
 int interp_main(mips32_ctx_t *ctx);
 int dbt_main(mips32_ctx_t *ctx);
 
+/*
+ * ---- Phase 1 frozen contracts (decoder / interp / guest memory / syscalls)
+ *
+ * Endianness: ctx->cp0_config1 bit 0 selects BE (mips) vs LE (mipsel).
+ * Faults: memory helpers return 0 on success, MIPS_FAULT (-1) when the
+ * access is unmapped, unaligned (for aligned-only accesses), or faulting.
+ */
+#define MIPS_FAULT (-1)
+
+static inline int mips_is_be(const mips32_ctx_t *ctx)
+{
+    return (ctx->cp0_config1 & 1U) != 0;
+}
+
+/* Decoded MIPS32r2 instruction (word already in host byte order). */
+typedef struct mips_dec {
+    uint32_t word;              /* raw 32-bit instruction word */
+    uint8_t  op;                /* major opcode (bits 31..26) */
+    uint8_t  rs;                /* bits 25..21 */
+    uint8_t  rt;                /* bits 20..16 */
+    uint8_t  rd;                /* bits 15..11 */
+    uint8_t  sa;                /* bits 10..6 */
+    uint8_t  funct;             /* bits 5..0 (SPECIAL) */
+    uint16_t imm;               /* bits 15..0 */
+    uint32_t target;            /* bits 25..0 (J/JAL) */
+    int32_t  simm;              /* sign-extended imm */
+    uint32_t uimm;              /* zero-extended imm */
+} mips_dec_t;
+
+/* Pure decoder (src/interp/decode.c, lane L1a). */
+void mips_decode(uint32_t word, mips_dec_t *d);
+/* Endianness-aware fetch from guest pc (0 ok, MIPS_FAULT on fault). */
+int mips_fetch(mips32_ctx_t *ctx, uint32_t pc, uint32_t *word);
+
+/* Reference interpreter (src/interp/interp.c, lane L1b). */
+int interp_step(mips32_ctx_t *ctx);
+int interp_run(mips32_ctx_t *ctx);
+
+/* Guest memory window + accessors (src/os/mem.c, lane L1c). */
+int guest_mem_init(mips32_ctx_t *ctx);
+int guest_ld8(mips32_ctx_t *ctx, uint32_t va, uint32_t *out);
+int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out);   /* aligned-only */
+int guest_ld32(mips32_ctx_t *ctx, uint32_t va, uint32_t *out);   /* aligned-only */
+int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val);
+int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val);    /* aligned-only */
+int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val);    /* aligned-only */
+/* Synchronous fault: records EXIT_FAULT (lane L1c; signals in Phase 4). */
+void mips_fault(mips32_ctx_t *ctx, uint32_t addr);
+
+/* Minimal O32 syscall dispatcher (src/os/syscall_min.c, lane L1c). */
+int32_t mips_syscall(mips32_ctx_t *ctx);
+
 #endif /* MIPS32RT_H */

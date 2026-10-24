@@ -14,7 +14,7 @@ Run after `RC-E` is merged to `master`.
   4. Create `Makefile` (with `build`, `check`, `check-line-limits`, `check-abi-invariants`, `clean`, `help`) and `flake.nix`.
 - **Acceptance Command**:
   ```sh
-  nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.stdenv.cc -c make build check-line-limits
+  nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.stdenv.cc -c make clean build check-line-limits CC=aarch64-unknown-linux-musl-gcc
   ```
 
 ---

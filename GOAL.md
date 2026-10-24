@@ -23,19 +23,19 @@ Implement, verify, and harden **`mips32rt`** — a zero-dependency, static-PIE (
 
 ### Phase E — Pre-Implementation Empirical Experiments (`RC-E`)
 Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experiment lanes `E01..E06`:
-- [ ] **E01 (O32 Syscall Stack Args 5..8 & `$a3` Error Flag)**: Verify MIPS O32 syscall args 5..8 at `$sp+16..$sp+28`, even-pair 64-bit alignment (`$a0:$a1`, `$a2:$a3`), and `$a3=0/1` return convention under `qemu-mipsel`. (`experiments/E01/FINDINGS.md`)
-- [ ] **E02 (Delay-Slot, Branch-Likely (`BEQL`) Annul & Page-End Faults)**: Verify `BEQL` not-taken annulment at `page_end - 4` before an `mprotect(..., PROT_NONE)` page and delay-slot `sc_pc = branch_pc` signal restart. (`experiments/E02/FINDINGS.md`)
-- [ ] **E03 (`FR=0` vs `FR=1` & Legacy vs 2008 NaN/ABS FPU Semantics)**: Verify `.MIPS.abiflags` (`PT_MIPS_ABIFLAGS`), `MTC1`/`MFHC1`/`MTHC1`, and quiet/signaling NaN bit patterns under `qemu-mipsel`. (`experiments/E03/FINDINGS.md`)
-- [ ] **E04 (O32 `rt_sigframe` Layout & 128-Signal (`sigsetsize=16`) UAPI)**: Compile a target C probe dumping `sizeof`/`offsetof` for `rt_sigframe`, `ucontext_t`, `sigcontext`, `stat64` (104 B), and `sigset_t` (16 B). (`experiments/E04/FINDINGS.md`)
-- [ ] **E05 (`LWL`/`LWR` & `SWL`/`SWR` Unaligned Semantics (`mipsel` & `mips` BE))**: Verify unaligned load/store merge semantics across all 4 byte alignments in both little-endian and big-endian modes. (`experiments/E05/FINDINGS.md`)
-- [ ] **E06 (TLS (`rdhwr $29` / `set_thread_area 4283`) & `LL`/`SC`)**: Verify `set_thread_area(4283)` + `rdhwr $v1, $29` and `LL`/`SC` atomic sequences under `qemu-mipsel`. (`experiments/E06/FINDINGS.md`)
-- [ ] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-mipsel (and qemu-mips for BE)` ground-truth verification.
+- [x] **E01 (O32 Syscall Stack Args 5..8 & `$a3` Error Flag)**: Verify MIPS O32 syscall args 5..8 at `$sp+16..$sp+28`, even-pair 64-bit alignment (`$a0:$a1`, `$a2:$a3`), and `$a3=0/1` return convention under `qemu-mipsel`. (`experiments/E01/FINDINGS.md`)
+- [x] **E02 (Delay-Slot, Branch-Likely (`BEQL`) Annul & Page-End Faults)**: Verify `BEQL` not-taken annulment at `page_end - 4` before an `mprotect(..., PROT_NONE)` page and delay-slot `sc_pc = branch_pc` signal restart. (`experiments/E02/FINDINGS.md`)
+- [x] **E03 (`FR=0` vs `FR=1` & Legacy vs 2008 NaN/ABS FPU Semantics)**: Verify `.MIPS.abiflags` (`PT_MIPS_ABIFLAGS`), `MTC1`/`MFHC1`/`MTHC1`, and quiet/signaling NaN bit patterns under `qemu-mipsel`. (`experiments/E03/FINDINGS.md`)
+- [x] **E04 (O32 `rt_sigframe` Layout & 128-Signal (`sigsetsize=16`) UAPI)**: Compile a target C probe dumping `sizeof`/`offsetof` for `rt_sigframe`, `ucontext_t`, `sigcontext`, `stat64` (104 B), and `sigset_t` (16 B). (`experiments/E04/FINDINGS.md`)
+- [x] **E05 (`LWL`/`LWR` & `SWL`/`SWR` Unaligned Semantics (`mipsel` & `mips` BE))**: Verify unaligned load/store merge semantics across all 4 byte alignments in both little-endian and big-endian modes. (`experiments/E05/FINDINGS.md`)
+- [x] **E06 (TLS (`rdhwr $29` / `set_thread_area 4283`) & `LL`/`SC`)**: Verify `set_thread_area(4283)` + `rdhwr $v1, $29` and `LL`/`SC` atomic sequences under `qemu-mipsel`. (`experiments/E06/FINDINGS.md`)
+- [x] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-mipsel (and qemu-mips for BE)` ground-truth verification.
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
-- [ ] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/mips32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
-- [ ] **Lane `L0b`**: Create `tests/check_abi_invariants.c` verifying all `mips32_ctx_t`, `sigframe`, `ucontext`, and `stat` `sizeof`/`offsetof` invariants with `_Static_assert` and runtime checks.
-- [ ] **Gate `RC0`**: `_build/mips32rt` builds cleanly as a static-PIE `aarch64-unknown-linux-musl` binary; `make check-line-limits` (`<= 900 LOC`) and `check_abi_invariants` pass.
+- [x] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/mips32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
+- [x] **Lane `L0b`**: Create `tests/check_abi_invariants.c` verifying all `mips32_ctx_t`, `sigframe`, `ucontext`, and `stat` `sizeof`/`offsetof` invariants with `_Static_assert` and runtime checks.
+- [x] **Gate `RC0`**: `_build/mips32rt` builds cleanly as a static-PIE `aarch64-unknown-linux-musl` binary; `make check-line-limits` (`<= 900 LOC`) and `check_abi_invariants` pass.
 
 ### Phase 1 — Base Integer Decoder, Reference Interpreter (`src/interp/`) & Minimal Syscalls (`RC1`)
 Write `docs/lanes/phase-1.md` and run concurrent lanes `L1a..L1d`:
