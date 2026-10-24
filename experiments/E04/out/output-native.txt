@@ -1,0 +1,60 @@
+--- sizes ---
+sizeof(sigset_t)=128
+sizeof(struct sigaction)=152
+sizeof(siginfo_t)=128
+sizeof(ucontext_t)=4560
+sizeof(struct stat64)=128
+sizeof(stack_t)=24
+--- sigaction offsets ---
+offsetof(struct sigaction,sa_handler)=0
+offsetof(struct sigaction,sa_mask)=8
+offsetof(struct sigaction,sa_flags)=136
+offsetof(struct sigaction,sa_restorer)=144
+--- ucontext offsets ---
+offsetof(ucontext_t,uc_flags)=0
+offsetof(ucontext_t,uc_link)=8
+offsetof(ucontext_t,uc_stack)=16
+offsetof(ucontext_t,uc_mcontext)=176
+offsetof(ucontext_t,uc_sigmask)=40
+--- stack_t offsets ---
+offsetof(stack_t,ss_sp)=0
+offsetof(stack_t,ss_flags)=8
+offsetof(stack_t,ss_size)=16
+--- mcontext (glibc o32) offsets ---
+--- siginfo offsets ---
+offsetof(siginfo_t,si_signo)=0
+offsetof(siginfo_t,si_errno)=4
+offsetof(siginfo_t,si_code)=8
+--- stat64 ---
+offsetof(struct stat64,st_dev)=0
+offsetof(struct stat64,st_ino)=8
+offsetof(struct stat64,st_mode)=16
+offsetof(struct stat64,st_nlink)=20
+offsetof(struct stat64,st_uid)=24
+offsetof(struct stat64,st_gid)=28
+offsetof(struct stat64,st_size)=48
+offsetof(struct stat64,st_blksize)=56
+offsetof(struct stat64,st_blocks)=64
+--- constants ---
+_NSIG=65
+NSIG=65
+SIGRTMIN=34
+SIGRTMAX=64
+SI_QUEUE=-1
+--- sigset128 ---
+sigismember(1)=1
+sigismember(31)=1
+sigismember(32)=0
+sigismember(64)=1
+sigismember(120)=-1
+sigismember(127)=-1
+--- delivery ---
+got_sig=35
+got_code=-6
+seen_pc=0x1
+seen_sp=0x1
+seen_fpc_csr=0x0
+raw_sigprocmask_size16=-1 errno=22
+raw_sigprocmask_size8=0 errno=0
+kernel_sigset_bytes=8
+RESULT=PASS

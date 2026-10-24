@@ -1,0 +1,102 @@
+--- sizes ---
+sizeof(sigset_t)=128
+sizeof(struct sigaction)=144
+sizeof(siginfo_t)=128
+sizeof(ucontext_t)=744
+sizeof(mcontext_t)=592
+sizeof(gregset_t)=256
+sizeof(fpregset_t)=256
+sizeof(greg_t)=8
+sizeof(struct sigcontext)=592
+sizeof(struct stat64)=160
+sizeof(stack_t)=12
+--- sigaction offsets ---
+offsetof(struct sigaction,sa_handler)=4
+offsetof(struct sigaction,sa_mask)=8
+offsetof(struct sigaction,sa_flags)=0
+offsetof(struct sigaction,sa_restorer)=136
+--- ucontext offsets ---
+offsetof(ucontext_t,uc_flags)=0
+offsetof(ucontext_t,uc_link)=4
+offsetof(ucontext_t,uc_stack)=8
+offsetof(ucontext_t,uc_mcontext)=24
+offsetof(ucontext_t,uc_sigmask)=616
+--- stack_t offsets ---
+offsetof(stack_t,ss_sp)=0
+offsetof(stack_t,ss_flags)=8
+offsetof(stack_t,ss_size)=4
+--- mcontext (glibc o32) offsets ---
+offsetof(mcontext_t,regmask)=0
+offsetof(mcontext_t,status)=4
+offsetof(mcontext_t,pc)=8
+offsetof(mcontext_t,gregs)=16
+offsetof(mcontext_t,fpregs)=272
+offsetof(mcontext_t,fp_owned)=528
+offsetof(mcontext_t,fpc_csr)=532
+offsetof(mcontext_t,fpc_eir)=536
+offsetof(mcontext_t,used_math)=540
+offsetof(mcontext_t,dsp)=544
+offsetof(mcontext_t,mdhi)=552
+offsetof(mcontext_t,mdlo)=560
+offsetof(mcontext_t,hi1)=568
+offsetof(mcontext_t,lo1)=572
+offsetof(mcontext_t,hi2)=576
+offsetof(mcontext_t,lo2)=580
+offsetof(mcontext_t,hi3)=584
+offsetof(mcontext_t,lo3)=588
+--- sigcontext (kernel ABI32 layout) offsets ---
+offsetof(struct sigcontext,sc_regmask)=0
+offsetof(struct sigcontext,sc_status)=4
+offsetof(struct sigcontext,sc_pc)=8
+offsetof(struct sigcontext,sc_regs)=16
+offsetof(struct sigcontext,sc_fpregs)=272
+offsetof(struct sigcontext,sc_ownedfp)=528
+offsetof(struct sigcontext,sc_fpc_csr)=532
+offsetof(struct sigcontext,sc_fpc_eir)=536
+offsetof(struct sigcontext,sc_used_math)=540
+offsetof(struct sigcontext,sc_dsp)=544
+offsetof(struct sigcontext,sc_mdhi)=552
+offsetof(struct sigcontext,sc_mdlo)=560
+offsetof(struct sigcontext,sc_hi1)=568
+offsetof(struct sigcontext,sc_lo1)=572
+offsetof(struct sigcontext,sc_hi2)=576
+offsetof(struct sigcontext,sc_lo2)=580
+offsetof(struct sigcontext,sc_hi3)=584
+offsetof(struct sigcontext,sc_lo3)=588
+--- siginfo offsets ---
+offsetof(siginfo_t,si_signo)=0
+offsetof(siginfo_t,si_errno)=8
+offsetof(siginfo_t,si_code)=4
+--- stat64 ---
+offsetof(struct stat64,st_dev)=0
+offsetof(struct stat64,st_ino)=16
+offsetof(struct stat64,st_mode)=24
+offsetof(struct stat64,st_nlink)=28
+offsetof(struct stat64,st_uid)=32
+offsetof(struct stat64,st_gid)=36
+offsetof(struct stat64,st_size)=56
+offsetof(struct stat64,st_blksize)=88
+offsetof(struct stat64,st_blocks)=96
+--- constants ---
+_NSIG=128
+NSIG=128
+SIGRTMIN=34
+SIGRTMAX=127
+SI_QUEUE=-1
+--- sigset128 ---
+sigismember(1)=1
+sigismember(31)=1
+sigismember(32)=0
+sigismember(64)=1
+sigismember(120)=1
+sigismember(127)=1
+--- delivery ---
+got_sig=35
+got_code=-6
+seen_pc=0x41a0ac
+seen_sp=0x40800b10
+seen_fpc_csr=0x0
+raw_sigprocmask_size16=0 errno=0
+raw_sigprocmask_size8=-1 errno=22
+kernel_sigset_bytes=16
+RESULT=PASS
