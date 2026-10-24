@@ -40,8 +40,11 @@ static int checks = 0;
 		} \
 	} while (0)
 
-/* SPEC 2.1 mips32_ctx_t layout. */
-_Static_assert(sizeof(mips32_ctx_t) == 0x1c0, "ctx size 0x1c0");
+/* SPEC 2.1 mips32_ctx_t layout: the ABI-locked prefix ends at 0x1c0;
+ * a C-only tail may follow (see src/mips32rt.h), so total sizeof is >=. */
+_Static_assert(offsetof(mips32_ctx_t, fpr) + sizeof(((mips32_ctx_t *)0)->fpr) == 0x1c0,
+    "locked prefix ends at 0x1c0");
+_Static_assert(sizeof(mips32_ctx_t) >= 0x1c0, "ctx spans locked prefix");
 _Static_assert(offsetof(mips32_ctx_t, gpr) == 0x000, "gpr at 0x000");
 _Static_assert(offsetof(mips32_ctx_t, pc) == 0x080, "pc at 0x080");
 _Static_assert(offsetof(mips32_ctx_t, next_pc) == 0x084, "next_pc at 0x084");
@@ -73,8 +76,19 @@ _Static_assert(sizeof(mips_stat64_t) == 104, "stat64 104");
 
 int main(void)
 {
-	/* SPEC 2.1 context. */
-	CHECK_SIZE(mips32_ctx_t, 0x1c0);
+	/* SPEC 2.1 context: locked prefix ends at 0x1c0, tail allowed. */
+	checks++;
+	if (offsetof(mips32_ctx_t, fpr) + sizeof(((mips32_ctx_t *)0)->fpr) == 0x1c0 &&
+	    sizeof(mips32_ctx_t) >= 0x1c0) {
+		printf("ok: locked ctx prefix ends at 0x1c0 (sizeof %u)\n",
+		    (unsigned)sizeof(mips32_ctx_t));
+	} else {
+		printf("FAIL: ctx prefix end %u, sizeof %u, want prefix 0x1c0\n",
+		    (unsigned)(offsetof(mips32_ctx_t, fpr) +
+		    sizeof(((mips32_ctx_t *)0)->fpr)),
+		    (unsigned)sizeof(mips32_ctx_t));
+		failures++;
+	}
 	CHECK_OFF(mips32_ctx_t, gpr, 0x000);
 	CHECK_OFF(mips32_ctx_t, pc, 0x080);
 	CHECK_OFF(mips32_ctx_t, next_pc, 0x084);

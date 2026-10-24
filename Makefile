@@ -67,6 +67,7 @@ check-line-limits: ## Fail if any .c/.h/.S source file exceeds 900 lines
 
 check-abi-invariants: ## Compile+run tests/check_abi_invariants.c (lane L0b; skips gracefully until it lands)
 	@if [ -f tests/check_abi_invariants.c ]; then \
+		mkdir -p $(BUILD_DIR) && \
 		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc tests/check_abi_invariants.c -o $(BUILD_DIR)/check_abi_invariants && ./$(BUILD_DIR)/check_abi_invariants; \
 	else \
 		echo "check-abi-invariants: tests/check_abi_invariants.c not present (lane L0b) — skipping"; \
