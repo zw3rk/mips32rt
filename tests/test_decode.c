@@ -13,7 +13,21 @@
 
 #include <stdio.h>
 
+#include "mips32rt.h"
 #include "interp/decode.h"
+
+/* Link stub: this self-test only exercises mips_decode (pure); the
+ * mips_fetch range check lives in the syscall layer (src/os/syscalls.c)
+ * and is covered by the run_p6 parity gates, not here. */
+int mips_sc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
+                     uint32_t need)
+{
+    (void)ctx;
+    (void)va;
+    (void)len;
+    (void)need;
+    return 1;
+}
 
 typedef struct {
     const char *name;
