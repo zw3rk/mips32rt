@@ -73,6 +73,9 @@
 #include <sys/syscall.h>
 #endif
 
+/* Phase 4 thread layer (src/os/threads.c, lane L4b): full futex ops. */
+int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp);
+
 
 /* ---- Small self-contained guest helpers (no faults, -EFAULT style) ---- */
 
@@ -853,7 +856,7 @@ int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
     case (uint32_t)MIPS32_NR_getrandom:
         return mips_sc_getrandom(ctx, sp);
     case (uint32_t)MIPS32_NR_futex:
-        return mips_sc_futex(ctx, sp);
+        return mips_sc_futex_thread(ctx, sp);
     case (uint32_t)MIPS32_NR_rt_sigprocmask:
         return mips_sc_rt_sigprocmask(ctx, sp);
     case (uint32_t)MIPS32_NR_rt_sigaction:
