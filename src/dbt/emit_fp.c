@@ -347,11 +347,11 @@ static void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
 }
 
 /* Merge an operation's exception bits (FPSR IOC/DZC/OFC/UFC/IXC in the
- * low 5 bits of wfpsr5) into FCSR (W21): Cause+E[17:12] are replaced
- * (cleared then set), E is set when an enabled exception occurred,
- * Flags[6:2] accumulate.  An enabled exception stores FCSR and exits
- * EXIT_TRAP at cur (Flags left untouched); otherwise Flags are updated
- * and emission continues.
+ * low 5 bits of wfpsr5) into FCSR (W21): Cause[17:12] is replaced
+ * (cleared then set, E never set: qemu reports 0x10800 on Invalid
+ * trap), Flags[6:2] accumulate.  An enabled exception stores FCSR and
+ * exits EXIT_TRAP at cur (Flags left untouched); otherwise Flags are
+ * updated and emission continues.
  * RBIT maps bit k to bit 31-k, so LSR 15 lands V..I on Cause 16..12
  * and LSR 25 on Flags 6..2. */
 static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
@@ -379,8 +379,6 @@ static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
     a64_emit_shift_imm_w(b, 22U, 22U, A64_SHIFT_LSL, 5U, false, NULL);
     a64_emit_and_reg_w(b, false, 22U, 22U, A64_TMP1, A64_SHIFT_LSL, 0U);
     ph = a64_emit_cbz_w_placeholder(b, false, 22U);
-    a64_emit_mov_imm32(b, 22U, FP_FCSR_E_BIT);
-    a64_emit_orr_reg_w(b, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
     a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     for (i = 0U; i < 16U; i++) {
         a64_emit_str_imm_w(b, (unsigned)kFpGprHost[kFpCached[i]], A64_XCTX,

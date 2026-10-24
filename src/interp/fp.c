@@ -48,13 +48,14 @@ static void fp_raise(struct fp_st *s, unsigned e)
         s->trap = 1;
 }
 
-/* Cause+E (17:12) replaced per-insn, Flags (6:2) accumulate. */
+/* Cause (17:12) replaced per-insn, Flags (6:2) accumulate. Trap: Cause
+ * sticks, Flags do not (E03: post-trap keeps Cause.V, no Flags.V, no E
+ * bit: qemu-mipsel reports 0x10800 for the Invalid trap). */
 static int fp_commit(struct fp_st *s)
 {
     s->ctx->fcsr &= ~0x3F000u;
     s->ctx->fcsr |= s->cause;
     if (s->trap) {
-        s->ctx->fcsr |= (1u << 17);
         mips_trap(s->ctx, 8, s->pc);
         return MIPS_FAULT;
     }
