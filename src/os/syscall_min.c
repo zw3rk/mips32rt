@@ -278,6 +278,9 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
     return sc_ret(ctx, 0);
 }
 
+/* Phase 2 static-libc layer (src/os/syscalls.c, lane L2a). */
+int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp);
+
 int32_t mips_syscall(mips32_ctx_t *ctx)
 {
     uint32_t nr;
@@ -345,6 +348,46 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         /* Single-threaded Phase 1: pid is the tid (real tids in Phase 4). */
         return sc_ret(ctx, (int32_t)getpid());
     }
+    /* Phase 2 (lane L2a): static-libc numbers handled in syscalls.c. */
+    case MIPS32_NR_open:
+    case MIPS32_NR_openat:
+    case MIPS32_NR_close:
+    case MIPS32_NR_lseek:
+    case MIPS32_NR_llseek:
+    case MIPS32_NR_readv:
+    case MIPS32_NR_writev:
+    case MIPS32_NR_dup:
+    case MIPS32_NR_dup2:
+    case MIPS32_NR_dup3:
+    case MIPS32_NR_pipe:
+    case MIPS32_NR_pipe2:
+    case MIPS32_NR_fcntl:
+    case MIPS32_NR_fcntl64:
+    case MIPS32_NR_ioctl:
+    case MIPS32_NR_stat64:
+    case MIPS32_NR_lstat64:
+    case MIPS32_NR_fstat64:
+    case MIPS32_NR_fstatat64:
+    case MIPS32_NR_statx:
+    case MIPS32_NR_getdents64:
+    case MIPS32_NR_readlink:
+    case MIPS32_NR_readlinkat:
+    case MIPS32_NR_access:
+    case MIPS32_NR_close_range:
+    case MIPS32_NR_nanosleep:
+    case MIPS32_NR_clock_gettime:
+    case MIPS32_NR_clock_gettime64:
+    case MIPS32_NR_getuid:
+    case MIPS32_NR_geteuid:
+    case MIPS32_NR_getgid:
+    case MIPS32_NR_getegid:
+    case MIPS32_NR_getrandom:
+    case MIPS32_NR_futex:
+    case MIPS32_NR_rt_sigprocmask:
+    case MIPS32_NR_rt_sigaction:
+    case MIPS32_NR_set_robust_list:
+    case MIPS32_NR_get_robust_list:
+        return mips_syscall_extra(ctx, sp);
     case MIPS32_NR_set_thread_area: {
         /* O32 takes the TLS base directly in $a0 (E06); rdhwr $29 reads
          * it back as ctx->ulr.  LL reservations are already clear here. */
