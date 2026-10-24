@@ -40,7 +40,7 @@ test -x "$ROOT/_build/mips32rt" || fail "no translator binary"
 
 echo "=== P5B container setup ($IMG) ==="
 docker run -d --name "$NAME" --memory 2g --cpus 2 \
-    --platform linux/arm64 -v "$ROOT:/w" -w /w "$IMG" sleep 1500
+    --platform linux/arm64 -v "$ROOT:/w" -w /w "$IMG" sleep 3600
 
 echo "=== P5B dynamic test + BusyBox checks ==="
 docker exec -e ENGINES="$ENGINES" -e BB_VER="$BB_VER" "$NAME" sh -c '
@@ -48,7 +48,7 @@ docker exec -e ENGINES="$ENGINES" -e BB_VER="$BB_VER" "$NAME" sh -c '
     apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         qemu-user gcc-mipsel-linux-gnu gcc-mips-linux-gnu \
         libc6-dev-mipsel-cross libc6-dev-mips-cross \
-        make wget bzip2 bc file ca-certificates
+        make wget bzip2 bc file ca-certificates gcc
     fails=0
 
     echo "--- P5B build dynamic test_p5_dyn + helper .so (LE+BE) ---"
@@ -138,19 +138,29 @@ docker exec -e ENGINES="$ENGINES" -e BB_VER="$BB_VER" "$NAME" sh -c '
             echo "--- P5B build BusyBox $endian/$flavor ---"
             obj=/tmp/bb-obj-$endian-$flavor
             mkdir -p $obj
-            (make -C /tmp/bb-src O=$obj ARCH=mips defconfig >/tmp/bb-$endian-$flavor.conf.log 2>&1) || {
-                echo "P5B BUSYBOX FAIL: $endian/$flavor defconfig"
+            # BusyBox has no scripts/config (that is a Linux kernel script)
+            # and no olddefconfig target: start from allnoconfig, flip the
+            # applets needed by the probe plus STATIC for static builds,
+            # then oldconfig with empty answers for the rest.
+            (make -C /tmp/bb-src O=$obj ARCH=mips allnoconfig >/tmp/bb-$endian-$flavor.conf.log 2>&1) || {
+                echo "P5B BUSYBOX FAIL: $endian/$flavor allnoconfig"
                 tail -20 /tmp/bb-$endian-$flavor.conf.log
                 fails=$((fails + 1))
                 continue
             }
-            /tmp/bb-src/scripts/config --file $obj/.config \
-                --set-str CONFIG_CROSS_COMPILER_PREFIX "$cross" \
-                --set-str CONFIG_EXTRA_CFLAGS "-march=mips32r2" \
-                $([ "$flavor" = static ] && echo --enable || echo --disable) CONFIG_STATIC \
-                >>/tmp/bb-$endian-$flavor.conf.log 2>&1
-            (make -C /tmp/bb-src O=$obj ARCH=mips olddefconfig >>/tmp/bb-$endian-$flavor.conf.log 2>&1) || {
-                echo "P5B BUSYBOX FAIL: $endian/$flavor olddefconfig"
+            if [ "$endian" = be ]; then eb=-EB; else eb=; fi
+            sed -i -e "s/^# CONFIG_ASH is not set\$/CONFIG_ASH=y/" \
+                -e "s/^# CONFIG_SH_IS_ASH is not set\$/CONFIG_SH_IS_ASH=y/" \
+                -e "s/^# CONFIG_LS is not set\$/CONFIG_LS=y/" \
+                -e "s/^# CONFIG_ECHO is not set\$/CONFIG_ECHO=y/" \
+                -e "s/^# CONFIG_WC is not set\$/CONFIG_WC=y/" \
+                $obj/.config
+            if [ "$flavor" = static ]; then
+                sed -i -e "s/^# CONFIG_STATIC is not set\$/CONFIG_STATIC=y/" \
+                    $obj/.config
+            fi
+            (yes "" | make -C /tmp/bb-src O=$obj ARCH=mips CROSS_COMPILE="$cross" EXTRA_CFLAGS="-march=mips32r2 $eb" oldconfig >>/tmp/bb-$endian-$flavor.conf.log 2>&1) || {
+                echo "P5B BUSYBOX FAIL: $endian/$flavor oldconfig"
                 tail -20 /tmp/bb-$endian-$flavor.conf.log
                 fails=$((fails + 1))
                 continue

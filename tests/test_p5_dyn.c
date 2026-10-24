@@ -228,11 +228,13 @@ static void t_dlopen(const char *helper_path)
  */
 int main(int argc, char **argv);
 
-static int auxv_entry_ok(unsigned long at_entry, unsigned long *expect_out)
+static int auxv_entry_ok(unsigned long at_entry, unsigned long *expect_out,
+                         unsigned long *base_out)
 {
     Dl_info info;
     Elf32_Ehdr eh;
     unsigned long expect = 0UL;
+    unsigned long base = 0UL;
 
     memset(&info, 0, sizeof info);
     if (dladdr((const void *)(uintptr_t)main, &info) == 0 ||
@@ -240,6 +242,7 @@ static int auxv_entry_ok(unsigned long at_entry, unsigned long *expect_out)
         ((uintptr_t)info.dli_fbase & 0xFFFu) != 0u) {
         return 0;
     }
+    base = (unsigned long)(uintptr_t)info.dli_fbase;
     memcpy(&eh, info.dli_fbase, sizeof eh);
     if (eh.e_ident[EI_MAG0] != ELFMAG0 || eh.e_ident[EI_MAG1] != ELFMAG1 ||
         eh.e_ident[EI_MAG2] != ELFMAG2 || eh.e_ident[EI_MAG3] != ELFMAG3 ||
@@ -247,8 +250,7 @@ static int auxv_entry_ok(unsigned long at_entry, unsigned long *expect_out)
         return 0;
     }
     if (eh.e_type == ET_DYN) {
-        expect = (unsigned long)(uintptr_t)info.dli_fbase +
-            (unsigned long)eh.e_entry;
+        expect = base + (unsigned long)eh.e_entry;
     } else if (eh.e_type == ET_EXEC) {
         expect = (unsigned long)eh.e_entry;
     } else {
@@ -256,6 +258,9 @@ static int auxv_entry_ok(unsigned long at_entry, unsigned long *expect_out)
     }
     if (expect_out != NULL) {
         *expect_out = expect;
+    }
+    if (base_out != NULL) {
+        *base_out = base;
     }
     return at_entry == expect;
 }
@@ -284,8 +289,18 @@ static void t_argv_env_auxv(int argc, char **argv)
     at_random = getauxval(AT_RANDOM);
     at_pagesz = getauxval(AT_PAGESZ);
     at_uid = getauxval(AT_UID);
-    if (at_entry == 0UL || !auxv_entry_ok(at_entry, NULL)) {
-        ok = 0;
+    {
+        /* Log the file-relative entry offset, not the absolute address:
+         * ET_DYN bases legitimately differ per loader (qemu maps at
+         * 0x40000000, mips32rt at 0x400000); the offset is invariant. */
+        unsigned long base = 0UL;
+        if (at_entry == 0UL || !auxv_entry_ok(at_entry, NULL, &base)) {
+            ok = 0;
+        }
+        n = snprintf(detail, sizeof(detail),
+                     "argc=%d entry_off=0x%lx marker=%s", argc,
+                     base != 0UL ? at_entry - base : at_entry,
+                     marker != NULL ? marker : "(null)");
     }
     if (at_phdr == 0UL || at_random == 0UL) {
         ok = 0;
@@ -296,9 +311,6 @@ static void t_argv_env_auxv(int argc, char **argv)
     if (at_uid != (unsigned long)getuid()) {
         ok = 0;
     }
-    n = snprintf(detail, sizeof(detail),
-                 "argc=%d entry=0x%lx marker=%s", argc, at_entry,
-                 marker != NULL ? marker : "(null)");
     (void)n;
     check("argv-env-auxv", ok, detail);
 }

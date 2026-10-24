@@ -113,11 +113,12 @@
 
 #define MIPS_THREAD_STACK_SIZE (2U * 1024U * 1024U)
 
+static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status);
+
 struct mips_thread {
     mips32_ctx_t ctx;
     void        *host_stack;
     uint32_t     ctid;
-    int          want_child_set;
     int          want_clear;
     /* Parent/child handshake: the child publishes its host tid, then
      * wakes the parent, which needs the tid for the guest clone
@@ -155,9 +156,6 @@ static int mips_thread_main(void *arg)
     self           = (uint32_t)syscall(SYS_gettid);
     t->ctx.host_tid = (int)self;
     t->ctx.is_thread_clone = true;
-    if (t->want_child_set) {
-        (void)thread_write_tid(&t->ctx, t->ctid, self);
-    }
     if (t->ctx.engine == MIPS32_ENGINE_DBT) {
         rc = dbt_main(&t->ctx);
     } else {
@@ -166,28 +164,23 @@ static int mips_thread_main(void *arg)
     /* Engines only return on a stop reason; exit syscalls never return. */
     status = (rc == 0) ? 0 : 1;
     if (t->want_clear) {
-        (void)thread_write_tid(&t->ctx, t->ctid, 0U);
-        (void)syscall(SYS_futex, mips32_guest_ptr(&t->ctx, t->ctid),
-                      (int)MIPS_FUTEX_WAKE, (uint32_t)INT_MAX, NULL, NULL,
-                      (uint32_t)0);
+        mips_thread_finish(&t->ctx, t->ctid, status);
+    } else {
+        (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
+                                        memory_order_relaxed);
+        (void)syscall(SYS_exit, (int)status);
     }
-    /* The initial thread is never counted, so reaching zero here only
-     * accounts clones; group teardown stays with exit/exit_group. */
-    (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
-                                    memory_order_relaxed);
-    (void)syscall(SYS_exit, (int)status);
     return 1; /* unreachable; keeps noreturn-less compilers quiet */
 }
 
-/* Guest exit() inside a CLONE_VM thread (RC4): end this host thread
- * alone, mirroring the engine-return path above (CLEARTID 0-write plus
- * FUTEX_WAKE, live-clone accounting, raw SYS_exit).  The group stays
- * alive; exit_group still tears everything down.  Does not return. */
-void mips_thread_exit(mips32_ctx_t *ctx, int status)
+/* Shared thread-teardown tail (CLEARTID 0-write plus FUTEX_WAKE,
+ * live-clone accounting, raw SYS_exit): used by the engine-return path
+ * and by guest exit().  Does not return. */
+static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status)
 {
-    if (ctx->clear_child_tid != 0U) {
-        (void)thread_write_tid(ctx, ctx->clear_child_tid, 0U);
-        (void)syscall(SYS_futex, mips32_guest_ptr(ctx, ctx->clear_child_tid),
+    if (ctid != 0U) {
+        (void)thread_write_tid(ctx, ctid, 0U);
+        (void)syscall(SYS_futex, mips32_guest_ptr(ctx, ctid),
                       (int)MIPS_FUTEX_WAKE, (uint32_t)INT_MAX, NULL, NULL,
                       (uint32_t)0);
     }
@@ -195,6 +188,14 @@ void mips_thread_exit(mips32_ctx_t *ctx, int status)
                                     memory_order_relaxed);
     (void)syscall(SYS_exit, status);
     _Exit(status); /* unreachable; raw SYS_exit never returns */
+}
+
+/* Guest exit() inside a CLONE_VM thread (RC4): end this host thread
+ * alone via the shared teardown tail.  The group stays alive;
+ * exit_group still tears everything down.  Does not return. */
+void mips_thread_exit(mips32_ctx_t *ctx, int status)
+{
+    mips_thread_finish(ctx, ctx->clear_child_tid, status);
 }
 
 /* Host thread entry for CLONE_VM-family guest threads (RC4): runs on
@@ -211,9 +212,19 @@ void mips_thread_exit(mips32_ctx_t *ctx, int status)
 static void *mips_host_thread_entry(void *arg)
 {
     struct mips_thread *t = (struct mips_thread *)arg;
+    uint32_t self;
 
-    atomic_store_explicit(&t->child_tid,
-                          (int)syscall(SYS_gettid), memory_order_relaxed);
+    self = (uint32_t)syscall(SYS_gettid);
+    atomic_store_explicit(&t->child_tid, (int)self, memory_order_relaxed);
+    /* Publish the guest tid before waking the parent: the parent returns
+     * from clone only after this store, so a joining parent always
+     * observes ctid == tid (or 0 after a fast child's clear), never a
+     * stale value.  The child is the sole writer of ctid (the parent
+     * skips its SETTID write when ptid aliases ctid), so the field is
+     * monotonic tid-then-0 and no resurrection race exists. */
+    if (t->ctid != 0U) {
+        (void)thread_write_tid(&t->ctx, t->ctid, self);
+    }
     atomic_store_explicit(&t->started, 1, memory_order_release);
     (void)syscall(SYS_futex, &t->started, (int)MIPS_FUTEX_WAKE,
                   (uint32_t)INT_MAX, NULL, NULL, (uint32_t)0);
@@ -311,8 +322,6 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     }
     t->host_stack      = stack;
     t->ctid            = ctid;
-    t->want_child_set  = (ctid != 0U &&
-                         (flags & MIPS_CLONE_CHILD_SETTID) != 0U);
     t->want_clear      = (ctid != 0U &&
                          (flags & MIPS_CLONE_CHILD_CLEARTID) != 0U);
 
@@ -356,7 +365,11 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         r = (long)atomic_load_explicit(&t->child_tid,
                                        memory_order_relaxed);
     }
-    if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U &&
+    /* When ptid aliases ctid (NPTL passes pd->tid for both), the
+     * child already wrote it at startup and will clear it on exit; a
+     * parent-side write here would race a fast child and resurrect a
+     * cleared tid, hanging the join.  Skip the redundant write. */
+    if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U && ptid != ctid &&
         thread_write_tid(ctx, ptid, (uint32_t)r) != 0) {
         /* The child already runs; its ctid/clear wake still fires on exit.
          * Report the fault to the parent while keeping the thread alive. */
