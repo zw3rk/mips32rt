@@ -643,7 +643,9 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
 static uint64_t fp_from_int(struct fp_st *s, unsigned f, int neg, uint64_t mag)
 {
     const struct fp_fmt *p = &fp_ff[f];
-    int32_t E = (int32_t)p->mb;
+    /* E tracks the true unbiased exponent for a mantissa normalized
+     * with the hidden bit at mb+3 (24/55 incl. 3 GRS bits below it). */
+    int32_t E = (int32_t)p->mb + 3;
     int sticky = 0;
     if (mag == 0u)
         return 0u;
@@ -856,10 +858,10 @@ int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     switch (d->rs) {
     case 0x08u:
         return fp_bc1(ctx, pc, d);
-    case 0x09u: /* MFHC1: high 32 bits, FR-agnostic flat lane (E03). */
+    case 0x03u: /* MFHC1: high 32 bits, FR-agnostic flat lane (E03). */
         interp_set_reg(ctx, d->rt, (uint32_t)(ctx->fpr[d->rd] >> 32));
         return 0;
-    case 0x0Bu: /* MTHC1: high 32 bits, low half preserved. */
+    case 0x07u: /* MTHC1: high 32 bits, low half preserved. */
         ctx->fpr[d->rd] = (ctx->fpr[d->rd] & 0xFFFFFFFFULL) |
                           (((uint64_t)ctx->gpr[d->rt]) << 32);
         return 0;

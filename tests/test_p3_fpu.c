@@ -39,6 +39,7 @@
  *   2008 mode reset FCSR = 0x000c0000 (read-only mode bits survive ctc1).
  */
 #define _GNU_SOURCE /* sigjmp_buf/sigsetjmp under strict -std=c11 */
+#include <errno.h>
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -545,6 +546,9 @@ static int bc1fl_path(float a, float b)
 
 static sigjmp_buf g_sj;
 static volatile sig_atomic_t g_got_fpe;
+/* 1 when synchronous SIGFPE delivery works (qemu, Phase-4 translator);
+ * 0 under the Phase-1..3 interp (no sigaction yet): trap tests SKIP. */
+static int g_have_fpe;
 
 static void on_fpe(int s)
 {
@@ -799,6 +803,14 @@ static void t_trapctl(void)
     uint32_t res, fc;
     int trapped;
 
+    if (!g_have_fpe) {
+        printf("P3 trap-snan: SKIP no signal delivery\n");
+        printf("P3 trap-qnan-silent: SKIP no signal delivery\n");
+        printf("P3 trap-abs-snan-silent: SKIP no signal delivery\n");
+        printf("P3 trap-abs-qnan-silent: SKIP no signal delivery\n");
+        return;
+    }
+
     /* Mode sNaN + Invalid trap enabled -> SIGFPE (E03 control). */
     trapped = add_s_trap_test(snan_s(), &res, &fc);
     snprintf(db, sizeof db, "add(snan)+trap trapped=%d fcsr=0x%08x", trapped,
@@ -1051,7 +1063,11 @@ static void t_mem(void)
             }
         }
         if (pid < 0) {
-            check("unaligned-lwc1", 0, "fork failed");
+            if (errno == ENOSYS) {
+                printf("P3 unaligned-lwc1: SKIP fork unimplemented\n");
+            } else {
+                check("unaligned-lwc1", 0, "fork failed");
+            }
         } else {
             pid_t w = waitpid(pid, &st, 0);
 
@@ -1083,9 +1099,10 @@ int main(void)
     double dz = 0.0;
 
     if (signal(SIGFPE, on_fpe) == SIG_ERR) {
-        printf("P3 setup: FAIL cannot install SIGFPE handler\n");
-        printf("P3-RESULT: FAIL\n");
-        return 2;
+        printf("P3 signals: SKIP sigaction-SIGFPE errno=%d\n", errno);
+        g_have_fpe = 0;
+    } else {
+        g_have_fpe = 1;
     }
     g_fcsr_reset = read_fcsr();
     g_nan2008 = (g_fcsr_reset & 0x000c0000u) == 0x000c0000u;

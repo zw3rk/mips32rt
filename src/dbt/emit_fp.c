@@ -111,15 +111,6 @@ static void fp_mem_d(a64_buf_t *b, unsigned is_store, unsigned vt,
                     ((rn_x & 31U) << 5) | (vt & 31U));
 }
 
-static void fp_mem_x(a64_buf_t *b, unsigned is_store, unsigned rt_x,
-                     unsigned rn_x, uint32_t byte_off)
-{
-    uint32_t base = (is_store != 0U) ? 0xF9000000U : 0xF9400000U;
-
-    a64_emit(b, base | (((byte_off >> 3) & 0xFFFU) << 10) |
-                    ((rn_x & 31U) << 5) | (rt_x & 31U));
-}
-
 /* MRS/MSR FPSR/FPCR (is_msr 0 = MRS Xt,sys; 1 = MSR sys,Xt). */
 static void fp_sys(a64_buf_t *b, unsigned is_msr, unsigned is_fpcr,
                    unsigned xt)
@@ -130,11 +121,6 @@ static void fp_sys(a64_buf_t *b, unsigned is_msr, unsigned is_fpcr,
         base |= 0x20U;
     }
     a64_emit(b, base | (xt & 31U));
-}
-
-static void fp_rev_x(a64_buf_t *b, unsigned xd, unsigned xn)
-{
-    a64_emit(b, 0xDAC00C00U | ((xn & 31U) << 5) | (xd & 31U));
 }
 
 /* Cached guest GPR -> host W register (SPEC 2.1; mirrors emit_int.c).
@@ -189,41 +175,26 @@ static uint32_t fp_slot(unsigned fs)
 static void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
+    (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
     if (is_d == 0U) {
         a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, fp_slot(fs));
-        if (be != 0) {
-            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-        }
         a64_emit_fmov_w_to_s(b, vd, A64_TMP1);
         return;
     }
     fp_mem_d(b, 0U, vd, A64_XCTX, fp_slot(fs));
-    if (be == 0) {
-        return;
-    }
-    fp_cvt(b, 1U, 1U, 0x06U, 24U, vd);
-    fp_rev_x(b, 24U, 24U);
-    fp_cvt(b, 1U, 1U, 0x07U, vd, 24U);
+    return;
 }
 
 static void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
+    (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
     if (is_d == 0U) {
         a64_emit_fmov_s_to_w(b, A64_TMP1, vd);
-        if (be != 0) {
-            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-        }
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, fp_slot(fs));
         return;
     }
-    if (be == 0) {
-        fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
-        return;
-    }
-    fp_cvt(b, 1U, 1U, 0x06U, 24U, vd);
-    fp_rev_x(b, 24U, 24U);
-    fp_mem_x(b, 1U, 24U, A64_XCTX, fp_slot(fs));
+    fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
 }
 
 /* Sync the host FPCR rounding mode from FCSR RM (W21).  Only the
@@ -565,18 +536,11 @@ static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
     return 0;
 }
 
-/* Store a W integer conversion result to an FPR low half (BE swaps). */
+/* Store a W integer conversion result to an FPR low half (a value). */
 static void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
 {
-    if (be == 0) {
-        a64_emit_str_imm_w(b, wsrc, A64_XCTX, off);
-        return;
-    }
-    if (wsrc != A64_TMP1) {
-        a64_emit_mov_w(b, A64_TMP1, wsrc);
-    }
-    a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
+    (void)be;
+    a64_emit_str_imm_w(b, wsrc, A64_XCTX, off);
 }
 
 /* CVT.W/CVT.L and ROUND/TRUNC/CEIL/FLOOR from S/D.  V0 holds the float
@@ -696,9 +660,8 @@ static int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_emit_csel_w(b, A64_TMP1, 23U, A64_TMP1, A64_COND_NE);
         a64_emit_mov_imm32(b, 23U, 0x7FFFFFFFU);
         a64_emit_csel_w(b, A64_TMP2, 23U, A64_TMP2, A64_COND_NE);
-        fp_store_w(b, (be == 0) ? A64_TMP1 : A64_TMP2, fp_slot(fd), be);
-        fp_store_w(b, (be == 0) ? A64_TMP2 : A64_TMP1, fp_slot(fd) + 4U,
-                   be);
+        fp_store_w(b, A64_TMP1, fp_slot(fd), be);
+        fp_store_w(b, A64_TMP2, fp_slot(fd) + 4U, be);
     }
     a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
     fp_finish(b, 22U, cur);
@@ -814,9 +777,6 @@ static int fp_move_op(a64_buf_t *b, const mips_dec_t *d, int be)
     }
     if (d->rs == FP_RS_MFC1 || d->rs == FP_RS_MFHC1 || d->rs == FP_RS_CFC1) {
         a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
-        if (be != 0 && d->rs != FP_RS_CFC1) {
-            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-        }
         fp_put(b, rt, A64_TMP1);
         return 0;
     }

@@ -144,18 +144,26 @@ int fpmove_cop1(mips32_ctx_t *ctx, const mips_dec_t *d)
     case 0x04u: /* MTC1: low 32 bits, upper lane preserved */
         ctx->fpr[fs] = (ctx->fpr[fs] & 0xFFFFFFFF00000000ULL) | ctx->gpr[rt];
         return 0;
-    case 0x02u: /* CFC1 */
-        if (fs != 31u) {
-            return MIPS_FAULT;
+    case 0x02u: /* CFC1: $31 = FCSR, $0 = FIR (read-only ID). */
+        if (fs == 31u) {
+            interp_set_reg(ctx, rt, ctx->fcsr);
+            return 0;
         }
-        interp_set_reg(ctx, rt, ctx->fcsr);
-        return 0;
-    case 0x06u: /* CTC1 */
-        if (fs != 31u) {
-            return MIPS_FAULT;
+        if (fs == 0u) {
+            /* qemu-mipsel-observed FIR (MIPS32r2, S+D, Legacy NaN). */
+            interp_set_reg(ctx, rt, 0x00739300u);
+            return 0;
         }
-        ctx->fcsr = ctx->gpr[rt];
-        return 0;
+        return MIPS_FAULT;
+    case 0x06u: /* CTC1: $31 = FCSR, $0 = FIR (writes ignored). */
+        if (fs == 31u) {
+            ctx->fcsr = ctx->gpr[rt];
+            return 0;
+        }
+        if (fs == 0u) {
+            return 0;
+        }
+        return MIPS_FAULT;
     default:
         return MIPS_FAULT;
     }
