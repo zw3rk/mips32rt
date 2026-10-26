@@ -23,7 +23,17 @@ LDFLAGS ?= -static-pie -Wl,-z,max-page-size=4096
 
 # src/main.c plus every vendored rt32 core file (Lane L0a).  Later phases
 # append src/interp, src/dbt, and src/os (beyond src/os/syscall_nr.h).
-SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
+# Wave U3: exactly one host backend joins the build (both define the same
+# rt_host_* symbols). Selected from the compiler target triple so
+# cross-builds get backend_linux even when the build host is Darwin.
+U3_PROBE_CC := $(or $(CC),cc)
+ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
+U3_BACKEND_SRC := src/os/backend_darwin.c
+else
+U3_BACKEND_SRC := src/os/backend_linux.c
+endif
+U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_darwin.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRC)
+SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(U3_OS_SRCS) $(wildcard src/dbt/*.c) $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
 HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
