@@ -495,7 +495,7 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
     a64_emit_ldr_imm_x(b, A64_TMP1, A64_TMP1, 0U);
     a64_emit_eor_reg_x(b, A64_TMP2, A64_TMP2, A64_TMP1);
-    ph_fail4 = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
+    ph_fail4 = a64_emit_cbz_x_placeholder(b, true, A64_TMP2);
     if (be != 0) {
         a64_emit_rev_w(b, A64_TMP3, data);
         data = A64_TMP3;
