@@ -171,6 +171,11 @@ int mips_hostfault_run(mips32_ctx_t *ctx, void *code, uint32_t *reasonp)
         mips32_ctx_t *rc = hf_ctx;
 
         hf_armed = 0;
+        /* A fault inside a locked LL/SC critical section abandons the
+         * block without running the unlock epilogue: release the lock
+         * for the faulting ctx (no other thread can be inside, since a
+         * live holder would have had to acquire it first). */
+        mips_ll_abandon(rc);
         if (rc == NULL) {
             _Exit(128 + (signo & 0x7F));
         }

@@ -122,6 +122,7 @@ static inline uint32_t rt32_ror32(uint32_t val, unsigned rot)
 
 /* Arithmetic (32-bit W) */
 void a64_emit_add_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
+void a64_emit_add_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn_x, uint32_t imm12, unsigned sh);
 void a64_emit_sub_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
 void a64_emit_add_reg_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, unsigned rm, unsigned shift, unsigned amount);
 void a64_emit_sub_reg_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, unsigned rm, unsigned shift, unsigned amount);
@@ -194,6 +195,11 @@ void a64_emit_ldrh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte
 void a64_emit_strh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_ldr_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
+void a64_emit_ldr_imm_x(a64_buf_t *b, unsigned rt_x, unsigned rn_x, uint32_t byte_offset);
+void a64_emit_str_imm_x(a64_buf_t *b, unsigned rt_x, unsigned rn_x, uint32_t byte_offset);
+void a64_emit_eor_reg_x(a64_buf_t *b, unsigned rd_x, unsigned rn_x, unsigned rm_x);
+size_t a64_emit_cbz_x_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt_x);
+void a64_patch_cbz_x(a64_buf_t *b, size_t patch_idx, size_t target_idx);
 
 /* Guest memory FP loads/stores via [xG, wAddr, uxtw] */
 void a64_emit_guest_ldr_s(a64_buf_t *b, unsigned vt, unsigned addr_w);

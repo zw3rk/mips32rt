@@ -195,6 +195,9 @@ typedef struct mips32_ctx {
     uint32_t vm_regime;
     uint64_t vm_arena_base;
     void *vm_tlb;
+    /* Wave U3-R3: full 64-bit LL epoch snapshot. Appended at the very
+     * end so every pinned offset above is unchanged. */
+    uint64_t ll_epoch_snap;
 } mips32_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */
@@ -344,6 +347,13 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
                uint32_t new_val, int *ok);                          /* aligned-only */
 /* Synchronous fault: records EXIT_FAULT (lane L1c; signals in Phase 4). */
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr);
+/* LL/SC exclusion spinlock (src/os/mem.c, RC-U3-r3): every store's epoch
+ * bump and every SC check-and-store run under it, closing the
+ * same-value race window. mips_ll_abandon releases it when a host
+ * fault abandons a block mid-critical-section. */
+void mips_ll_lock(mips32_ctx_t *ctx);
+void mips_ll_unlock(mips32_ctx_t *ctx);
+void mips_ll_abandon(mips32_ctx_t *ctx);
 
 /* Minimal O32 syscall dispatcher (src/os/syscall_min.c, lane L1c). */
 int32_t mips_syscall(mips32_ctx_t *ctx);

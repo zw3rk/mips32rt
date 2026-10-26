@@ -34,19 +34,65 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* RC-U3-R2 shared LL/SC epoch table: one 16 KiB host page at the
+/* RC-U3-R2/R3 shared LL/SC epoch table: 4096 64-bit generations at the
  * unmappable guest address MIPS32_LL_EPOCH_GVA (above
  * MIPS32_TASK_SIZE_TOP, so no guest mapping can alias it and the
- * region walker never covers it).  Both engines index it as
- * table[(addr >> 6) & 4095]: every store advances the touched 64-byte
- * lines, LL snapshots the word's line into the u3_pad tail bytes, and
- * SC verifies the snapshot around its CAS (bumping on success).  A
+ * region walker never covers it), plus one 64-bit spinlock word right
+ * after the table.  Both engines index table[(addr >> 6) & 4095]:
+ * every store advances the touched 64-byte lines, LL snapshots the
+ * full 64-bit generation into ctx->ll_epoch_snap, and SC verifies the
+ * snapshot before committing its write (bumping on success).  A
  * same-value cross-thread store therefore fails the SC even though
- * the value compare alone would succeed. */
+ * the value compare alone would succeed.  Full 64-bit generations
+ * never wrap in practice, closing the 8-bit wraparound hole. */
 #define MIPS32_LL_EPOCH_GVA   0xFFFF0000u
 #define MIPS32_LL_EPOCH_WORDS 4096u
-#define MIPS32_LL_EPOCH_BYTES (4096u * 4u)
-#define MIPS32_LL_SEQ_MASK    0xFFu
+#define MIPS32_LL_EPOCH_BYTES (4096u * 8u + 8u)
+#define MIPS32_LL_LOCK_OFFSET (4096u * 8u)
+
+/* LL/SC exclusion: every store's epoch bump and every SC
+ * check-and-store run under this spinlock, so an intervening same-value
+ * store cannot slip between the SC's verification and its commit.
+ * Taken only around short reservation ops, never across syscalls.
+ * mips_ll_abandon lets the host-fault handler release it when a fault
+ * abandons a block mid-critical-section (the faulting thread always
+ * owns it then, so no live holder is disturbed). */
+/* Static zero-initialization is the clear state per C11; this avoids
+ * SDKs whose <stdatomic.h> omits ATOMIC_FLAG_INITIALIZER. */
+static atomic_flag mips_ll_spin;
+static _Atomic(uintptr_t) mips_ll_owner;
+
+void mips_ll_lock(mips32_ctx_t *ctx)
+{
+    while (atomic_flag_test_and_set_explicit(&mips_ll_spin,
+        memory_order_acquire)) {
+    }
+    atomic_store_explicit(&mips_ll_owner, (uintptr_t)ctx,
+        memory_order_relaxed);
+}
+
+void mips_ll_unlock(mips32_ctx_t *ctx)
+{
+    (void)ctx;
+    atomic_store_explicit(&mips_ll_owner, (uintptr_t)0,
+        memory_order_relaxed);
+    atomic_flag_clear_explicit(&mips_ll_spin, memory_order_release);
+}
+
+void mips_ll_abandon(mips32_ctx_t *ctx)
+{
+    if (ctx != NULL &&
+        atomic_load_explicit(&mips_ll_owner,
+            memory_order_relaxed) == (uintptr_t)ctx) {
+        atomic_store_explicit(&mips_ll_owner, (uintptr_t)0,
+            memory_order_relaxed);
+        atomic_flag_clear_explicit(&mips_ll_spin, memory_order_release);
+    }
+}
+
+/* Locked guest store (defined below; used by the guest_st* family). */
+static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
+    const void *src, uint32_t len);
 
 /* Forward: on-demand epoch mapping (defined below fixade_on). */
 int mips_ll_epoch_ensure(mips32_ctx_t *ctx);
@@ -120,10 +166,6 @@ static int range_covered(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
 extern int mips_signal_has_handler(int signo);
 extern void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr);
 
-/* Forward: ordinary stores overlapping the LL word break it (defined
- * below fixade_on, used by guest_st8 first). */
-static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len);
-
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
 {
     int signo;
@@ -151,6 +193,25 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
     mips_trap(ctx, signo, addr);
 }
 
+/* Regime-A2 access validation (RC-U3-r3 #4): route every byte through
+ * the Soft-TLB miss helper so unmapped pages fault, clean COW pages
+ * promote on first write, and the TLB entry is installed for the
+ * (future) DBT fast path. Byte-granular so spanning and fixade-
+ * emulated accesses validate every touched page. Returns 0 when the
+ * access may proceed (fault already recorded otherwise). */
+static int a2_validate(mips32_ctx_t *ctx, uint32_t va, uint32_t len,
+                       int is_write)
+{
+    uint32_t i;
+
+    for (i = 0u; i < len; i++) {
+        if (mips32_vm_tlb_miss(ctx, va + i, is_write, 1u) != 0) {
+            return MIPS_FAULT;
+        }
+    }
+    return 0;
+}
+
 int guest_ld8(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     uint8_t b;
@@ -158,7 +219,11 @@ int guest_ld8(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
     if (ctx == NULL || out == NULL) {
         return MIPS_FAULT;
     }
-    if (!range_covered(ctx, va, 1U, (uint32_t)PROT_READ)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 1U, 0) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 1U, (uint32_t)PROT_READ)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
@@ -174,13 +239,16 @@ int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
     if (ctx == NULL) {
         return MIPS_FAULT;
     }
-    if (!range_covered(ctx, va, 1U, (uint32_t)PROT_WRITE)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 1U, 1) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 1U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
     b = (uint8_t)(val & 0xFFU);
-    memcpy(mips32_guest_ptr(ctx, va), &b, 1U);
-    note_store(ctx, va, 1U);
+    mips_store_locked(ctx, va, &b, 1U);
     return 0;
 }
 
@@ -238,12 +306,12 @@ int mips_ll_epoch_ensure(mips32_ctx_t *ctx)
  * demand by mips_ll_epoch_ensure); plain host pointer, never a guest
  * range.  NULL when the reservation failed: callers degrade to the
  * value-compare-only protocol instead of faulting. */
-static _Atomic uint32_t *ll_epoch_table(mips32_ctx_t *ctx)
+static _Atomic uint64_t *ll_epoch_table(mips32_ctx_t *ctx)
 {
     if (mips_ll_epoch_ensure(ctx) == 0) {
         return NULL;
     }
-    return (_Atomic uint32_t *)(void *)(uintptr_t)(ctx->guest_base +
+    return (_Atomic uint64_t *)(void *)(uintptr_t)(ctx->guest_base +
                                                    (uint64_t)MIPS32_LL_EPOCH_GVA);
 }
 
@@ -254,10 +322,13 @@ static uint32_t ll_epoch_idx(uint32_t va)
 
 /* Advance the epoch for every 64-byte line in [va, va + len): first and
  * last line, which covers all stores up to 4 bytes (a 4-byte access
- * touches at most two lines). */
-static void ll_epoch_bump(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
+ * touches at most two lines). Locked variant runs inside the caller's
+ * mips_ll_lock critical section; the plain variant takes the lock
+ * itself. */
+static void ll_epoch_bump_locked(mips32_ctx_t *ctx, uint32_t va,
+    uint32_t len)
 {
-    _Atomic uint32_t *tab;
+    _Atomic uint64_t *tab;
     uint32_t first;
     uint32_t last;
 
@@ -276,25 +347,24 @@ static void ll_epoch_bump(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
     }
 }
 
-/* LL epoch snapshot: the table entry's low 8 bits in u3_pad[0] (the
- * struct layout is untouched).  The byte wraps every 256 same-line
- * stores, ample for any deterministic LL/SC span, and a spurious SC
- * failure stays architecturally legal. */
-static void ll_seq_save(mips32_ctx_t *ctx, uint32_t seq)
+/* LL epoch snapshot: the table entry's full 64-bit generation in
+ * ctx->ll_epoch_snap (appended at the struct tail, offsets above
+ * untouched). Generations never wrap in practice. */
+static void ll_seq_save(mips32_ctx_t *ctx, uint64_t seq)
 {
-    ctx->u3_pad[0] = (uint8_t)(seq & MIPS32_LL_SEQ_MASK);
+    ctx->ll_epoch_snap = seq;
 }
 
-static uint32_t ll_seq_saved(const mips32_ctx_t *ctx)
+static uint64_t ll_seq_saved(const mips32_ctx_t *ctx)
 {
-    return (uint32_t)ctx->u3_pad[0];
+    return ctx->ll_epoch_snap;
 }
 
 /* RC-U3-R2 LL record (interp LL path): llbit/lladdr/llval plus the
  * epoch snapshot the later SC verifies. */
 void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val)
 {
-    _Atomic uint32_t *tab;
+    _Atomic uint64_t *tab;
 
     if (ctx == NULL) {
         return;
@@ -317,15 +387,17 @@ void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val)
  * reservations for other words alive.  Every store also advances the
  * shared epoch (regardless of llbit: another thread may hold a live
  * reservation on the line), so a same-value cross-thread store still
- * fails a later SC via the epoch check. */
-static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
+ * fails a later SC via the epoch check.  Locked body: the caller's
+ * mips_ll_lock critical section must already cover the data store, so
+ * verification and commit stay indivisible (RC-U3-r3). */
+static void note_store_locked(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
 {
     uint64_t end64;
 
     if (ctx == NULL || len == 0u) {
         return;
     }
-    ll_epoch_bump(ctx, va, len);
+    ll_epoch_bump_locked(ctx, va, len);
     if (ctx->llbit == 0u) {
         return;
     }
@@ -334,6 +406,21 @@ static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
         end64 > (uint64_t)ctx->lladdr) {
         ctx->llbit = 0u;
     }
+}
+
+/* Locked guest store: data write plus epoch/reservation update under
+ * one mips_ll_lock critical section. All interp stores go through
+ * here so an SC's check-and-store can never interleave with them. */
+static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
+    const void *src, uint32_t len)
+{
+    if (ctx == NULL || src == NULL || len == 0u) {
+        return;
+    }
+    mips_ll_lock(ctx);
+    memcpy(mips32_guest_ptr(ctx, va), src, len);
+    note_store_locked(ctx, va, len);
+    mips_ll_unlock(ctx);
 }
 
 int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
@@ -351,7 +438,11 @@ int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
-        if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
+        if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+            if (a2_validate(ctx, va, 2U, 0) != 0) {
+                return MIPS_FAULT;
+            }
+        } else if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
@@ -364,7 +455,11 @@ int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
         }
         return 0;
     }
-    if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 2U, 0) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
@@ -391,7 +486,11 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
-        if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
+        if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+            if (a2_validate(ctx, va, 2U, 1) != 0) {
+                return MIPS_FAULT;
+            }
+        } else if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
@@ -402,11 +501,14 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             p[0] = (uint8_t)(val & 0xFFU);
             p[1] = (uint8_t)((val >> 8) & 0xFFU);
         }
-        memcpy(mips32_guest_ptr(ctx, va), p, 2U);
-        note_store(ctx, va, 2U);
+        mips_store_locked(ctx, va, p, 2U);
         return 0;
     }
-    if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 2U, 1) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
@@ -417,8 +519,7 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         b[0] = (uint8_t)(val & 0xFFU);
         b[1] = (uint8_t)((val >> 8) & 0xFFU);
     }
-    memcpy(mips32_guest_ptr(ctx, va), b, 2U);
-    note_store(ctx, va, 2U);
+    mips_store_locked(ctx, va, b, 2U);
     return 0;
 }
 
@@ -436,7 +537,11 @@ int guest_ld32(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
-        if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
+        if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+            if (a2_validate(ctx, va, 4U, 0) != 0) {
+                return MIPS_FAULT;
+            }
+        } else if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
@@ -450,7 +555,11 @@ int guest_ld32(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
         }
         return 0;
     }
-    if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 4U, 0) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
@@ -479,7 +588,11 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
-        if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+        if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+            if (a2_validate(ctx, va, 4U, 1) != 0) {
+                return MIPS_FAULT;
+            }
+        } else if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
             mips_fault(ctx, va);
             return MIPS_FAULT;
         }
@@ -494,11 +607,14 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             q[2] = (uint8_t)((val >> 16) & 0xFFU);
             q[3] = (uint8_t)((val >> 24) & 0xFFU);
         }
-        memcpy(mips32_guest_ptr(ctx, va), q, 4U);
-        note_store(ctx, va, 4U);
+        mips_store_locked(ctx, va, q, 4U);
         return 0;
     }
-    if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 4U, 1) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
@@ -513,11 +629,16 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         b[2] = (uint8_t)((val >> 16) & 0xFFU);
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
-    memcpy(mips32_guest_ptr(ctx, va), b, 4U);
-    note_store(ctx, va, 4U);
+    mips_store_locked(ctx, va, b, 4U);
     return 0;
 }
 
+/* RC-U3-r3 atomic SC: verify the epoch snapshot, then compare-and-store,
+ * then bump the epoch, all under mips_ll_lock. Checking the epoch
+ * BEFORE the write (rather than after, as before) means a reservation
+ * loss fails without touching memory: no committed write can ever
+ * outlive a failed SC. The lock serializes against ordinary stores'
+ * bumps, closing the same-value race window entirely. */
 int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
                uint32_t new_val, int *ok)
 {
@@ -525,10 +646,10 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
     uint32_t  new_pat;
     uint32_t *hp;
     int       swapped;
-    _Atomic uint32_t *tab;
+    _Atomic uint64_t *tab;
     uint32_t  idx;
-    uint32_t  want;
-    uint32_t  s1;
+    uint64_t  want;
+    uint64_t  s1;
 
     if (ctx == NULL || ok == NULL) {
         return MIPS_FAULT;
@@ -537,34 +658,23 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
-    if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        if (a2_validate(ctx, va, 4U, 1) != 0) {
+            return MIPS_FAULT;
+        }
+    } else if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
     }
-    /* RC-U3-R2 epoch gate: a dead reservation (or one for another
-     * address) fails without touching memory.  Otherwise the snapshot
-     * taken at LL time must still match: any store to the line since
-     * (even a same-value one the CAS would accept) fails the SC. */
+    /* A dead reservation (or one for another address) fails without
+     * touching memory or the lock. */
     if (ctx->llbit == 0u || ctx->lladdr != va) {
         *ok = 0;
         return 0;
     }
-    tab = ll_epoch_table(ctx);
-    if (tab == NULL) {
-        idx = 0u;
-        s1 = 0u;
-        want = 0u;
-    } else {
-        idx  = ll_epoch_idx(va);
-        want = ll_seq_saved(ctx);
-        s1   = atomic_load_explicit(&tab[idx], memory_order_relaxed);
-        if ((s1 & MIPS32_LL_SEQ_MASK) != want) {
-            *ok = 0;
-            return 0;
-        }
-    }
     /* Value-domain compare like LL/SC: the host mapping holds the
-     * guest-order byte pattern, so swap both sides on BE. */
+     * guest-order byte pattern, so swap both sides on BE. Pure
+     * computation, no shared state: safe outside the lock. */
     if (mips_is_be(ctx)) {
         exp_pat = ((exp_val >> 24) & 0xFFU) | ((exp_val >> 8) & 0xFF00U) |
                   ((exp_val << 8) & 0xFF0000U) | ((exp_val << 24) & 0xFF000000U);
@@ -574,6 +684,22 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
         exp_pat = exp_val;
         new_pat = new_val;
     }
+    mips_ll_lock(ctx);
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        idx = 0u;
+        s1 = 0u;
+        want = 0u;
+    } else {
+        idx  = ll_epoch_idx(va);
+        want = ll_seq_saved(ctx);
+        s1   = atomic_load_explicit(&tab[idx], memory_order_relaxed);
+        if (s1 != want) {
+            mips_ll_unlock(ctx);
+            *ok = 0;
+            return 0;
+        }
+    }
     hp = (uint32_t *)(void *)mips32_guest_ptr(ctx, va);
     swapped = 0;
     if (__atomic_compare_exchange_n(hp, &exp_pat, new_pat, 0,
@@ -581,17 +707,12 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
         swapped = 1;
     }
     if (swapped != 0 && tab != NULL) {
-        /* The epoch must also be stable across the CAS itself (a store
-         * racing the atomic step still breaks a hardware reservation).
-         * Success is itself a store, so it advances the epoch. */
-        uint32_t s2 = atomic_load_explicit(&tab[idx], memory_order_relaxed);
-
-        if ((s2 & MIPS32_LL_SEQ_MASK) != (s1 & MIPS32_LL_SEQ_MASK)) {
-            swapped = 0;
-        } else {
-            atomic_fetch_add_explicit(&tab[idx], 1u, memory_order_relaxed);
-        }
+        /* Success is itself a store, so it advances the epoch while
+         * still holding the lock: no ordinary store can slip between
+         * the check above and this bump. */
+        atomic_fetch_add_explicit(&tab[idx], 1u, memory_order_relaxed);
     }
+    mips_ll_unlock(ctx);
     *ok = swapped;
     return 0;
 }

@@ -25,12 +25,20 @@
 #define EMIT_FIXADE_OFFSET ((uint32_t)offsetof(mips32_ctx_t, fixade_enabled))
 #define EMIT_DELAY_TARGET_OFFSET \
     ((uint32_t)offsetof(mips32_ctx_t, delay_target))
-/* RC-U3-R2 LL epoch snapshot: low 8 bits in u3_pad[0] (struct layout
- * untouched; see src/os/mem.c). */
-#define EMIT_LL_SEQ_OFFSET ((uint32_t)offsetof(mips32_ctx_t, u3_pad))
-/* Guest VA of the shared 16 KiB epoch page (G-relative, unmappable:
- * above MIPS32_TASK_SIZE_TOP).  JIT forms Xtab = x20 + (OFF + idx*4). */
+/* RC-U3-R2/R3 LL epoch snapshot: the full 64-bit generation in
+ * ctx->ll_epoch_snap (struct tail; see src/os/mem.c). */
+#define EMIT_LL_SEQ_OFFSET ((uint32_t)offsetof(mips32_ctx_t, ll_epoch_snap))
+_Static_assert(offsetof(mips32_ctx_t, ll_epoch_snap) % 8u == 0u,
+    "ll_epoch_snap must be 8-byte aligned for LDR Xt");
+/* NOTE: the offset exceeds the 12-bit unsigned LDR range; emitters
+ * materialize it with mov_imm32 + base add (see emit_epoch_record),
+ * never as an immediate offset. */
+/* Guest VA of the shared 32 KiB epoch table (G-relative, unmappable:
+ * above MIPS32_TASK_SIZE_TOP).  JIT forms Xtab = x20 + (OFF + idx*8). */
 #define EMIT_LL_EPOCH_OFFSET 0xFFFF0000u
+/* Guest VA of the 64-bit LL exclusion spinlock: the first word after
+ * the epoch table. JIT forms Xlock = x20 + LOCK_OFF. */
+#define EMIT_LL_LOCK_OFFSET (0xFFFF0000u + 4096u * 8u)
 
 /* Register-cache core (src/dbt/emit_int.c). */
 int      gpr_host(unsigned g);

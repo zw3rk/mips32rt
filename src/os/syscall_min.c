@@ -476,6 +476,10 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_get_robust_list:
     case MIPS32_NR_unlink:
     case MIPS32_NR_unlinkat:
+    case MIPS32_NR_truncate:
+    case MIPS32_NR_ftruncate:
+    case MIPS32_NR_truncate64:
+    case MIPS32_NR_ftruncate64:
         return mips_syscall_extra(ctx, sp);
     case MIPS32_NR_SYSMIPS: {
         /* sysmips(cmd, arg): only MIPS_FIXADE is emulated. */

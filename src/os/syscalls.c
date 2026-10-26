@@ -796,6 +796,11 @@ int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
         return sc_unlinkat(ctx, sp, 1);
     case (uint32_t)MIPS32_NR_unlinkat:
         return sc_unlinkat(ctx, sp, 0);
+    case (uint32_t)MIPS32_NR_truncate:
+    case (uint32_t)MIPS32_NR_ftruncate:
+    case (uint32_t)MIPS32_NR_truncate64:
+    case (uint32_t)MIPS32_NR_ftruncate64:
+        return mips32_file_sc_truncate(ctx, sp, nr);
     case (uint32_t)MIPS32_NR_close:
         return sc_close(ctx, sp);
     case (uint32_t)MIPS32_NR_lseek:

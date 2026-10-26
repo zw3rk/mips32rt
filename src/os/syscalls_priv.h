@@ -93,6 +93,9 @@ void     mips_sc_st32(uint8_t *p, uint32_t v, int be);
 void     mips_sc_st64(uint8_t *p, uint64_t v, int be);
 int      mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va,
                            char *host_buf);
+/* Truncate payload (defined in src/vm/vm_file.c; wired here). */
+int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp,
+                                uint32_t nr);
 int      mips_sc_read_ts(const mips32_ctx_t *ctx, uint32_t va,
                          struct timespec *out);
 int      mips_sc_write_ts(mips32_ctx_t *ctx, uint32_t va,

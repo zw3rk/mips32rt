@@ -70,6 +70,14 @@ void a64_emit_add_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn,
                     ((rn & 31U) << 5) | (rd & 31U));
 }
 
+void a64_emit_add_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn_x,
+                        uint32_t imm12, unsigned sh)
+{
+    uint32_t s = set_flags ? (1U << 29) : 0U;
+    a64_emit(b, 0x91000000U | s | ((sh & 1U) << 22) | ((imm12 & 0xFFFU) << 10) |
+                    ((rn_x & 31U) << 5) | (rd_x & 31U));
+}
+
 void a64_emit_sub_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn,
                         uint16_t imm12, unsigned sh)
 {
@@ -497,6 +505,44 @@ void a64_emit_ldr_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_
 void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset)
 {
     emit_ctx_mem_imm(b, 0xB9000000U, 2U, true, rt, rn_x, byte_offset);
+}
+
+void a64_emit_ldr_imm_x(a64_buf_t *b, unsigned rt_x, unsigned rn_x, uint32_t byte_offset)
+{
+    emit_ctx_mem_imm(b, 0xF9400000U, 3U, false, rt_x, rn_x, byte_offset);
+}
+
+void a64_emit_str_imm_x(a64_buf_t *b, unsigned rt_x, unsigned rn_x, uint32_t byte_offset)
+{
+    emit_ctx_mem_imm(b, 0xF9000000U, 3U, true, rt_x, rn_x, byte_offset);
+}
+
+void a64_emit_eor_reg_x(a64_buf_t *b, unsigned rd_x, unsigned rn_x, unsigned rm_x)
+{
+    a64_emit(b, 0xCA000000U | ((rm_x & 31U) << 16) | ((rn_x & 31U) << 5) |
+                (rd_x & 31U));
+}
+
+size_t a64_emit_cbz_x_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt_x)
+{
+    b->cond_branch_depth++;
+    size_t idx = b->count;
+    uint32_t base = is_cbnz ? 0xB5000000U : 0xB4000000U;
+    a64_emit(b, base | (rt_x & 31U));
+    return idx;
+}
+
+void a64_patch_cbz_x(a64_buf_t *b, size_t patch_idx, size_t target_idx)
+{
+    if (b->cond_branch_depth > 0U) {
+        b->cond_branch_depth--;
+    }
+    if (patch_idx >= b->count) {
+        return;
+    }
+    int32_t disp = (int32_t)target_idx - (int32_t)patch_idx;
+    uint32_t op_rt = b->words[patch_idx] & 0xFF00001FU;
+    b->words[patch_idx] = op_rt | (((uint32_t)disp & 0x7FFFFU) << 5);
 }
 
 /* a32rt's ctx VFP accessors (vfp_ldr_ctx/vfp_str_ctx and

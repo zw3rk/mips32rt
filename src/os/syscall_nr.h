@@ -49,6 +49,14 @@
 #define MIPS32_NR_pipe   4042 /* o32 index 42: sysm_pipe */
 #define MIPS32_NR_pipe2  4328 /* o32 index 328: sys_pipe2 */
 #define MIPS32_NR_fcntl  4055 /* o32 index 55: sys_fcntl (compat) */
+#define MIPS32_NR_truncate 4092 /* o32 index 92: sys_truncate */
+#define MIPS32_NR_ftruncate 4093 /* o32 index 93: sys_ftruncate */
+#define MIPS32_NR_truncate64 4211 /* o32 index 211: sys_truncate64 */
+#define MIPS32_NR_ftruncate64 4212 /* o32 index 212: sys_ftruncate64 */
+#define MIPS32_NR_truncate 4092 /* o32 index 92: sys_truncate */
+#define MIPS32_NR_ftruncate 4093 /* o32 index 93: sys_ftruncate */
+#define MIPS32_NR_truncate64 4211 /* o32 index 211: sys_truncate64 */
+#define MIPS32_NR_ftruncate64 4212 /* o32 index 212: sys_ftruncate64 */
 #define MIPS32_NR_fcntl64 4220 /* o32 index 220: sys_fcntl64 */
 #define MIPS32_NR_ioctl  4054 /* o32 index 54: sys_ioctl (compat) */
 

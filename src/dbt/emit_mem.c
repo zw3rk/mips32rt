@@ -56,34 +56,38 @@ static void emit_sync_pc(a64_buf_t *b, uint32_t fpc, int ind_slot)
     }
 }
 
-/* RC-U3-R2 shared LL/SC epoch (see src/os/mem.c): the 16 KiB table at
- * G + EMIT_LL_EPOCH_OFFSET is indexed (addr >> 6) & 4095.  Table entry
- * address forms as Xtab = x20 + (OFF + idx*4) with plain W/X moves and
- * adds (UBFM #6,#11 extracts the masked index: ROR-by-6 bits [11:0]).
- * Scratch discipline: idx in W17 (never W16), table math in W16/X16.
- * A64_ADDR survives every sequence below. */
+/* RC-U3-R2/R3 shared LL/SC epoch (see src/os/mem.c): 4096 64-bit
+ * generations at G + EMIT_LL_EPOCH_OFFSET indexed by (addr >> 6) & 4095,
+ * plus the 64-bit exclusion spinlock at G + EMIT_LL_LOCK_OFFSET.  Table
+ * entry address forms as Xtab = x20 + (OFF + idx*8) with plain W/X
+ * moves and adds (UBFM #6,#11 extracts the masked index).  Scratch
+ * discipline: idx in W17 (never W16), table math in W16/X16.
+ * A64_ADDR survives every sequence below.  All epoch traffic runs
+ * under the spinlock (emit_ll_lock/unlock): plain X loads/stores are
+ * then atomic and ordered, no LDXR/STXR retry loops needed. */
 static void emit_epoch_addr(a64_buf_t *b, unsigned idx_w)
 {
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_EPOCH_OFFSET);
     a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP1, idx_w,
-                       A64_SHIFT_LSL, 2U);
+                       A64_SHIFT_LSL, 3U);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
 }
 
-/* Wdst = table[idx_w] (clobbers W16/X16). */
-static void emit_epoch_load(a64_buf_t *b, unsigned idx_w, unsigned dst_w)
+/* Xdst = table[idx_w] (clobbers W16/X16). */
+static void emit_epoch_load(a64_buf_t *b, unsigned idx_w, unsigned dst_x)
 {
     emit_epoch_addr(b, idx_w);
-    a64_emit_ldr_imm_w(b, dst_w, A64_TMP1, 0U);
+    a64_emit_ldr_imm_x(b, dst_x, A64_TMP1, 0U);
 }
 
-/* table[idx_w]++ (clobbers W16/X16 and W17 unless it is idx_w). */
+/* table[idx_w]++ (clobbers W16/X16 and W17 unless it is idx_w).
+ * Caller must hold the LL spinlock. */
 static void emit_epoch_bump_idx(a64_buf_t *b, unsigned idx_w)
 {
     emit_epoch_addr(b, idx_w);
-    a64_emit_ldr_imm_w(b, A64_TMP2, A64_TMP1, 0U);
-    a64_emit_add_imm_w(b, false, A64_TMP2, A64_TMP2, 1U, 0U);
-    a64_emit_str_imm_w(b, A64_TMP2, A64_TMP1, 0U);
+    a64_emit_ldr_imm_x(b, A64_TMP2, A64_TMP1, 0U);
+    a64_emit_add_imm_x(b, false, A64_TMP2, A64_TMP2, 1U, 0U);
+    a64_emit_str_imm_x(b, A64_TMP2, A64_TMP1, 0U);
 }
 
 /* Advance the lines covering the len-byte store at [addr_w, addr_w+len):
@@ -102,18 +106,52 @@ static void emit_epoch_bump_len(a64_buf_t *b, unsigned addr_w, unsigned len)
     }
 }
 
-/* Record the low 8 bits of table[(addr_w >> 6) & 4095] into
- * u3_pad[0] (matches src/os/mem.c).  The byte wraps every 256
- * same-line stores, ample for any deterministic LL/SC span, and a
- * spurious SC failure stays architecturally legal.  Clobbers
- * W16/W17/X16; addr_w survives. */
+/* Record the full 64-bit table[(addr_w >> 6) & 4095] generation into
+ * ctx->ll_epoch_snap (matches src/os/mem.c).  Clobbers W16/X16/X17;
+ * addr_w survives. */
 static void emit_epoch_record(a64_buf_t *b, unsigned addr_w)
 {
     a64_emit_ubfm_w(b, A64_TMP2, addr_w, 6U, 11U);
     emit_epoch_load(b, A64_TMP2, A64_TMP2);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_SEQ_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
-    a64_emit_strb_imm_w(b, A64_TMP2, A64_TMP1, 0U);
+    a64_emit_str_imm_x(b, A64_TMP2, A64_TMP1, 0U);
+}
+
+/* W30 is the lock status scratch: no emitted code reads or writes x30
+ * (verified by grep; the trampoline saves/restores it around
+ * run_block), so lock/unlock sequences may clobber it freely. */
+#define LL_SPIN_STATUS 30U
+
+/* Acquire the LL exclusion spinlock: X16 = &lock; LDXR W17;
+ * empty -> STXR #1 (status in W30); repeat while taken or the
+ * store fails. Clobbers X16/W17/W30; everything else survives. */
+static void emit_ll_lock(a64_buf_t *b)
+{
+    size_t retry;
+    size_t ph_taken;
+    size_t ph_fail;
+
+    a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_LOCK_OFFSET);
+    a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
+    retry = b->count;
+    a64_emit_ldxr_w(b, A64_TMP2, A64_TMP1);
+    ph_taken = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
+    a64_patch_cbz_w(b, ph_taken, retry);
+    a64_emit_mov_imm32(b, A64_TMP2, 1U);
+    a64_emit_stxr_w(b, LL_SPIN_STATUS, A64_TMP2, A64_TMP1);
+    ph_fail = a64_emit_cbz_w_placeholder(b, true, LL_SPIN_STATUS);
+    a64_patch_cbz_w(b, ph_fail, retry);
+    a64_emit_dmb_ish(b);
+}
+
+/* Release the LL spinlock. No register clobbers beyond DMB ordering. */
+static void emit_ll_unlock(a64_buf_t *b)
+{
+    a64_emit_dmb_ish(b);
+    a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_LOCK_OFFSET);
+    a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
+    a64_emit_str_imm_w(b, A64_ZR, A64_TMP1, 0U);
 }
 
 /* Alignment guard (fault info = runtime address in w22).  Linux MIPS
@@ -227,11 +265,14 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         put_rd(b, rt, dst);
         return;
     case MIPS_OP_SB:
+        emit_ll_lock(b);
         a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
         emit_epoch_bump_len(b, A64_ADDR, 1u);
         emit_reservation_break(b, A64_ADDR, 0);
+        emit_ll_unlock(b);
         return;
     case MIPS_OP_SH: case MIPS_OP_SW:
+        emit_ll_lock(b);
         /* TMP2: the check below clobbers TMP1. */
         v = op_val(b, rt, A64_TMP2);
         emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc,
@@ -246,6 +287,7 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
                                 (d->op == MIPS_OP_SW) ? 4u : 2u);
             emit_reservation_break(b, A64_ADDR,
                                    (d->op == MIPS_OP_SW) ? 1 : 0);
+            emit_ll_unlock(b);
             return;
         }
         if (d->op == MIPS_OP_SH) {
@@ -261,6 +303,7 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_epoch_bump_len(b, A64_ADDR, (d->op == MIPS_OP_SW) ? 4u : 2u);
         emit_reservation_break(b, A64_ADDR,
                                (d->op == MIPS_OP_SW) ? 1 : 0);
+        emit_ll_unlock(b);
         return;
     default:
         break;
@@ -298,6 +341,9 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         a64_emit_sub_imm_w(b, true, A64_TMP1, A64_TMP1, 1U, 0U);
     }
     /* k=3,0,1,2: fall-through enters k=3. */
+    if (is_load == 0) {
+        emit_ll_lock(b);
+    }
     for (o = 0U, k = 3U; o < 4U; o++, k = (o == 1U) ? 0U : k + 1U) {
         if (k < 3U) {
             a64_patch_cbz_w(b, ph_cbz[k], b->count);
@@ -361,6 +407,7 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
          * 64-byte boundary. */
         emit_epoch_bump_len(b, A64_TMP3, 4u);
         emit_reservation_break(b, A64_TMP3, 0);
+        emit_ll_unlock(b);
     }
 }
 
@@ -384,24 +431,30 @@ void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_LLVAL_OFFSET);
 }
 
-/* SC: LDXR first (fault side effect even when llbit is clear, matching
- * interp), then llbit/lladdr/llval check, epoch check against the LL
- * snapshot, STXR retry loop, epoch-stability check around the CAS, and
- * an epoch bump on success (x24 = host address, w16 = status).  A
- * same-value store to the line since the LL fails the SC even though
- * the value compare alone would succeed. */
+/* SC: verify-then-commit under the LL spinlock (RC-U3-r3).  The lock
+ * makes the epoch check, the value compare, the data store, and the
+ * epoch bump one atomic unit: no ordinary store can slip between the
+ * verification and the commit, closing the same-value race that a
+ * check-then-CAS leaves open.  Plain loads/stores are used throughout
+ * (no LDXR/STXR retry loop is needed once stores are serialized).
+ * Register plan: data in TMP3-or-mapped (untouched), A64_ADDR holds
+ * the guest VA into the epoch verify, X24 the host address from then
+ * on; TMP1/TMP2/X16/X17/W30 are scratch. */
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot)
 {
     unsigned data = op_val(b, d->rt, A64_TMP3);
-    size_t ph_fail1, ph_fail2, ph_fail3, ph_fail4, ph_fail5;
-    size_t ph_done, ph_retry, retry_ldxr;
+    size_t ph_fail1, ph_fail2, ph_fail3, ph_fail4;
+    size_t ph_done;
 
     emit_sync_pc(b, fpc, ind_slot);
     emit_align_fault(b, 1U, fpc, ind_slot);
     a64_emit_add_uxtw_x(b, 24U, A64_XG, A64_ADDR);
-    retry_ldxr = b->count; /* STXR failure clears it: restart at LDXR. */
-    a64_emit_ldxr_w(b, A64_TMP1, 24U);
+    emit_ll_lock(b);
+    /* Probe + value load (faults like the old LDXR did, even when the
+     * reservation below is dead). A host fault here abandons the
+     * block; mips_ll_abandon releases the lock for the faulting ctx. */
+    a64_emit_ldr_imm_w(b, A64_TMP1, 24U, 0U);
     a64_emit_ldrb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
     ph_fail1 = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
     /* The reservation is address-specific: a live bit for another word
@@ -417,51 +470,34 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2,
                        A64_SHIFT_LSL, 0U);
     ph_fail3 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    /* Epoch gate: s1 is the low 8 bits of table[idx(addr)], checked
-     * against the LL snapshot byte in u3_pad[0] (see the record
-     * helper).  Register plan (a W write zeroes the X upper half, so
-     * a value and an address can never share a number): W22/ADDR is
-     * dead from here (x24 already holds the host address), X22 carries
-     * &tab across the STXR, W16 carries s1, W17 is scratch. */
+    /* Epoch gate: the full 64-bit table entry must equal the LL
+     * snapshot in ctx->ll_epoch_snap.  Verified BEFORE the store, so
+     * a failed SC never commits a write. */
     a64_emit_ubfm_w(b, A64_TMP2, A64_ADDR, 6U, 11U);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_EPOCH_OFFSET);
     a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2,
-                       A64_SHIFT_LSL, 2U);
-    a64_emit_add_uxtw_x(b, A64_ADDR, A64_XG, A64_TMP1);
-    a64_emit_ldr_imm_w(b, A64_TMP1, A64_ADDR, 0U);
-    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, 0U, 7U);
-    a64_emit_mov_imm32(b, A64_TMP2, EMIT_LL_SEQ_OFFSET);
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XCTX, A64_TMP2);
-    a64_emit_ldrb_imm_w(b, A64_TMP2, A64_TMP2, 0U);
-    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2,
-                       A64_SHIFT_LSL, 0U);
-    ph_fail4 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+                       A64_SHIFT_LSL, 3U);
+    a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
+    a64_emit_ldr_imm_x(b, A64_TMP2, A64_TMP1, 0U);
+    a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_SEQ_OFFSET);
+    a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
+    a64_emit_ldr_imm_x(b, 30U, A64_TMP1, 0U);
+    a64_emit_eor_reg_x(b, A64_TMP2, A64_TMP2, 30U);
+    ph_fail4 = a64_emit_cbz_x_placeholder(b, true, A64_TMP2);
     if (be != 0) {
         a64_emit_rev_w(b, A64_TMP3, data);
         data = A64_TMP3;
     }
-    a64_emit_stxr_w(b, A64_TMP2, data, 24U);
-    ph_retry = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
-    a64_patch_cbz_w(b, ph_retry, retry_ldxr);
-    /* Around-CAS stability: s2 must equal the pre-CAS s1 (X22 still
-     * addresses the entry).  No bump on failure: a failed SC is not a
-     * store. */
-    a64_emit_ldr_imm_w(b, A64_TMP2, A64_ADDR, 0U);
-    a64_emit_ubfm_w(b, A64_TMP2, A64_TMP2, 0U, 7U);
-    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP1,
-                       A64_SHIFT_LSL, 0U);
-    ph_fail5 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    a64_emit_ldr_imm_w(b, A64_TMP2, A64_ADDR, 0U);
-    a64_emit_add_imm_w(b, false, A64_TMP2, A64_TMP2, 1U, 0U);
-    a64_emit_str_imm_w(b, A64_TMP2, A64_ADDR, 0U);
+    a64_emit_str_imm_w(b, data, 24U, 0U);
+    emit_epoch_bump_len(b, A64_ADDR, 4U);
+    emit_ll_unlock(b);
     a64_emit_mov_imm32(b, A64_TMP1, 1U);
     ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, ph_fail1, b->count);
     a64_patch_b_cond(b, ph_fail2, b->count);
     a64_patch_b_cond(b, ph_fail3, b->count);
-    a64_patch_b_cond(b, ph_fail4, b->count);
-    a64_patch_b_cond(b, ph_fail5, b->count);
-    a64_emit_clrex(b);
+    a64_patch_cbz_x(b, ph_fail4, b->count);
+    emit_ll_unlock(b);
     a64_emit_mov_imm32(b, A64_TMP1, 0U);
     a64_patch_b_cond(b, ph_done, b->count);
     a64_emit_strb_imm_w(b, A64_ZR, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
