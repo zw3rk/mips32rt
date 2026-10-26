@@ -41,8 +41,14 @@ void rt32_host_probe(mips32_ctx_t *ctx)
     }
 
     a32h_info_t info = {0};
-    if (syscall(SYS_ioctl, fd, (unsigned long)A32H_GET_INFO, &info) == 0 &&
-        info.abi_major == A32H_ABI_MAJOR) {
+    int ok;
+#if defined(__linux__)
+    ok = (syscall(SYS_ioctl, fd, (unsigned long)A32H_GET_INFO, &info) == 0);
+#else
+    /* SYS_ioctl is Linux-specific; the libc wrapper is portable. */
+    ok = (ioctl(fd, (unsigned long)A32H_GET_INFO, &info) == 0);
+#endif
+    if (ok && info.abi_major == A32H_ABI_MAJOR) {
         ctx->host_info = info;
         ctx->has_host_info = true;
     }

@@ -1,13 +1,17 @@
 /*
- * src/dbt/emit_int.c -- AArch64 integer emitter (Phase 2, L2c).
+ * src/dbt/emit_int.c -- AArch64 integer emitter: ALU/control core (L2c).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Memory emission (EA, aligned/unaligned loads/stores, LL/SC) lives in
+ * src/dbt/emit_mem.c; shared internals are declared in emit_priv.h.
  */
 #include <stddef.h>
 #include <stdint.h>
 #include "mips32rt.h"
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
+#include "dbt/emit_priv.h"
 /* Cached guest GPR -> host W register (SPEC 2.1 order). */
 static const int8_t kGprHost[32] = {
     -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
@@ -16,9 +20,9 @@ static const int8_t kGprHost[32] = {
 static const uint8_t kCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
-static int gpr_host(unsigned g) { return (g < 32U) ? (int)kGprHost[g] : -1; }
+int gpr_host(unsigned g) { return (g < 32U) ? (int)kGprHost[g] : -1; }
 /* Guest GPR value into a host register (cached host, wzr, or tmp load). */
-static unsigned op_val(a64_buf_t *b, unsigned g, unsigned tmp)
+unsigned op_val(a64_buf_t *b, unsigned g, unsigned tmp)
 {
     int h;
     if (g == MIPS32_REG_ZERO) return A64_ZR;
@@ -29,7 +33,7 @@ static unsigned op_val(a64_buf_t *b, unsigned g, unsigned tmp)
 }
 
 /* $0 as an ADD/SUB/CMP operand: plain ZR would read SP. */
-static unsigned op_sp(a64_buf_t *b, unsigned g, unsigned tmp)
+unsigned op_sp(a64_buf_t *b, unsigned g, unsigned tmp)
 {
     if (g != MIPS32_REG_ZERO) return op_val(b, g, tmp);
     a64_emit_mov_imm32(b, tmp, 0U);
@@ -37,7 +41,7 @@ static unsigned op_sp(a64_buf_t *b, unsigned g, unsigned tmp)
 }
 
 /* Write host src back to guest GPR ($0 dropped). */
-static void put_rd(a64_buf_t *b, unsigned g, unsigned src)
+void put_rd(a64_buf_t *b, unsigned g, unsigned src)
 {
     int h;
     if (g == MIPS32_REG_ZERO) return;
@@ -79,17 +83,14 @@ static void br_cmp2(a64_buf_t *b, unsigned rs, unsigned rt)
     a64_emit_sub_reg_w(b, true, A64_ZR, ra, rb, A64_SHIFT_LSL, 0U);
 }
 
-/* w22 = rs + simm (guest effective address, 32-bit wrap). */
-static void emit_ea(a64_buf_t *b, unsigned rs, int32_t simm)
+/* Load ctx->delay_target (JR/JALR dynamic target) into dst.  The field
+ * sits beyond the LDR imm12 reach, so materialize the offset in a
+ * scratch and add it to x19. */
+void emit_load_delay_target(a64_buf_t *b, unsigned dst)
 {
-    int h = (rs == MIPS32_REG_ZERO) ? -1 : gpr_host(rs);
-    if (h < 0 && rs == MIPS32_REG_ZERO)
-        a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)simm);
-    else {
-        if (h < 0) a64_emit_ldr_imm_w(b, A64_ADDR, A64_XCTX, rs * 4U);
-        else a64_emit_mov_w(b, A64_ADDR, (unsigned)h);
-        add_off(b, A64_ADDR, A64_ADDR, simm);
-    }
+    a64_emit_mov_imm32(b, A64_TMP1, EMIT_DELAY_TARGET_OFFSET);
+    a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
+    a64_emit_ldr_imm_w(b, dst, A64_TMP1, 0U);
 }
 
 static void emit_prologue(a64_buf_t *b)
@@ -99,19 +100,12 @@ static void emit_prologue(a64_buf_t *b)
         a64_emit_ldr_imm_w(b, (unsigned)kGprHost[kCached[i]], A64_XCTX,
                            (uint32_t)kCached[i] * 4U);
 }
-static void emit_flush(a64_buf_t *b)
+void emit_flush(a64_buf_t *b)
 {
     unsigned i;
     for (i = 0U; i < 16U; i++)
         a64_emit_str_imm_w(b, (unsigned)kGprHost[kCached[i]], A64_XCTX,
                            (uint32_t)kCached[i] * 4U);
-}
-/* RC4: flush cached GPRs + record fpc in ctx->pc before a guest-memory access that can host-fault (delivery reads ctx). */
-static void emit_sync_pc(a64_buf_t *b, uint32_t fpc)
-{
-    emit_flush(b);
-    a64_emit_mov_imm32(b, A64_TMP1, fpc);
-    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
 }
 static void emit_pc_imm(a64_buf_t *b, uint32_t pc, uint32_t npc)
 {
@@ -145,29 +139,27 @@ static void emit_exit_indirect(a64_buf_t *b)
     a64_emit_mov_imm32(b, 1U, 0U);
     a64_emit_ret(b);
 }
-/* B.cond to a fault exit with info = cur (flags already set). */
+/* B.cond to a fault exit with info = cur (flags already set).  In a
+ * JR/JALR delay slot next_pc recovers from ctx->delay_target (the
+ * branch target) instead of fpc + 4. */
 static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
-                            uint32_t fpc)
+                            uint32_t fpc, int ind_slot)
 {
     size_t ph_f = a64_emit_b_cond_placeholder(b, cond);
     size_t ph_c = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+
     a64_patch_b_cond(b, ph_f, b->count);
-    emit_exit_imm(b, MIPS32_EXIT_FAULT, cur, fpc, fpc + 4U);
-    a64_patch_b_cond(b, ph_c, b->count);
-}
-/* Alignment guard (fault info = runtime address in w22). */
-static void emit_align_fault(a64_buf_t *b, unsigned mask_bits, uint32_t fpc)
-{
-    size_t ph_f, ph_c;
-    a64_emit_ubfm_w(b, A64_TMP1, A64_ADDR, 0U, mask_bits);
-    ph_f = a64_emit_cbz_w_placeholder(b, true, A64_TMP1);
-    ph_c = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, ph_f, b->count);
-    emit_flush(b);
-    emit_pc_imm(b, fpc, fpc + 4U);
-    a64_emit_mov_imm32(b, 0U, MIPS32_EXIT_FAULT);
-    a64_emit_mov_w(b, 1U, A64_ADDR);
-    a64_emit_ret(b);
+    if (ind_slot != 0) {
+        emit_flush(b);
+        a64_emit_mov_imm32(b, A64_TMP1, fpc);
+        a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
+        emit_load_delay_target(b, A64_TMP1);
+        a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX,
+                           MIPS32_CTX_NEXT_PC_OFFSET);
+        emit_reason(b, MIPS32_EXIT_FAULT, cur);
+    } else {
+        emit_exit_imm(b, MIPS32_EXIT_FAULT, cur, fpc, fpc + 4U);
+    }
     a64_patch_b_cond(b, ph_c, b->count);
 }
 
@@ -189,7 +181,7 @@ static void emit_align_fault(a64_buf_t *b, unsigned mask_bits, uint32_t fpc)
 
 /* ADDI/ADDU/SLTI/SLTIU/ANDI/ORI/XORI/LUI. -1 declines. */
 static int emit_imm_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                       uint32_t fpc)
+                       uint32_t fpc, int ind_slot)
 {
     unsigned rs = d->rs, rt = d->rt, ra;
     switch (d->op) {
@@ -205,7 +197,7 @@ static int emit_imm_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
             a64_emit_add_reg_w(b, true, A64_TMP1, ra, A64_TMP2,
                                A64_SHIFT_LSL, 0U);
         }
-        emit_cond_fault(b, A64_COND_VS, cur, fpc);
+        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
         put_rd(b, rt, A64_TMP1);
         return 0;
     case MIPS_OP_ADDIU:
@@ -359,7 +351,7 @@ static int emit_muldiv(a64_buf_t *b, const mips_dec_t *d)
 
 /* SPECIAL ALU/shifts/MOVZ/MOVN/traps + SYSCALL/BREAK exits. */
 static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                        uint32_t fpc)
+                        uint32_t fpc, int ind_slot)
 {
     static const uint8_t kCond[8] = { 10U, 2U, 11U, 3U, 0U, 0U, 1U, 0U };
     unsigned ra, rb;
@@ -417,13 +409,13 @@ static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     switch (d->funct) {
     case MIPS_FUNCT_ADD:
         a64_emit_add_reg_w(b, true, A64_TMP1, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, A64_COND_VS, cur, fpc);
+        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
         put_rd(b, d->rd, A64_TMP1);
         return 0;
     case MIPS_FUNCT_ADDU: ALU3(add_reg_w, d->rd, ra, rb); return 0;
     case MIPS_FUNCT_SUB:
         a64_emit_sub_reg_w(b, true, A64_TMP1, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, A64_COND_VS, cur, fpc);
+        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
         put_rd(b, d->rd, A64_TMP1);
         return 0;
     case 0x23U: ALU3(sub_reg_w, d->rd, ra, rb); return 0; /* SUBU */
@@ -447,7 +439,8 @@ static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     case 0x30U: case 0x31U: case 0x32U: case 0x33U: /* TGE/TLT */
     case 0x34U: case 0x36U: /* TEQ/TNE */
         a64_emit_sub_reg_w(b, true, A64_ZR, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, kCond[(d->funct - 0x30U) & 7U], cur, fpc);
+        emit_cond_fault(b, kCond[(d->funct - 0x30U) & 7U], cur, fpc,
+                        ind_slot);
         return 0;
     default:
         return -1;
@@ -509,7 +502,7 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
 
 /* REGIMM traps (fault shape mirrors SPECIAL traps); SYNCI declines. */
 static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                       uint32_t fpc)
+                       uint32_t fpc, int ind_slot)
 {
     static const uint8_t kCond[8] = { 10U, 2U, 11U, 12U, 13U, 0U, 0U, 1U };
     unsigned idx;
@@ -524,7 +517,7 @@ static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     default: return -1;
     }
     cmp_simm(b, d->rs, d->simm);
-    emit_cond_fault(b, kCond[idx], cur, fpc);
+    emit_cond_fault(b, kCond[idx], cur, fpc, ind_slot);
     return 0;
 }
 
@@ -539,168 +532,8 @@ static int emit_cop0(a64_buf_t *b, const mips_dec_t *d)
     return -1;
 }
 
-/* Aligned LB/LH/LW/LBU/LHU/SB/SH/SW fast path (EA already in w22). */
-static void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d,
-                             uint32_t fpc, int be)
-{
-    unsigned rt = d->rt, v, dst;
-    emit_sync_pc(b, fpc);
-    int h = gpr_host(rt);
-    dst = (h >= 0) ? (unsigned)h : A64_TMP1;
-    switch (d->op) {
-    case MIPS_OP_LB: case MIPS_OP_LBU:
-        if (d->op == MIPS_OP_LB) a64_emit_guest_ldrsb_w(b, dst, A64_ADDR);
-        else a64_emit_guest_ldrb_w(b, dst, A64_ADDR);
-        put_rd(b, rt, dst);
-        return;
-    case MIPS_OP_LH: case MIPS_OP_LHU:
-        emit_align_fault(b, 0U, fpc);
-        a64_emit_guest_ldrh_w(b, dst, A64_ADDR);
-        if (be != 0) a64_emit_rev16_w(b, dst, dst);
-        if (d->op == MIPS_OP_LH) a64_emit_sbfm_w(b, dst, dst, 0U, 15U);
-        put_rd(b, rt, dst);
-        return;
-    case MIPS_OP_LW:
-        emit_align_fault(b, 1U, fpc);
-        a64_emit_guest_ldr_w(b, dst, A64_ADDR);
-        if (be != 0) a64_emit_rev_w(b, dst, dst);
-        put_rd(b, rt, dst);
-        return;
-    case MIPS_OP_SB:
-        a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
-        return;
-    case MIPS_OP_SH: case MIPS_OP_SW:
-        v = op_val(b, rt, A64_TMP2); /* TMP2: the check below clobbers TMP1. */
-        emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc);
-        if (be == 0) {
-            if (d->op == MIPS_OP_SH)
-                a64_emit_guest_strh_w(b, v, A64_ADDR);
-            else a64_emit_guest_str_w(b, v, A64_ADDR);
-            return;
-        }
-        if (d->op == MIPS_OP_SH) a64_emit_rev16_w(b, A64_TMP1, v);
-        else a64_emit_rev_w(b, A64_TMP1, v);
-        if (d->op == MIPS_OP_SH) a64_emit_guest_strh_w(b, A64_TMP1, A64_ADDR);
-        else a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
-        return;
-    default:
-        break;
-    }
-}
-
-/* E05 byte position (0 = LSB) of memory byte i for the k-th offset. */
-static unsigned merge_pos(unsigned op, int be, unsigned i, unsigned k)
-{
-    if (op == MIPS_OP_LWL || op == MIPS_OP_SWL)
-        return (be != 0) ? (3U - (i - k)) : (3U - k + i);
-    return (be != 0) ? (k - i) : (i - k);
-}
-
-/* LWL/LWR/SWL/SWR: 4-way k dispatch, straight-line byte paths (E05). */
-static void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
-{
-    unsigned rt = d->rt, lo, hi, i, k, o;
-    emit_sync_pc(b, fpc);
-    int is_load = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_LWR);
-    int left = (d->op == MIPS_OP_LWL || d->op == MIPS_OP_SWL);
-    size_t ph_cbz[3], ph_end[3];
-    a64_emit_ubfm_w(b, A64_TMP1, A64_ADDR, 0U, 1U);
-    a64_emit_shift_imm_w(b, A64_TMP3, A64_ADDR, A64_SHIFT_LSR, 2U, false,
-                         NULL);
-    a64_emit_shift_imm_w(b, A64_TMP3, A64_TMP3, A64_SHIFT_LSL, 2U, false,
-                         NULL);
-    for (k = 0U; k < 3U; k++) {
-        ph_cbz[k] = a64_emit_cbz_w_placeholder(b, false, A64_TMP1);
-        a64_emit_sub_imm_w(b, true, A64_TMP1, A64_TMP1, 1U, 0U);
-    }
-    for (o = 0U, k = 3U; o < 4U; o++, k = (o == 1U) ? 0U : k + 1U) { /* k=3,0,1,2: fall-through enters k=3. */
-        if (k < 3U) a64_patch_cbz_w(b, ph_cbz[k], b->count);
-        if (left != 0) { lo = (be != 0) ? k : 0U; hi = (be != 0) ? 3U : k; }
-        else { lo = (be != 0) ? 0U : k; hi = (be != 0) ? k : 3U; }
-        if (is_load != 0) {
-            unsigned acc = op_val(b, rt, A64_TMP2);
-            if (acc != A64_TMP2) a64_emit_mov_w(b, A64_TMP2, acc);
-            for (i = lo; i <= hi; i++) {
-                unsigned pos = merge_pos(d->op, be, i, k);
-                a64_emit_add_imm_w(b, false, A64_ADDR, A64_TMP3, (uint16_t)i,
-                                   0U);
-                a64_emit_guest_ldrb_w(b, A64_TMP1, A64_ADDR);
-                a64_emit_mov_imm32(b, 24U, 0xFFU << (8U * pos));
-                a64_emit_bic_reg_w(b, false, A64_TMP2, A64_TMP2, 24U,
-                                   A64_SHIFT_LSL, 0U);
-                a64_emit_shift_imm_w(b, A64_TMP1, A64_TMP1, A64_SHIFT_LSL,
-                                     8U * pos, false, NULL);
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1,
-                                   A64_SHIFT_LSL, 0U);
-            }
-            put_rd(b, rt, A64_TMP2);
-        } else {
-            unsigned v = op_val(b, rt, A64_TMP2);
-            for (i = lo; i <= hi; i++) {
-                unsigned pos = merge_pos(d->op, be, i, k);
-                a64_emit_add_imm_w(b, false, A64_ADDR, A64_TMP3, (uint16_t)i,
-                                   0U);
-                if (pos == 0U) a64_emit_mov_w(b, A64_TMP1, v);
-                else a64_emit_shift_imm_w(b, A64_TMP1, v, A64_SHIFT_LSR,
-                                          8U * pos, false, NULL);
-                a64_emit_guest_strb_w(b, A64_TMP1, A64_ADDR);
-            }
-        }
-        if (o < 3U) ph_end[o] = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    }
-    for (o = 0U; o < 3U; o++) a64_patch_b_cond(b, ph_end[o], b->count);
-}
-
-/* LL: aligned load + llbit/lladdr/llval record (align guard syncs). */
-static void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
-{
-    emit_align_fault(b, 1U, fpc);
-    a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
-    if (be != 0) a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-    put_rd(b, d->rt, A64_TMP1);
-    a64_emit_mov_imm32(b, A64_TMP2, 1U);
-    a64_emit_strb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
-    a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, MIPS32_CTX_LLADDR_OFFSET);
-    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_LLVAL_OFFSET);
-}
-
-/* SC: LDXR first (fault side effect even when llbit is clear, matching
- * interp), then llbit/llval check, STXR retry loop in x24/w16. */
-static void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be)
-{
-    unsigned data = op_val(b, d->rt, A64_TMP3);
-    size_t ph_fail1, ph_fail2, ph_done, ph_retry, retry_ldxr;
-    emit_align_fault(b, 1U, fpc);
-    a64_emit_add_uxtw_x(b, 24U, A64_XG, A64_ADDR);
-    retry_ldxr = b->count; /* STXR failure clears it: restart at LDXR. */
-    a64_emit_ldxr_w(b, A64_TMP1, 24U);
-    a64_emit_ldrb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
-    ph_fail1 = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
-    if (be != 0) a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-    a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLVAL_OFFSET);
-    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2, A64_SHIFT_LSL,
-                       0U);
-    ph_fail2 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    if (be != 0) {
-        a64_emit_rev_w(b, A64_TMP3, data);
-        data = A64_TMP3;
-    }
-    a64_emit_stxr_w(b, A64_TMP1, data, 24U);
-    ph_retry = a64_emit_cbz_w_placeholder(b, true, A64_TMP1);
-    a64_patch_cbz_w(b, ph_retry, retry_ldxr);
-    a64_emit_mov_imm32(b, A64_TMP1, 1U);
-    ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, ph_fail1, b->count);
-    a64_patch_b_cond(b, ph_fail2, b->count);
-    a64_emit_clrex(b);
-    a64_emit_mov_imm32(b, A64_TMP1, 0U);
-    a64_patch_b_cond(b, ph_done, b->count);
-    a64_emit_strb_imm_w(b, A64_ZR, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
-    put_rd(b, d->rt, A64_TMP1);
-}
-
 static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                    uint32_t fpc, int be);
+                    uint32_t fpc, int be, int ind_slot);
 
 /* Control with delay slot (REGIMM 0x12/0x13 included, mirroring interp). */
 static int is_ctl(const mips_dec_t *d)
@@ -717,13 +550,18 @@ static void emit_link_imm(a64_buf_t *b, unsigned rd, uint32_t val)
     else { a64_emit_mov_imm32(b, A64_TMP1, val); a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, rd * 4U); }
 }
 
-/* Branch + inline delay slot (flags before link write; x23 holds the indirect target across the slot). */
+/* Branch + inline delay slot (flags before link write; x23 holds the
+ * indirect target across the slot, spilled to ctx->delay_target before
+ * the slot so a delay-slot fault can recover next_pc).  A JALR whose
+ * link register aliases its source (rd == rs) defers the link write
+ * until after the slot: committing first would clobber rs, and a fault
+ * in the slot would then re-execute the jump to the wrong target. */
 static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
                         const mips_dec_t *s, uint32_t cur, int be)
 {
     uint32_t nottaken = cur + 8U, taken = 0U;
     unsigned cond = A64_COND_AL;
-    int indirect = 0, link_rd = -1;
+    int indirect = 0, link_rd = -1, defer_link = 0;
     size_t ph_t;
     switch (d->op) {
     case MIPS_OP_J: case MIPS_OP_JAL:
@@ -758,45 +596,62 @@ static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
     }
     if (d->op != MIPS_OP_J && d->op != MIPS_OP_JAL && d->op != MIPS_OP_SPECIAL)
         taken = cur + 4U + (uint32_t)(d->simm * 4);
-    if (indirect != 0) a64_emit_mov_w(b, 23U, op_val(b, d->rs, A64_TMP1));
-    if (link_rd >= 0) emit_link_imm(b, (unsigned)link_rd, cur + 8U);
     if (indirect != 0) {
-        (void)emit_one(b, s, cur + 4U, cur, be);
+        a64_emit_mov_w(b, 23U, op_val(b, d->rs, A64_TMP1));
+        /* Spill the dynamic target before the slot: every fault path
+         * inside the slot (inline exits, host faults) loses x23. */
+        a64_emit_mov_imm32(b, A64_TMP1, EMIT_DELAY_TARGET_OFFSET);
+        a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
+        a64_emit_str_imm_w(b, 23U, A64_TMP1, 0U);
+        defer_link = (link_rd >= 0 && d->funct == MIPS_FUNCT_JALR &&
+                      link_rd == (int)d->rs);
+    }
+    if (link_rd >= 0 && defer_link == 0) {
+        emit_link_imm(b, (unsigned)link_rd, cur + 8U);
+    }
+    if (indirect != 0) {
+        (void)emit_one(b, s, cur + 4U, cur, be, 1);
+        if (defer_link != 0) {
+            emit_link_imm(b, (unsigned)link_rd, cur + 8U);
+        }
         emit_exit_indirect(b);
         return;
     }
     if (cond == A64_COND_AL) {
-        (void)emit_one(b, s, cur + 4U, cur, be);
+        (void)emit_one(b, s, cur + 4U, cur, be, 0);
         emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, taken, taken + 4U);
         return;
     }
     ph_t = a64_emit_b_cond_placeholder(b, cond);
     if (mips_is_branch_likely(d) == 0 && (d->op != MIPS_OP_REGIMM ||
         (d->rt != 0x12U && d->rt != 0x13U)))
-        (void)emit_one(b, s, cur + 4U, cur, be);
+        (void)emit_one(b, s, cur + 4U, cur, be, 0);
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, nottaken, nottaken + 4U);
     a64_patch_b_cond(b, ph_t, b->count);
-    (void)emit_one(b, s, cur + 4U, cur, be);
+    (void)emit_one(b, s, cur + 4U, cur, be, 0);
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, taken, taken + 4U);
 }
 
-/* One straight-line insn: 0 continue, 1 exit, -1 decline. */
+/* One straight-line insn: 0 continue, 1 exit, -1 decline.  ind_slot
+ * marks a JR/JALR delay slot (fault exits recover next_pc from
+ * ctx->delay_target). */
 static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                    uint32_t fpc, int be)
+                    uint32_t fpc, int be, int ind_slot)
 {
     switch (d->op) {
-    case MIPS_OP_SPECIAL: return emit_special(b, d, cur, fpc);
+    case MIPS_OP_SPECIAL: return emit_special(b, d, cur, fpc, ind_slot);
     case MIPS_OP_SPECIAL2: return emit_muldiv(b, d);
     case MIPS_OP_SPECIAL3: return emit_special3(b, d);
-    case MIPS_OP_REGIMM: return emit_regimm(b, d, cur, fpc);
+    case MIPS_OP_REGIMM: return emit_regimm(b, d, cur, fpc, ind_slot);
     case MIPS_OP_ADDI: case MIPS_OP_ADDIU: case MIPS_OP_SLTI:
     case MIPS_OP_SLTIU: case MIPS_OP_ANDI: case MIPS_OP_ORI:
-    case MIPS_OP_XORI: case MIPS_OP_LUI: return emit_imm_op(b, d, cur, fpc);
+    case MIPS_OP_XORI: case MIPS_OP_LUI:
+        return emit_imm_op(b, d, cur, fpc, ind_slot);
     case MIPS_OP_COP0: return emit_cop0(b, d);
     case MIPS_OP_LB: case MIPS_OP_LH: case MIPS_OP_LW: case MIPS_OP_LBU:
     case MIPS_OP_LHU: case MIPS_OP_SB: case MIPS_OP_SH: case MIPS_OP_SW:
         emit_ea(b, d->rs, d->simm);
-        emit_mem_aligned(b, d, fpc, be);
+        emit_mem_aligned(b, d, fpc, be, ind_slot);
         return 0;
     case MIPS_OP_LWL: case MIPS_OP_LWR: case MIPS_OP_SWL: case MIPS_OP_SWR:
         emit_ea(b, d->rs, d->simm);
@@ -804,8 +659,11 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         return 0;
     case MIPS_OP_LL: case MIPS_OP_SC:
         emit_ea(b, d->rs, d->simm);
-        if (d->op == MIPS_OP_LL) emit_ll(b, d, fpc, be);
-        else emit_sc(b, d, fpc, be);
+        if (d->op == MIPS_OP_LL) {
+            emit_ll(b, d, fpc, be, ind_slot);
+        } else {
+            emit_sc(b, d, fpc, be, ind_slot);
+        }
         return 0;
     case 0x2FU: case 0x33U: return 0; /* CACHE / PREF */
     default: return -1;
@@ -882,7 +740,7 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
             *out_end = cur + 8U;
             break;
         }
-        rc = emit_one(&b, d, cur, cur, be);
+        rc = emit_one(&b, d, cur, cur, be, 0);
         if (rc == 0) { cur += 4U; continue; }
         if (rc < 0) emit_exit_imm(&b, MIPS32_EXIT_UNDEF, 0U, cur, cur + 4U);
         *out_end = cur + (rc < 0 ? 0U : 4U);

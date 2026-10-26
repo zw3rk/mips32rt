@@ -13,11 +13,26 @@
 #define _GNU_SOURCE
 #include "vm_priv.h"
 
+#include "vm/vm32.h"
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+
+/* Provider A hook (src/vm/vm_file.c): declared locally so vm32.h stays
+ * untouched.  Mirrors private file bytes into the A2 arena. */
+extern int mips32_file_populate_private(mips32_ctx_t *ctx, uint32_t gva,
+                                        uint32_t len, int fd,
+                                        uint64_t file_off);
+/* Keep the A2 Soft-TLB coherent wherever the DBT range is invalidated. */
+static void vm_invalidate_all(mips32_ctx_t *ctx, uint32_t start,
+                              uint32_t end)
+{
+    vm_invalidate_jit(ctx, start, end);
+    mips32_vm_invalidate_range(ctx, start, end);
+}
 
 static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                                 uint32_t flags, int fd, uint32_t pgoffset)
@@ -85,6 +100,13 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
     }
     (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                                   prot & 0x7U, flags, "[mmap]");
+    if ((flags & 0x01U) == 0U && (host_flags & MAP_ANONYMOUS) == 0 &&
+        fd >= 0 && ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        /* Provider A: mirror private file bytes into the A2 arena. */
+        (void)mips32_file_populate_private(ctx, target_va,
+                                           (uint32_t)aligned_len, fd,
+                                           (uint64_t)host_off);
+    }
     return target_va;
 }
 
@@ -104,7 +126,7 @@ uint32_t rt32_vm_mmap2(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
     if (res <= 0xFFFFF000U &&
         ((flags & (RT32_MAP_FIXED | RT32_MAP_FIXED_NOREPLACE)) != 0U ||
          (prot & (uint32_t)PROT_EXEC) != 0U)) {
-        vm_invalidate_jit(ctx, res, (uint32_t)((uint64_t)res + vm_page_align_up((uint64_t)len)));
+        vm_invalidate_all(ctx, res, (uint32_t)((uint64_t)res + vm_page_align_up((uint64_t)len)));
     }
 
     /* No AOT pre-translator exists: the Phase 2 DBT compiles lazily. */
@@ -150,7 +172,7 @@ int rt32_vm_mprotect(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t pr
     vm_lock_release();
 
     if (rc == 0 && len > 0U) {
-        vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
+        vm_invalidate_all(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
     }
     return rc;
 }
@@ -194,7 +216,7 @@ int rt32_vm_munmap(mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
     vm_lock_release();
 
     if (rc == 0) {
-        vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
+        vm_invalidate_all(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
     }
     return rc;
 }
@@ -253,7 +275,7 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             if (rc != 0) {
                 return (uint32_t)rc;
             }
-            vm_invalidate_jit(ctx, unmap_addr, unmap_addr + unmap_len);
+            vm_invalidate_all(ctx, unmap_addr, unmap_addr + unmap_len);
             return old_addr;
         }
 
@@ -274,7 +296,7 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                 vm_sync_to_ctx(ctx);
                 vm_lock_release();
                 if ((prot & (uint32_t)PROT_EXEC) != 0U) {
-                    vm_invalidate_jit(ctx, old_end, ext_end);
+                    vm_invalidate_all(ctx, old_end, ext_end);
                 }
                 return old_addr;
             }
@@ -321,9 +343,9 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 
-    vm_invalidate_jit(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
+    vm_invalidate_all(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
     if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {
-        vm_invalidate_jit(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
+        vm_invalidate_all(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
     }
     return new_va;
 }

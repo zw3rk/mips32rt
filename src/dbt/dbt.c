@@ -758,6 +758,9 @@ int dbt_main(mips32_ctx_t *ctx)
         case MIPS32_EXIT_UNDEF:
         case MIPS32_EXIT_SINGLE_STEP:
         case MIPS32_EXIT_TRAP:
+            /* RC-U3 TIF_FIXADE: misaligned LH/LHU/LW/SH/SW with
+             * fixade_enabled arrive here (ALIGN exit); interp_step
+             * emulates the access and dispatch resumes. */
             if (dbt_step_fallback(ctx) != 0) {
                 return 1;
             }
@@ -767,10 +770,16 @@ int dbt_main(mips32_ctx_t *ctx)
              * in exit_info; deliver like the mem layer (AdEL/AdES bus
              * when misaligned, segv otherwise) and resume.  An
              * undeliverable fault must die by signal (mips_trap),
-             * matching interp -- never stop quietly with rc 1. */
-            int signo = ((ctx->exit_info & 3U) != 0U) ? 10 : 11;
+             * matching interp -- never stop quietly with rc 1.
+             * RC-U3 TIF_FIXADE: a misaligned inline exit with FIXADE
+             * set takes the SINGLE_STEP path (interp_step emulates),
+             * so a FAULT exit on a misaligned address can only be a
+             * mapping/permission failure -> SIGSEGV, never SIGBUS. */
+            uint32_t info = ctx->exit_info;
+            int signo = (ctx->fixade_enabled != 0U ||
+                         (info & 3U) == 0U) ? 11 : 10;
 
-            mips_trap(ctx, signo, ctx->exit_info);
+            mips_trap(ctx, signo, info);
             if (ctx->exit_reason != MIPS32_EXIT_NONE) {
                 return 1;
             }
