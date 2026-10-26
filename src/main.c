@@ -347,6 +347,7 @@ int main(int argc, char **argv)
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.engine = -1; /* unset: --interp/--dbt or MIPS32RT_ENGINE; INTERP default */
+    ctx.fixade_enabled = 1u; /* Wave U3: Linux MIPS TIF_FIXADE default-on */
 
     path_idx = parse_args(&ctx, argc, argv, &execfn, &image_fd);
     if (path_idx < 0) {

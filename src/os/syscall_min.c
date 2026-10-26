@@ -59,6 +59,13 @@ extern long syscall(long __n, ...);
 
 /* Locally frozen: __NR_set_tid_address = __NR_Linux + 252 (see above). */
 #define MIPS32_NR_TID_ADDRESS 4252U
+/* Wave U3: O32 sysmips = __NR_Linux + 149 (syscall_o32.tbl) and
+ * MIPS_FIXADE = 7 (Linux sys/sysmips.h).  Defined locally so the
+ * frozen src/os/syscall_nr.h stays untouched (TID_ADDRESS precedent).
+ * sysmips(MIPS_FIXADE, 0) disables unaligned emulation (next
+ * misaligned access faults -> SIGBUS/BUS_ADRALN); nonzero enables. */
+#define MIPS32_NR_SYSMIPS 4149U
+#define MIPS32_SYSMIPS_FIXADE 7U
 
 /* Cross-lane hook (same weak-reference pattern as src/os/proc.c): the
  * Phase 2 DBT provides mips32_dbt_invalidate_range; without it
@@ -470,6 +477,20 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_unlink:
     case MIPS32_NR_unlinkat:
         return mips_syscall_extra(ctx, sp);
+    case MIPS32_NR_SYSMIPS: {
+        /* sysmips(cmd, arg): only MIPS_FIXADE is emulated. */
+        uint32_t cmd = o32_arg(ctx, sp, 0, &ok);
+        uint32_t arg = o32_arg(ctx, sp, 1, &ok);
+
+        if (!ok) {
+            return sc_ret(ctx, -EFAULT);
+        }
+        if (cmd != (uint32_t)MIPS32_SYSMIPS_FIXADE) {
+            return sc_ret(ctx, -(int32_t)ENOSYS);
+        }
+        ctx->fixade_enabled = (arg != 0U) ? 1u : 0u;
+        return sc_ret(ctx, 0);
+    }
     case MIPS32_NR_set_thread_area: {
         /* O32 takes the TLS base directly in $a0 (E06); rdhwr $29 reads
          * it back as ctx->ulr.  LL reservations are already clear here. */
