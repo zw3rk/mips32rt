@@ -34,6 +34,23 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* RC-U3-R2 shared LL/SC epoch table: one 16 KiB host page at the
+ * unmappable guest address MIPS32_LL_EPOCH_GVA (above
+ * MIPS32_TASK_SIZE_TOP, so no guest mapping can alias it and the
+ * region walker never covers it).  Both engines index it as
+ * table[(addr >> 6) & 4095]: every store advances the touched 64-byte
+ * lines, LL snapshots the word's line into the u3_pad tail bytes, and
+ * SC verifies the snapshot around its CAS (bumping on success).  A
+ * same-value cross-thread store therefore fails the SC even though
+ * the value compare alone would succeed. */
+#define MIPS32_LL_EPOCH_GVA   0xFFFF0000u
+#define MIPS32_LL_EPOCH_WORDS 4096u
+#define MIPS32_LL_EPOCH_BYTES (4096u * 4u)
+#define MIPS32_LL_SEQ_MASK    0xFFu
+
+/* Forward: on-demand epoch mapping (defined below fixade_on). */
+int mips_ll_epoch_ensure(mips32_ctx_t *ctx);
+
 int guest_mem_init(mips32_ctx_t *ctx)
 {
     if (ctx == NULL) {
@@ -43,6 +60,15 @@ int guest_mem_init(mips32_ctx_t *ctx)
     if (rt32_vm_init(ctx, UINT64_MAX) != 0) {
         return MIPS_FAULT;
     }
+    /* Eager epoch mapping for direct guest_mem_init users; the lazy
+     * path in ll_epoch_table covers entry points that never call this
+     * (production main.c reserves the window itself). */
+    if (mips_ll_epoch_ensure(ctx) == 0) {
+        return MIPS_FAULT;
+    }
+    ctx->u3_pad[0] = 0u;
+    ctx->u3_pad[1] = 0u;
+    ctx->u3_pad[2] = 0u;
     /* Wave U3: connect the two-regime VM (FIXADE default-on, A1/A2
      * select, A2 arena/TLB allocation). */
     mips32_fixade_init(ctx);
@@ -168,15 +194,139 @@ static int fixade_on(const mips32_ctx_t *ctx)
     return ctx != NULL && ctx->fixade_enabled != 0u;
 }
 
+/* The G this process last mapped the epoch page for (idempotent
+ * MAP_FIXED remap when the window moves, e.g. re-exec with an explicit
+ * --window; concurrent CLONE_VM mappers just repeat the same mapping). */
+static _Atomic uint64_t ll_epoch_mapped_base = (uint64_t)UINT64_MAX;
+
+/* Map the shared epoch page at G + MIPS32_LL_EPOCH_GVA on demand (the
+ * production entry point in src/main.c reserves the window itself and
+ * never calls guest_mem_init, so every live path funnels through here).
+ * Returns 1 when the table is usable, 0 when the reservation failed. */
+int mips_ll_epoch_ensure(mips32_ctx_t *ctx)
+{
+    void *tab;
+    void *res;
+    uint64_t base;
+
+    if (ctx == NULL) {
+        return 0;
+    }
+    base = atomic_load_explicit(&ll_epoch_mapped_base,
+                                memory_order_relaxed);
+    if (base == ctx->guest_base) {
+        return 1;
+    }
+    tab = (void *)(uintptr_t)(ctx->guest_base +
+                              (uint64_t)MIPS32_LL_EPOCH_GVA);
+    res = mmap(tab, (size_t)MIPS32_LL_EPOCH_BYTES,
+               PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (res == MAP_FAILED || res != tab) {
+        if (res != MAP_FAILED && res != tab) {
+            (void)munmap(res, (size_t)MIPS32_LL_EPOCH_BYTES);
+        }
+        return 0;
+    }
+    memset(tab, 0, (size_t)MIPS32_LL_EPOCH_BYTES);
+    atomic_store_explicit(&ll_epoch_mapped_base, ctx->guest_base,
+                          memory_order_relaxed);
+    return 1;
+}
+
+/* The shared epoch table lives at G + MIPS32_LL_EPOCH_GVA (mapped on
+ * demand by mips_ll_epoch_ensure); plain host pointer, never a guest
+ * range.  NULL when the reservation failed: callers degrade to the
+ * value-compare-only protocol instead of faulting. */
+static _Atomic uint32_t *ll_epoch_table(mips32_ctx_t *ctx)
+{
+    if (mips_ll_epoch_ensure(ctx) == 0) {
+        return NULL;
+    }
+    return (_Atomic uint32_t *)(void *)(uintptr_t)(ctx->guest_base +
+                                                   (uint64_t)MIPS32_LL_EPOCH_GVA);
+}
+
+static uint32_t ll_epoch_idx(uint32_t va)
+{
+    return (va >> 6) & (MIPS32_LL_EPOCH_WORDS - 1u);
+}
+
+/* Advance the epoch for every 64-byte line in [va, va + len): first and
+ * last line, which covers all stores up to 4 bytes (a 4-byte access
+ * touches at most two lines). */
+static void ll_epoch_bump(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
+{
+    _Atomic uint32_t *tab;
+    uint32_t first;
+    uint32_t last;
+
+    if (ctx == NULL || len == 0u) {
+        return;
+    }
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        return;
+    }
+    first = ll_epoch_idx(va);
+    last = ll_epoch_idx(va + len - 1u);
+    atomic_fetch_add_explicit(&tab[first], 1u, memory_order_relaxed);
+    if (last != first) {
+        atomic_fetch_add_explicit(&tab[last], 1u, memory_order_relaxed);
+    }
+}
+
+/* LL epoch snapshot: the table entry's low 8 bits in u3_pad[0] (the
+ * struct layout is untouched).  The byte wraps every 256 same-line
+ * stores, ample for any deterministic LL/SC span, and a spurious SC
+ * failure stays architecturally legal. */
+static void ll_seq_save(mips32_ctx_t *ctx, uint32_t seq)
+{
+    ctx->u3_pad[0] = (uint8_t)(seq & MIPS32_LL_SEQ_MASK);
+}
+
+static uint32_t ll_seq_saved(const mips32_ctx_t *ctx)
+{
+    return (uint32_t)ctx->u3_pad[0];
+}
+
+/* RC-U3-R2 LL record (interp LL path): llbit/lladdr/llval plus the
+ * epoch snapshot the later SC verifies. */
+void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val)
+{
+    _Atomic uint32_t *tab;
+
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->llbit  = 1u;
+    ctx->lladdr = addr;
+    ctx->llval  = val;
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        ll_seq_save(ctx, 0u);
+        return;
+    }
+    ll_seq_save(ctx, atomic_load_explicit(&tab[ll_epoch_idx(addr)],
+                                          memory_order_relaxed));
+}
+
 /* RC-U3 LL/SC: an ordinary store overlapping the reserved word breaks
  * this thread's reservation (the later SC then fails its checks).
  * Spurious SC failure is architecturally legal; the overlap test keeps
- * reservations for other words alive. */
+ * reservations for other words alive.  Every store also advances the
+ * shared epoch (regardless of llbit: another thread may hold a live
+ * reservation on the line), so a same-value cross-thread store still
+ * fails a later SC via the epoch check. */
 static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
 {
     uint64_t end64;
 
-    if (ctx == NULL || ctx->llbit == 0u || len == 0u) {
+    if (ctx == NULL || len == 0u) {
+        return;
+    }
+    ll_epoch_bump(ctx, va, len);
+    if (ctx->llbit == 0u) {
         return;
     }
     end64 = (uint64_t)va + (uint64_t)len;
@@ -375,6 +525,10 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
     uint32_t  new_pat;
     uint32_t *hp;
     int       swapped;
+    _Atomic uint32_t *tab;
+    uint32_t  idx;
+    uint32_t  want;
+    uint32_t  s1;
 
     if (ctx == NULL || ok == NULL) {
         return MIPS_FAULT;
@@ -386,6 +540,28 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
     if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
         return MIPS_FAULT;
+    }
+    /* RC-U3-R2 epoch gate: a dead reservation (or one for another
+     * address) fails without touching memory.  Otherwise the snapshot
+     * taken at LL time must still match: any store to the line since
+     * (even a same-value one the CAS would accept) fails the SC. */
+    if (ctx->llbit == 0u || ctx->lladdr != va) {
+        *ok = 0;
+        return 0;
+    }
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        idx = 0u;
+        s1 = 0u;
+        want = 0u;
+    } else {
+        idx  = ll_epoch_idx(va);
+        want = ll_seq_saved(ctx);
+        s1   = atomic_load_explicit(&tab[idx], memory_order_relaxed);
+        if ((s1 & MIPS32_LL_SEQ_MASK) != want) {
+            *ok = 0;
+            return 0;
+        }
     }
     /* Value-domain compare like LL/SC: the host mapping holds the
      * guest-order byte pattern, so swap both sides on BE. */
@@ -403,6 +579,18 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
     if (__atomic_compare_exchange_n(hp, &exp_pat, new_pat, 0,
                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
         swapped = 1;
+    }
+    if (swapped != 0 && tab != NULL) {
+        /* The epoch must also be stable across the CAS itself (a store
+         * racing the atomic step still breaks a hardware reservation).
+         * Success is itself a store, so it advances the epoch. */
+        uint32_t s2 = atomic_load_explicit(&tab[idx], memory_order_relaxed);
+
+        if ((s2 & MIPS32_LL_SEQ_MASK) != (s1 & MIPS32_LL_SEQ_MASK)) {
+            swapped = 0;
+        } else {
+            atomic_fetch_add_explicit(&tab[idx], 1u, memory_order_relaxed);
+        }
     }
     *ok = swapped;
     return 0;

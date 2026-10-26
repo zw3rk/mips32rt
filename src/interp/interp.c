@@ -28,6 +28,10 @@ __attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
                                                       uint32_t start,
                                                       uint32_t end);
 
+/* RC-U3-R2 epoch record (src/os/mem.c): LL snapshots the shared line
+ * epoch into the u3_pad tail bytes for the later SC check. */
+extern void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val);
+
 static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
 {
     if (ctx->trace_enabled) {
@@ -455,7 +459,10 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt, (uint32_t)(int32_t)(int8_t)(v & 0xFFu));
         return 0;
     case 0x21u: /* LH */
-        if ((addr & 1u) != 0u) {
+        /* RC-U3-R2 FIXADE: with fixade_enabled the misaligned access is
+         * not an address error; the guest_ld16 helper emulates it in
+         * software.  Only fault inline when FIXADE is clear. */
+        if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
@@ -466,7 +473,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x22u: /* LWL */
         return do_lwl(ctx, addr, d->rt);
     case 0x23u: /* LW */
-        if ((addr & 3u) != 0u) {
+        if (((addr & 3u) != 0u) && ctx->fixade_enabled == 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
@@ -481,7 +488,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt, v & 0xFFu);
         return 0;
     case 0x25u: /* LHU */
-        if ((addr & 1u) != 0u) {
+        if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
@@ -497,7 +504,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         }
         return 0;
     case 0x29u: /* SH */
-        if ((addr & 1u) != 0u) {
+        if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_st16(ctx, addr, ctx->gpr[d->rt] & 0xFFFFu) != 0) {
@@ -507,7 +514,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x2Au: /* SWL */
         return do_swl(ctx, addr, ctx->gpr[d->rt]);
     case 0x2Bu: /* SW */
-        if ((addr & 3u) != 0u) {
+        if (((addr & 3u) != 0u) && ctx->fixade_enabled == 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_st32(ctx, addr, ctx->gpr[d->rt]) != 0) {
@@ -517,15 +524,15 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x2Eu: /* SWR */
         return do_swr(ctx, addr, ctx->gpr[d->rt]);
     case 0x30u: /* LL */
+        /* LL/SC stay aligned-only: FIXADE emulates integer loads and
+         * stores, never atomics. */
         if ((addr & 3u) != 0u) {
             return fault_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
-        ctx->llbit = 1;
-        ctx->lladdr = addr;
-        ctx->llval = v;
+        mips_ll_record(ctx, addr, v);
         interp_set_reg(ctx, d->rt, v);
         return 0;
     case 0x38u: { /* SC */
