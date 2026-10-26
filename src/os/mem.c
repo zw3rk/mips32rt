@@ -24,6 +24,7 @@
 #include "mips32rt.h"
 
 #include "rt32/rt32.h"
+#include "vm/vm32.h"
 
 #include <stddef.h>
 #include <signal.h>
@@ -40,6 +41,12 @@ int guest_mem_init(mips32_ctx_t *ctx)
     }
     rt32_host_probe(ctx);
     if (rt32_vm_init(ctx, UINT64_MAX) != 0) {
+        return MIPS_FAULT;
+    }
+    /* Wave U3: connect the two-regime VM (FIXADE default-on, A1/A2
+     * select, A2 arena/TLB allocation). */
+    mips32_fixade_init(ctx);
+    if (mips32_vm32_init(ctx) != 0) {
         return MIPS_FAULT;
     }
     return 0;
@@ -87,6 +94,10 @@ static int range_covered(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
 extern int mips_signal_has_handler(int signo);
 extern void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr);
 
+/* Forward: ordinary stores overlapping the LL word break it (defined
+ * below fixade_on, used by guest_st8 first). */
+static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len);
+
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
 {
     int signo;
@@ -105,8 +116,12 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
      * (SIGBUS); aligned ones as TLB miss/permission faults (SIGSEGV).
      * mips_raise_guest clears exit_reason on delivery so the engine can
      * resume at the handler; without one the process dies by signal
-     * (139 for SIGSEGV, matching the Phase-1 exit shape). */
-    signo = ((addr & 3U) != 0U) ? 10 : 11;
+     * (139 for SIGSEGV, matching the Phase-1 exit shape).
+     * RC-U3 TIF_FIXADE: with fixade_enabled set, misaligned integer
+     * accesses emulate in software and never reach here, so a fault on
+     * a misaligned address is a mapping/permission failure (SIGSEGV),
+     * not an address error. */
+    signo = (ctx->fixade_enabled != 0U || (addr & 3U) == 0U) ? 11 : 10;
     mips_trap(ctx, signo, addr);
 }
 
@@ -139,6 +154,7 @@ int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
     }
     b = (uint8_t)(val & 0xFFU);
     memcpy(mips32_guest_ptr(ctx, va), &b, 1U);
+    note_store(ctx, va, 1U);
     return 0;
 }
 
@@ -150,6 +166,24 @@ int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
 static int fixade_on(const mips32_ctx_t *ctx)
 {
     return ctx != NULL && ctx->fixade_enabled != 0u;
+}
+
+/* RC-U3 LL/SC: an ordinary store overlapping the reserved word breaks
+ * this thread's reservation (the later SC then fails its checks).
+ * Spurious SC failure is architecturally legal; the overlap test keeps
+ * reservations for other words alive. */
+static void note_store(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
+{
+    uint64_t end64;
+
+    if (ctx == NULL || ctx->llbit == 0u || len == 0u) {
+        return;
+    }
+    end64 = (uint64_t)va + (uint64_t)len;
+    if ((uint64_t)va < (uint64_t)ctx->lladdr + 4u &&
+        end64 > (uint64_t)ctx->lladdr) {
+        ctx->llbit = 0u;
+    }
 }
 
 int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
@@ -219,6 +253,7 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             p[1] = (uint8_t)((val >> 8) & 0xFFU);
         }
         memcpy(mips32_guest_ptr(ctx, va), p, 2U);
+        note_store(ctx, va, 2U);
         return 0;
     }
     if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
@@ -233,6 +268,7 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         b[1] = (uint8_t)((val >> 8) & 0xFFU);
     }
     memcpy(mips32_guest_ptr(ctx, va), b, 2U);
+    note_store(ctx, va, 2U);
     return 0;
 }
 
@@ -309,6 +345,7 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
             q[3] = (uint8_t)((val >> 24) & 0xFFU);
         }
         memcpy(mips32_guest_ptr(ctx, va), q, 4U);
+        note_store(ctx, va, 4U);
         return 0;
     }
     if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
@@ -327,6 +364,7 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
     memcpy(mips32_guest_ptr(ctx, va), b, 4U);
+    note_store(ctx, va, 4U);
     return 0;
 }
 

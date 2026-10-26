@@ -80,6 +80,13 @@ static const void *hf_fault_pc(void *uc)
         return NULL;
     }
     return (const void *)(uintptr_t)u->uc_mcontext.pc;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *u = (ucontext_t *)uc;
+
+    if (u == NULL) {
+        return NULL;
+    }
+    return (const void *)(uintptr_t)u->uc_mcontext->__ss.__pc;
 #else
     (void)uc;
     return NULL;
