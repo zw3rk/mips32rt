@@ -23,8 +23,8 @@ LDFLAGS ?= -static-pie -Wl,-z,max-page-size=4096
 
 # src/main.c plus every vendored rt32 core file (Lane L0a).  Later phases
 # append src/interp, src/dbt, and src/os (beyond src/os/syscall_nr.h).
-SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
-HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h)
+SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
+HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) $(OBJ_DIR)/rt32/safe_syscall_a64.o $(OBJ_DIR)/dbt/trampoline_a64.o
