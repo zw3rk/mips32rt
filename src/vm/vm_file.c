@@ -33,6 +33,8 @@
 
 #include "vm/vm32.h"
 
+#include "os/syscalls_priv.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -41,6 +43,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* O32 truncate numbers, arch/mips/kernel/syscalls/syscall_o32.tbl
+ * (kept local: src/os/syscall_nr.h is coordinator-frozen).
+ * 92 truncate, 93 ftruncate (offset from __NR_Linux 4000). */
+#define MIPS32_NR_TRUNCATE_LOCAL  4092
+#define MIPS32_NR_FTRUNCATE_LOCAL 4093
 
 #define MIPS32_FAMILY_MAX_INODES 256u
 
@@ -144,7 +152,9 @@ int mips32_file_populate_private(mips32_ctx_t *ctx, uint32_t gva,
     if (ctx == NULL || len == 0u) {
         return -EFAULT;
     }
-    hva = (uint8_t *)(void *)(uintptr_t)(ctx->vm_arena_base + (uint64_t)gva);
+    /* RC-U3-R2 single canonical backing: file bytes land at G + gva
+     * (never a separate arena), the same HVA every other path uses. */
+    hva = (uint8_t *)(void *)(uintptr_t)(ctx->guest_base + (uint64_t)gva);
     want = (size_t)len;
     got = pread(fd, hva, want, (off_t)file_off);
     if (got < 0) {
@@ -240,4 +250,66 @@ int mips32_file_truncate_at(int fd, uint64_t len)
         }
     }
     return 0;
+}
+
+/* sys_truncate / sys_ftruncate (O32 4092/4093): guest-facing wrappers
+ * around mips32_file_truncate_at.  The host call runs first and only a
+ * successful one updates the family size/generation hooks, per the 4.5
+ * Step-3->4 rule.  Dispatch (src/os/syscall_min.c forward list +
+ * mips_syscall_extra cases + frozen src/os/syscall_nr.h numbers) is
+ * coordinator-owned and not wired here; this function is the payload
+ * those cases call. */
+int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
+{
+    int ok = 1;
+
+    if (ctx == NULL) {
+        return (int32_t)-EFAULT;
+    }
+    if (nr == (uint32_t)MIPS32_NR_TRUNCATE_LOCAL) {
+        char     path[MIPS_PATH_MAX];
+        uint32_t path_va = mips_sc_arg(ctx, sp, 0, &ok);
+        int32_t  len     = (int32_t)mips_sc_arg(ctx, sp, 1, &ok);
+        int      fd;
+        int      rc;
+
+        if (!ok) {
+            return mips_sc_ret(ctx, -EFAULT);
+        }
+        if (len < 0) {
+            return mips_sc_ret(ctx, -EINVAL);
+        }
+        rc = mips_sc_read_cstr(ctx, path_va, path);
+        if (rc != 0) {
+            return mips_sc_ret(ctx, rc);
+        }
+        fd = open(path, O_WRONLY);
+        if (fd < 0) {
+            return mips_sc_ret(ctx, -(int32_t)errno);
+        }
+        rc = mips32_file_truncate_at(fd, (uint64_t)(int64_t)len);
+        (void)close(fd);
+        if (rc != 0) {
+            return mips_sc_ret(ctx, rc);
+        }
+        return mips_sc_ret(ctx, 0);
+    }
+    if (nr == (uint32_t)MIPS32_NR_FTRUNCATE_LOCAL) {
+        uint32_t fd  = mips_sc_arg(ctx, sp, 0, &ok);
+        int32_t  len = (int32_t)mips_sc_arg(ctx, sp, 1, &ok);
+        int      rc;
+
+        if (!ok) {
+            return mips_sc_ret(ctx, -EFAULT);
+        }
+        if (len < 0) {
+            return mips_sc_ret(ctx, -EINVAL);
+        }
+        rc = mips32_file_truncate_at((int)fd, (uint64_t)(int64_t)len);
+        if (rc != 0) {
+            return mips_sc_ret(ctx, rc);
+        }
+        return mips_sc_ret(ctx, 0);
+    }
+    return mips_sc_ret(ctx, -ENOSYS);
 }

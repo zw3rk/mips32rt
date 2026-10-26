@@ -20,6 +20,9 @@ static const int8_t kGprHost[32] = {
 static const uint8_t kCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
+/* RC-U3-R2 epoch page (src/os/mem.c): translation-time mapping
+ * guarantee for blocks that emit epoch-table accesses. */
+extern int mips_ll_epoch_ensure(mips32_ctx_t *ctx);
 int gpr_host(unsigned g) { return (g < 32U) ? (int)kGprHost[g] : -1; }
 /* Guest GPR value into a host register (cached host, wzr, or tmp load). */
 unsigned op_val(a64_buf_t *b, unsigned g, unsigned tmp)
@@ -655,7 +658,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         return 0;
     case MIPS_OP_LWL: case MIPS_OP_LWR: case MIPS_OP_SWL: case MIPS_OP_SWR:
         emit_ea(b, d->rs, d->simm);
-        emit_mem_unaligned(b, d, fpc, be);
+        emit_mem_unaligned(b, d, fpc, be, ind_slot);
         return 0;
     case MIPS_OP_LL: case MIPS_OP_SC:
         emit_ea(b, d->rs, d->simm);
@@ -707,7 +710,7 @@ static int slot_ok(const mips_dec_t *d)
     }
 }
 
-/* Frozen contract: insns[0..count) at guest pc into out[0..cap); a mid-block decline exits EXIT_UNDEF with *out_end past the prefix. */
+/* Frozen contract: insns[0..count) at guest pc into out[0..cap); a mid-block decline exits EXIT_UNDEF with *out_end past the prefix. RC-U3-R2: blocks containing guest-memory/LL/SC ops additionally ensure the shared epoch page is mapped (translation precedes execution). */
 int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
                  unsigned count, uint8_t *out, size_t cap,
                  size_t *out_len, uint32_t *out_end)
@@ -721,6 +724,22 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         cap < 4U || (cap & 3U) != 0U)
         return -1;
     be = mips_is_be(ctx);
+    /* RC-U3-R2: emitted memory/LL/SC sequences index the shared epoch
+     * table at G + 0xFFFF0000 via x20, so the page must be mapped
+     * before the block can run.  Translation precedes execution, hence
+     * this translation-time guarantee (best-effort: the C helpers
+     * degrade gracefully when the reservation fails).  Pure-ALU blocks
+     * skip it. */
+    for (i = 0U; i < count; i++) {
+        unsigned op = insns[i].op;
+
+        if ((op >= 0x20U && op <= 0x26U) || (op >= 0x28U && op <= 0x2BU) ||
+            op == 0x2EU || op == 0x30u || op == 0x38u || op == 0x31u ||
+            op == 0x35u || op == 0x39u || op == 0x3Du) {
+            (void)mips_ll_epoch_ensure(ctx);
+            break;
+        }
+    }
     a64_buf_init(&b, (uint32_t *)out, cap / 4U);
     emit_prologue(&b);
     cur = pc;

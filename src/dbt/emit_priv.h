@@ -25,6 +25,12 @@
 #define EMIT_FIXADE_OFFSET ((uint32_t)offsetof(mips32_ctx_t, fixade_enabled))
 #define EMIT_DELAY_TARGET_OFFSET \
     ((uint32_t)offsetof(mips32_ctx_t, delay_target))
+/* RC-U3-R2 LL epoch snapshot: low 8 bits in u3_pad[0] (struct layout
+ * untouched; see src/os/mem.c). */
+#define EMIT_LL_SEQ_OFFSET ((uint32_t)offsetof(mips32_ctx_t, u3_pad))
+/* Guest VA of the shared 16 KiB epoch page (G-relative, unmappable:
+ * above MIPS32_TASK_SIZE_TOP).  JIT forms Xtab = x20 + (OFF + idx*4). */
+#define EMIT_LL_EPOCH_OFFSET 0xFFFF0000u
 
 /* Register-cache core (src/dbt/emit_int.c). */
 int      gpr_host(unsigned g);
@@ -42,7 +48,7 @@ void emit_ea(a64_buf_t *b, unsigned rs, int32_t simm);
 void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
                       int be, int ind_slot);
 void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
-                        int be);
+                        int be, int ind_slot);
 void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot);
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,

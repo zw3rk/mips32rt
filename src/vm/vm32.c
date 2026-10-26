@@ -7,18 +7,18 @@
  * UNIFICATION-PLAN.md Rev 4 sections 4.3-4.6, 5.1: Regime A1
  * (H == 4096: the rt32 4 GiB window [G, G+4GiB) with x20 = G and the
  * 1-instruction [x20, wAddr, uxtw] lowering) vs Regime A2 (H > 4096:
- * a single MAP_PRIVATE arena with union host protections, x20 =
- * &ctx->tlb[0], and the 7-instruction Soft-TLB for every DBT access).
+ * x20 = &ctx->tlb[0], and the 7-instruction Soft-TLB for every DBT
+ * access).
  *
- * Why A2 fixes the four Dual-View defects (fable C1/C2/M3, astra#xhigh
- * #1-#4): the arena is MAP_PRIVATE so host fork() COW-isolates parent
- * and child with zero copying; the 16 KiB host page covering RELRO +
- * .data carries union PROT_READ|PROT_WRITE while the RELRO TLB
- * write_tag stays ~0ULL, so .data stores run at full speed with zero
- * SIGSEGV trap storms; permission checks happen in software at
- * instruction 6 (cbnz) before the host load/store, so a fault never
- * partially mutates guest state; every page has one coherent address
- * HVA = arena_base + gva shared by DBT, interp, futex, and syscalls.
+ * RC-U3-R2 single canonical backing: both regimes use the rt32 window
+ * [G, G+4GiB) as the one arena (vm_arena_base == guest_base, no
+ * separate reservation).  HVA = G + gva is the single coherent address
+ * shared by DBT, interp, futex, and syscalls, so Provider-A file bytes
+ * populated into G and the Soft-TLB addends can never disagree about
+ * where a guest page lives (the old separate A2 arena duplicated file
+ * content the mappings never read).  Permission checks still happen in
+ * software at instruction 6 (cbnz) before the host load/store, so a
+ * fault never partially mutates guest state.
  *
  * Pure C11.  No inline asm, never touches x18 (fixed registers are
  * installed by src/dbt/trampoline_a64.S only).
@@ -33,19 +33,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
 #include <unistd.h>
-
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
-/* macOS names it MAP_ANON; Linux MAP_ANONYMOUS. */
-#ifndef MAP_ANONYMOUS
-#ifdef MAP_ANON
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-#endif
 
 uint32_t mips32_vm_regime_for_host(size_t host_page_size)
 {
@@ -82,36 +70,6 @@ int32_t mips32_fixade_sysmips(mips32_ctx_t *ctx, uint32_t arg)
     return 0;
 }
 
-/*
- * Reserve one 4 GiB MAP_PRIVATE arena for Regime A2.  Returns the base
- * address or 0 on failure (the caller keeps the A1 window instead).
- */
-static uint64_t reserve_a2_arena(void)
-{
-    uint64_t base;
-    void *res;
-
-    for (base = 0x100000000ULL; base < 0x1000000000ULL; base += 0x100000000ULL) {
-        res = mmap((void *)(uintptr_t)base, 0x100000000ULL,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (res == MAP_FAILED && (errno == EINVAL || errno == EOPNOTSUPP)) {
-            res = mmap((void *)(uintptr_t)base, 0x100000000ULL,
-                       PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        }
-        if (res == MAP_FAILED) {
-            continue;
-        }
-        if ((uint64_t)(uintptr_t)res != base) {
-            (void)munmap(res, 0x100000000ULL);
-            continue;
-        }
-        return base;
-    }
-    return 0u;
-}
-
 static void tlb_invalidate_all(mips32_ctx_t *ctx)
 {
     mips32_tlb_entry_t *tlb;
@@ -130,11 +88,13 @@ static void tlb_invalidate_all(mips32_ctx_t *ctx)
 int mips32_vm32_init(mips32_ctx_t *ctx)
 {
     size_t host_page;
-    uint64_t arena;
 
     if (ctx == NULL) {
         return -EFAULT;
     }
+    /* RC-U3-R2: the arena is always the rt32 window itself (set by
+     * rt32_vm_init before this runs); there is no separate reservation
+     * to keep coherent.  A2 only adds the per-context Soft-TLB. */
     host_page = host_page_size();
     if (mips32_vm_regime_for_host(host_page) == MIPS32_VM_REGIME_A1) {
         ctx->vm_regime = MIPS32_VM_REGIME_A1;
@@ -146,18 +106,12 @@ int mips32_vm32_init(mips32_ctx_t *ctx)
         }
         return 0;
     }
-    /* Regime A2: MAP_PRIVATE arena + per-context Soft-TLB. */
-    arena = reserve_a2_arena();
-    if (arena == 0u) {
-        return -ENOMEM;
-    }
     ctx->vm_tlb = calloc(MIPS32_TLB_SIZE, sizeof(mips32_tlb_entry_t));
     if (ctx->vm_tlb == NULL) {
-        (void)munmap((void *)(uintptr_t)arena, 0x100000000ULL);
         return -ENOMEM;
     }
     ctx->vm_regime = MIPS32_VM_REGIME_A2;
-    ctx->vm_arena_base = arena;
+    ctx->vm_arena_base = ctx->guest_base;
     ctx->delay_target = 0u;
     if (ctx->fixade_enabled != 0u && ctx->fixade_enabled != 1u) {
         ctx->fixade_enabled = 1u;
