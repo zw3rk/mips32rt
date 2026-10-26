@@ -142,6 +142,16 @@ int guest_st8(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
     return 0;
 }
 
+/* Wave U3 (UNIFICATION-PLAN.md 4.3, fable M5): Linux MIPS TIF_FIXADE.
+ * fixade_enabled == 1 (the default) emulates unaligned integer
+ * loads/stores byte-wise in software; when cleared via
+ * sysmips(MIPS_FIXADE, 0) the next misaligned access faults so the
+ * signal layer delivers guest SIGBUS/BUS_ADRALN. */
+static int fixade_on(const mips32_ctx_t *ctx)
+{
+    return ctx != NULL && ctx->fixade_enabled != 0u;
+}
+
 int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     uint8_t b[2];
@@ -150,8 +160,25 @@ int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
         return MIPS_FAULT;
     }
     if ((va & 1U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        uint32_t lo = 0u;
+        uint32_t hi = 0u;
+
+        if (!fixade_on(ctx)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        memcpy(&lo, mips32_guest_ptr(ctx, va), 1U);
+        memcpy(&hi, mips32_guest_ptr(ctx, va + 1U), 1U);
+        if (mips_is_be(ctx)) {
+            *out = (lo << 8) | hi;
+        } else {
+            *out = lo | (hi << 8);
+        }
+        return 0;
     }
     if (!range_covered(ctx, va, 2U, (uint32_t)PROT_READ)) {
         mips_fault(ctx, va);
@@ -174,8 +201,25 @@ int guest_st16(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         return MIPS_FAULT;
     }
     if ((va & 1U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        uint8_t p[2];
+
+        if (!fixade_on(ctx)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (mips_is_be(ctx)) {
+            p[0] = (uint8_t)((val >> 8) & 0xFFU);
+            p[1] = (uint8_t)(val & 0xFFU);
+        } else {
+            p[0] = (uint8_t)(val & 0xFFU);
+            p[1] = (uint8_t)((val >> 8) & 0xFFU);
+        }
+        memcpy(mips32_guest_ptr(ctx, va), p, 2U);
+        return 0;
     }
     if (!range_covered(ctx, va, 2U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);
@@ -200,8 +244,25 @@ int guest_ld32(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
         return MIPS_FAULT;
     }
     if ((va & 3U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        uint8_t q[4];
+
+        if (!fixade_on(ctx)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        memcpy(q, mips32_guest_ptr(ctx, va), 4U);
+        if (mips_is_be(ctx)) {
+            *out = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) |
+                   ((uint32_t)q[2] << 8) | (uint32_t)q[3];
+        } else {
+            *out = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
+                   ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+        }
+        return 0;
     }
     if (!range_covered(ctx, va, 4U, (uint32_t)PROT_READ)) {
         mips_fault(ctx, va);
@@ -226,8 +287,29 @@ int guest_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t val)
         return MIPS_FAULT;
     }
     if ((va & 3U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        uint8_t q[4];
+
+        if (!fixade_on(ctx)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+            mips_fault(ctx, va);
+            return MIPS_FAULT;
+        }
+        if (mips_is_be(ctx)) {
+            q[0] = (uint8_t)((val >> 24) & 0xFFU);
+            q[1] = (uint8_t)((val >> 16) & 0xFFU);
+            q[2] = (uint8_t)((val >> 8) & 0xFFU);
+            q[3] = (uint8_t)(val & 0xFFU);
+        } else {
+            q[0] = (uint8_t)(val & 0xFFU);
+            q[1] = (uint8_t)((val >> 8) & 0xFFU);
+            q[2] = (uint8_t)((val >> 16) & 0xFFU);
+            q[3] = (uint8_t)((val >> 24) & 0xFFU);
+        }
+        memcpy(mips32_guest_ptr(ctx, va), q, 4U);
+        return 0;
     }
     if (!range_covered(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
         mips_fault(ctx, va);

@@ -178,6 +178,23 @@ typedef struct mips32_ctx {
     uint64_t blocks_compiled;
     uint64_t icache_flushes;
     uint64_t wx_transitions;
+
+    /* ---- Wave U3 tail (Regime A1/A2 + TIF_FIXADE + dynamic delay) ----
+     * Appended only (SPEC 2.1 locked prefix above is untouched):
+     * fixade_enabled mirrors Linux MIPS TIF_FIXADE (default 1: the
+     * interp/DBT emulate unaligned integer loads/stores in software;
+     * sysmips(MIPS_FIXADE, 0) clears it so the next misaligned access
+     * delivers guest SIGBUS/BUS_ADRALN).  delay_target records the
+     * JR/JALR indirect target for RT_NPC_DYNAMIC_CTX recovery.
+     * vm_regime selects A1 (direct window) vs A2 (Soft-TLB arena);
+     * vm_arena_base is the canonical arena base and vm_tlb the
+     * 4096-entry Soft-TLB (NULL in A1). */
+    uint8_t fixade_enabled;
+    uint8_t u3_pad[3];
+    uint32_t delay_target;
+    uint32_t vm_regime;
+    uint64_t vm_arena_base;
+    void *vm_tlb;
 } mips32_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */

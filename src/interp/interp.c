@@ -741,6 +741,10 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     case 0x00u: /* JR / JALR */
         taken = 1;
         target = rs;
+        /* Wave U3 RT_NPC_DYNAMIC_CTX: record the indirect target so a
+         * fault inside the delay slot can recover guest_npc from
+         * ctx->delay_target (UNIFICATION-PLAN.md 4.3). */
+        ctx->delay_target = rs;
         if (d->funct == 0x09u) {
             link = 1;
             link_rd = d->rd;
