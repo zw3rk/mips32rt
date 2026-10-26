@@ -278,11 +278,13 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_ll_unlock(b);
         return;
     case MIPS_OP_SH: case MIPS_OP_SW:
+        /* The alignment guard runs first: on a misaligned exit the
+         * lock must never be taken (its RET paths skip unlock). */
+        emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc,
+                         ind_slot);
         emit_ll_lock(b);
         /* TMP2: the check below clobbers TMP1. */
         v = op_val(b, rt, A64_TMP2);
-        emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc,
-                         ind_slot);
         if (be == 0) {
             if (d->op == MIPS_OP_SH) {
                 a64_emit_guest_strh_w(b, v, A64_ADDR);
@@ -337,6 +339,11 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
     size_t ph_cbz[3], ph_end[3];
 
     emit_sync_pc(b, fpc, ind_slot);
+    /* Lock before the k dispatch so every offset path (0-3) holds it;
+     * acquiring inside the loop body would let offsets 0-2 skip it. */
+    if (is_load == 0) {
+        emit_ll_lock(b);
+    }
     a64_emit_ubfm_w(b, A64_TMP1, A64_ADDR, 0U, 1U);
     a64_emit_shift_imm_w(b, A64_TMP3, A64_ADDR, A64_SHIFT_LSR, 2U, false,
                          NULL);
@@ -347,9 +354,6 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         a64_emit_sub_imm_w(b, true, A64_TMP1, A64_TMP1, 1U, 0U);
     }
     /* k=3,0,1,2: fall-through enters k=3. */
-    if (is_load == 0) {
-        emit_ll_lock(b);
-    }
     for (o = 0U, k = 3U; o < 4U; o++, k = (o == 1U) ? 0U : k + 1U) {
         if (k < 3U) {
             a64_patch_cbz_w(b, ph_cbz[k], b->count);
@@ -445,7 +449,9 @@ void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
  * (no LDXR/STXR retry loop is needed once stores are serialized).
  * Register plan: data in TMP3-or-mapped (untouched), A64_ADDR holds
  * the guest VA into the epoch verify, X24 the host address from then
- * on; TMP1/TMP2/X16/X17/W30 are scratch. */
+ * on; TMP1/TMP2/X16/X17 are scratch (never x30: it holds the return
+ * address across emitted blocks). The snapshot load reuses X16 after
+ * the entry address is dead; the bump recomputes it. */
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot)
 {
@@ -487,9 +493,9 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     a64_emit_ldr_imm_x(b, A64_TMP2, A64_TMP1, 0U);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_SEQ_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
-    a64_emit_ldr_imm_x(b, 30U, A64_TMP1, 0U);
-    a64_emit_eor_reg_x(b, A64_TMP2, A64_TMP2, 30U);
-    ph_fail4 = a64_emit_cbz_x_placeholder(b, true, A64_TMP2);
+    a64_emit_ldr_imm_x(b, A64_TMP1, A64_TMP1, 0U);
+    a64_emit_eor_reg_x(b, A64_TMP2, A64_TMP2, A64_TMP1);
+    ph_fail4 = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
     if (be != 0) {
         a64_emit_rev_w(b, A64_TMP3, data);
         data = A64_TMP3;
