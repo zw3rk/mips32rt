@@ -118,20 +118,21 @@ static void emit_epoch_record(a64_buf_t *b, unsigned addr_w)
     a64_emit_str_imm_x(b, A64_TMP2, A64_TMP1, 0U);
 }
 
-/* W30 is the lock status scratch: no emitted code reads or writes x30
- * (verified by grep; the trampoline saves/restores it around
- * run_block), so lock/unlock sequences may clobber it freely. */
-#define LL_SPIN_STATUS 30U
-
-/* Acquire the LL exclusion spinlock: X16 = &lock; LDXR W17;
- * empty -> STXR #1 (status in W30); repeat while taken or the
- * store fails. Clobbers X16/W17/W30; everything else survives. */
+/* Lock protocol (RC-U3-r4): the spinlock word lives at G +
+ * EMIT_LL_LOCK_OFFSET and the owning ctx at +8 (see src/os/mem.c).
+ * Both engines lock the same word: LDXR/STXR here, C11 atomics
+ * there. W30/x30 is NEVER touched (it holds the return address
+ * across emitted blocks); X21 is spilled to an explicitly allocated
+ * stack slot instead (async-signal-safe: never the red zone).
+ * Clobbers X16/W17/X21 inside; everything else survives. */
 static void emit_ll_lock(a64_buf_t *b)
 {
     size_t retry;
     size_t ph_taken;
     size_t ph_fail;
 
+    a64_emit_sub_imm_x(b, false, 31U, 31U, 16U, 0U);
+    a64_emit_str_imm_x(b, A64_TMP3, 31U, 0U);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_LOCK_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
     retry = b->count;
@@ -139,18 +140,23 @@ static void emit_ll_lock(a64_buf_t *b)
     ph_taken = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
     a64_patch_cbz_w(b, ph_taken, retry);
     a64_emit_mov_imm32(b, A64_TMP2, 1U);
-    a64_emit_stxr_w(b, LL_SPIN_STATUS, A64_TMP2, A64_TMP1);
-    ph_fail = a64_emit_cbz_w_placeholder(b, true, LL_SPIN_STATUS);
+    a64_emit_stxr_w(b, A64_TMP3, A64_TMP2, A64_TMP1);
+    ph_fail = a64_emit_cbz_w_placeholder(b, true, A64_TMP3);
     a64_patch_cbz_w(b, ph_fail, retry);
+    a64_emit_str_imm_x(b, A64_XCTX, A64_TMP1, 8U);
     a64_emit_dmb_ish(b);
+    a64_emit_ldr_imm_x(b, A64_TMP3, 31U, 0U);
+    a64_emit_add_imm_x(b, false, 31U, 31U, 16U, 0U);
 }
 
-/* Release the LL spinlock. No register clobbers beyond DMB ordering. */
+/* Release: clear owner, then the lock word, with release ordering.
+ * Recomputes its address locally; X16 is the only scratch used. */
 static void emit_ll_unlock(a64_buf_t *b)
 {
-    a64_emit_dmb_ish(b);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_LOCK_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
+    a64_emit_dmb_ish(b);
+    a64_emit_str_imm_x(b, A64_ZR, A64_TMP1, 8U);
     a64_emit_str_imm_w(b, A64_ZR, A64_TMP1, 0U);
 }
 

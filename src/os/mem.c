@@ -47,50 +47,100 @@
  * never wrap in practice, closing the 8-bit wraparound hole. */
 #define MIPS32_LL_EPOCH_GVA   0xFFFF0000u
 #define MIPS32_LL_EPOCH_WORDS 4096u
-#define MIPS32_LL_EPOCH_BYTES (4096u * 8u + 8u)
+#define MIPS32_LL_EPOCH_BYTES (4096u * 8u + 16u)
 #define MIPS32_LL_LOCK_OFFSET (4096u * 8u)
+#define MIPS32_LL_OWNER_OFFSET (4096u * 8u + 8u)
 
-/* LL/SC exclusion: every store's epoch bump and every SC
- * check-and-store run under this spinlock, so an intervening same-value
- * store cannot slip between the SC's verification and its commit.
- * Taken only around short reservation ops, never across syscalls.
- * mips_ll_abandon lets the host-fault handler release it when a fault
- * abandons a block mid-critical-section (the faulting thread always
- * owns it then, so no live holder is disturbed). */
-/* Static zero-initialization is the clear state per C11; this avoids
- * SDKs whose <stdatomic.h> omits ATOMIC_FLAG_INITIALIZER. */
-static atomic_flag mips_ll_spin;
-static _Atomic(uintptr_t) mips_ll_owner;
+static _Atomic uint64_t *ll_epoch_table(mips32_ctx_t *ctx);
+
+/* LL/SC exclusion: the lock word and owning ctx live in the shared
+ * epoch mapping itself (lock at table index 4096, owner at 4097), so the
+ * C engine and inline DBT sequences serialize on the SAME word
+ * (disjoint locks do not mutually exclude). Every store's epoch bump
+ * and every SC check-and-store run under it, so an intervening
+ * same-value store cannot slip between the SC's verification and its
+ * commit. Taken only around short reservation ops, never across
+ * syscalls. mips_ll_abandon releases the lock for the faulting ctx
+ * when a host fault abandons a block mid-critical-section (the owner
+ * slot proves the faulting thread holds it, so a live holder is never
+ * disturbed). */
+static _Atomic uint32_t *mips_ll_lockword(mips32_ctx_t *ctx)
+{
+    _Atomic uint64_t *tab;
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        return NULL;
+    }
+    return (_Atomic uint32_t *)(void *)&tab[4096u];
+}
+
+static _Atomic uint64_t *mips_ll_ownerword(mips32_ctx_t *ctx)
+{
+    _Atomic uint64_t *tab;
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+    tab = ll_epoch_table(ctx);
+    if (tab == NULL) {
+        return NULL;
+    }
+    return &tab[4097u];
+}
 
 void mips_ll_lock(mips32_ctx_t *ctx)
 {
-    while (atomic_flag_test_and_set_explicit(&mips_ll_spin,
-        memory_order_acquire)) {
+    _Atomic uint32_t *w = mips_ll_lockword(ctx);
+    _Atomic uint64_t *o;
+
+    if (w == NULL) {
+        return;
     }
-    atomic_store_explicit(&mips_ll_owner, (uintptr_t)ctx,
-        memory_order_relaxed);
+    while (atomic_exchange_explicit(w, 1u, memory_order_acquire) != 0u) {
+    }
+    o = mips_ll_ownerword(ctx);
+    if (o != NULL) {
+        atomic_store_explicit(o, (uint64_t)(uintptr_t)ctx,
+                              memory_order_relaxed);
+    }
 }
 
 void mips_ll_unlock(mips32_ctx_t *ctx)
 {
-    (void)ctx;
-    atomic_store_explicit(&mips_ll_owner, (uintptr_t)0,
-        memory_order_relaxed);
-    atomic_flag_clear_explicit(&mips_ll_spin, memory_order_release);
+    _Atomic uint32_t *w = mips_ll_lockword(ctx);
+    _Atomic uint64_t *o = mips_ll_ownerword(ctx);
+
+    if (o != NULL) {
+        atomic_store_explicit(o, (uint64_t)0u, memory_order_relaxed);
+    }
+    if (w != NULL) {
+        atomic_store_explicit(w, 0u, memory_order_release);
+    }
 }
 
 void mips_ll_abandon(mips32_ctx_t *ctx)
 {
-    if (ctx != NULL &&
-        atomic_load_explicit(&mips_ll_owner,
-            memory_order_relaxed) == (uintptr_t)ctx) {
-        atomic_store_explicit(&mips_ll_owner, (uintptr_t)0,
-            memory_order_relaxed);
-        atomic_flag_clear_explicit(&mips_ll_spin, memory_order_release);
+    _Atomic uint64_t *o = mips_ll_ownerword(ctx);
+    _Atomic uint32_t *w;
+
+    if (ctx == NULL || o == NULL) {
+        return;
+    }
+    if (atomic_load_explicit(o, memory_order_relaxed) !=
+        (uint64_t)(uintptr_t)ctx) {
+        return;
+    }
+    atomic_store_explicit(o, (uint64_t)0u, memory_order_relaxed);
+    w = mips_ll_lockword(ctx);
+    if (w != NULL) {
+        atomic_store_explicit(w, 0u, memory_order_relaxed);
     }
 }
 
-/* Locked guest store (defined below; used by the guest_st* family). */
 static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
     const void *src, uint32_t len);
 

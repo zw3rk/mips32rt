@@ -78,6 +78,14 @@ void a64_emit_add_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn
                     ((rn_x & 31U) << 5) | (rd_x & 31U));
 }
 
+void a64_emit_sub_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn_x,
+                        uint32_t imm12, unsigned sh)
+{
+    uint32_t s = set_flags ? (1U << 29) : 0U;
+    a64_emit(b, 0xD1000000U | s | ((sh & 1U) << 22) | ((imm12 & 0xFFFU) << 10) |
+                    ((rn_x & 31U) << 5) | (rd_x & 31U));
+}
+
 void a64_emit_sub_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn,
                         uint16_t imm12, unsigned sh)
 {

@@ -123,6 +123,7 @@ static inline uint32_t rt32_ror32(uint32_t val, unsigned rot)
 /* Arithmetic (32-bit W) */
 void a64_emit_add_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
 void a64_emit_add_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn_x, uint32_t imm12, unsigned sh);
+void a64_emit_sub_imm_x(a64_buf_t *b, bool set_flags, unsigned rd_x, unsigned rn_x, uint32_t imm12, unsigned sh);
 void a64_emit_sub_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
 void a64_emit_add_reg_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, unsigned rm, unsigned shift, unsigned amount);
 void a64_emit_sub_reg_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, unsigned rm, unsigned shift, unsigned amount);
