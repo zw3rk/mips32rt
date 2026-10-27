@@ -17,10 +17,17 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __linux__
 #include <sys/random.h>
+#endif
 #include <unistd.h>
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 #define RT32_STACK_TOP  0x7FFF0000U
 #define RT32_STACK_SIZE (8U * 1024U * 1024U)
@@ -117,11 +124,19 @@ int rt32_stack_setup(mips32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     uint32_t sp = RT32_STACK_TOP - 64U;
 
     uint8_t rand_bytes[16];
+#ifdef __APPLE__
+    arc4random_buf(rand_bytes, sizeof(rand_bytes));
+#elif defined(__linux__)
     if (getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes)) {
         for (size_t i = 0; i < sizeof(rand_bytes); i++) {
             rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
         }
     }
+#else
+    for (size_t i = 0; i < sizeof(rand_bytes); i++) {
+        rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
+    }
+#endif
     uint32_t at_random_va = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
     const char *execfn_str = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];
     uint32_t at_execfn_va = push_cstring(ctx, &sp, execfn_str);

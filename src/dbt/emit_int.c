@@ -479,9 +479,8 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
             return 0;
         }
         dst = op_val(b, d->rt, A64_TMP2);
-        if (dst != A64_TMP1) a64_emit_mov_w(b, A64_TMP1, dst);
-        a64_emit_bfm_w(b, A64_TMP1, src, (32U - lsb) & 31U, size - 1U);
-        put_rd(b, d->rt, A64_TMP1);
+        a64_emit_bfm_w(b, dst, src, (32U - lsb) & 31U, size - 1U);
+        put_rd(b, d->rt, dst);
         return 0;
     case 0x20U: /* BSHFL: source is rt (rs is unused, always $0). */
         src = op_val(b, d->rt, A64_TMP1);

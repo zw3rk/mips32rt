@@ -462,6 +462,8 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
     case MIPS32_NR_nanosleep:
     case MIPS32_NR_clock_gettime:
     case MIPS32_NR_clock_gettime64:
+    case MIPS32_NR_getpid:
+    case MIPS32_NR_getppid:
     case MIPS32_NR_getuid:
     case MIPS32_NR_geteuid:
     case MIPS32_NR_getgid:

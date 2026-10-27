@@ -586,13 +586,40 @@ int32_t mips_sc_clock_gettime(mips32_ctx_t *ctx, uint32_t sp, int wide)
     int             ok = 1;
     uint32_t        clk;
     uint32_t        ts_va;
+    clockid_t       host_clk;
 
     clk   = mips_sc_arg(ctx, sp, 0, &ok);
     ts_va = mips_sc_arg(ctx, sp, 1, &ok);
     if (!ok) {
         return mips_sc_ret(ctx, -EFAULT);
     }
-    if (clock_gettime((clockid_t)clk, &ts) != 0) {
+#ifdef __APPLE__
+    switch (clk) {
+    case 0U:
+    case 5U:
+        host_clk = CLOCK_REALTIME;
+        break;
+    case 1U:
+    case 6U:
+    case 7U:
+        host_clk = CLOCK_MONOTONIC;
+        break;
+    case 2U:
+        host_clk = CLOCK_PROCESS_CPUTIME_ID;
+        break;
+    case 3U:
+        host_clk = CLOCK_THREAD_CPUTIME_ID;
+        break;
+    case 4U:
+        host_clk = CLOCK_MONOTONIC_RAW;
+        break;
+    default:
+        return mips_sc_ret(ctx, -EINVAL);
+    }
+#else
+    host_clk = (clockid_t)clk;
+#endif
+    if (clock_gettime(host_clk, &ts) != 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
     }
     if (mips_sc_write_ts(ctx, ts_va, &ts, wide) != 0) {

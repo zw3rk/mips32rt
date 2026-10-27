@@ -782,7 +782,19 @@ static int proc_synth_fd(const char *tag, const void *data, unsigned long len,
     if (((flags & O_ACCMODE) != O_RDONLY) || ((flags & O_TRUNC) != 0)) {
         return -EACCES;
     }
+#ifdef __linux__
     fd = memfd_create(tag, (flags & O_CLOEXEC) != 0 ? MFD_CLOEXEC : 0);
+#else
+    (void)tag;
+    char tmpl[] = "/tmp/mips32rt-proc-XXXXXX";
+    fd = mkstemp(tmpl);
+    if (fd >= 0) {
+        (void)unlink(tmpl);
+        if ((flags & O_CLOEXEC) != 0) {
+            (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+    }
+#endif
     if (fd < 0) {
         return -errno;
     }

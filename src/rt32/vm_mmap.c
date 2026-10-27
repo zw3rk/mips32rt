@@ -20,6 +20,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 /* Provider A hook (src/vm/vm_file.c): declared locally so vm32.h stays
  * untouched.  Mirrors private file bytes into the A2 arena. */
@@ -88,12 +93,46 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
     int   host_prot   = mips32_host_prot(ctx, prot);
     void *host_target = mips32_guest_ptr(ctx, target_va);
     off_t host_off    = (off_t)pgoffset * (off_t)MIPS32_PAGE_SIZE;
+#ifdef __APPLE__
+    uint32_t h_start = target_va & ~0x3FFFU;
+    uint32_t h_end   = ((uint32_t)((uint64_t)target_va + aligned_len) + 0x3FFFU) & ~0x3FFFU;
+    if ((target_va & 0x3FFFU) == 0U && (aligned_len & 0x3FFFULL) == 0ULL &&
+        ((host_flags & MAP_ANONYMOUS) != 0 || (host_off & 0x3FFF) == 0)) {
+        void *res = mmap(host_target, (size_t)aligned_len, host_prot,
+                         host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
+                         (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
+        if (res == MAP_FAILED) {
+            return (uint32_t)(-errno);
+        }
+    } else {
+        if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
+                     PROT_READ | PROT_WRITE) != 0) {
+            return (uint32_t)(-errno);
+        }
+        memset(host_target, 0, (size_t)aligned_len);
+        if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
+            uint8_t *dst = (uint8_t *)host_target;
+            size_t rem = (size_t)aligned_len;
+            off_t cur_off = host_off;
+            while (rem > 0U) {
+                ssize_t n = pread(fd, dst, rem, cur_off);
+                if (n <= 0) {
+                    break;
+                }
+                dst += (size_t)n;
+                rem -= (size_t)n;
+                cur_off += (off_t)n;
+            }
+        }
+    }
+#else
     void *res = mmap(host_target, (size_t)aligned_len, host_prot,
                      host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
                      (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
     if (res == MAP_FAILED) {
         return (uint32_t)(-errno);
     }
+#endif
 
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
@@ -151,9 +190,21 @@ static int vm_mprotect_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, ui
         return -ENOMEM;
     }
 
+#ifdef __APPLE__
+    uint32_t h_start = addr & ~0x3FFFU;
+    uint32_t h_end   = ((uint32_t)end64 + 0x3FFFU) & ~0x3FFFU;
+    int      h_prot  = mips32_host_prot(ctx, prot);
+    if ((addr & 0x3FFFU) != 0U || (end64 & 0x3FFFULL) != 0ULL) {
+        h_prot |= PROT_READ | PROT_WRITE;
+    }
+    if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start), h_prot) != 0) {
+        return -errno;
+    }
+#else
     if (mprotect(mips32_guest_ptr(ctx, addr), (size_t)aligned_len, mips32_host_prot(ctx, prot)) != 0) {
         return -errno;
     }
+#endif
 
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     return 0;

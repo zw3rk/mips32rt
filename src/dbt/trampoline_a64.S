@@ -12,6 +12,9 @@
 
 .text
 .p2align 2
+#ifdef __APPLE__
+.globl _dbt_trampoline_enter
+#endif
 .globl dbt_trampoline_enter
 
 /* uint32_t dbt_trampoline_enter(mips32_ctx_t *ctx, void *code);
@@ -20,6 +23,9 @@
  * (MIPS32_EXIT_*), w1 = exit info, ctx->pc already advanced.  The block
  * preserves x19/x20/x29; all other AAPCS callee-saved state is owned
  * here. */
+#ifdef __APPLE__
+_dbt_trampoline_enter:
+#endif
 dbt_trampoline_enter:
     stp x29, x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!

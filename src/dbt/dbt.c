@@ -23,10 +23,17 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE 1
+#endif
 
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 
 #ifndef MAP_ANONYMOUS
 #ifdef MAP_ANON
@@ -132,7 +139,7 @@ static int dbt_is_control(const mips_dec_t *d)
 }
 
 /* True for likely branches (delay slot annulled when not taken, SPEC 2.2). */
-static int dbt_is_likely(const mips_dec_t *d)
+__attribute__((unused)) static int dbt_is_likely(const mips_dec_t *d)
 {
     switch (d->op) {
     case DBT_OP_BEQL:
@@ -211,8 +218,14 @@ static int dbt_pool_ensure(mips32_ctx_t *ctx)
     if (dbt_cache->pool != NULL) {
         return 0;
     }
+#ifdef __APPLE__
+    dbt_cache->pool = (uint8_t *)mmap(NULL, DBT_CODE_POOL_SIZE,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+#else
     dbt_cache->pool = (uint8_t *)mmap(NULL, DBT_CODE_POOL_SIZE,
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
     return dbt_cache->pool == MAP_FAILED ? -1 : 0;
 }
 
@@ -465,8 +478,6 @@ static void dbt_ras_push(uint32_t pc)
 static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
 {
     uintptr_t base;
-    uintptr_t start;
-    uintptr_t end;
     void *dst;
 
     (void)ctx;
@@ -479,16 +490,25 @@ static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
     }
     base = (uintptr_t)dbt_cache->pool;
     dst = (void *)(base + dbt_cache->pool_used);
-    start = base & ~(uintptr_t)4095U;
-    end = (base + dbt_cache->pool_used + len + 4095U) & ~(uintptr_t)4095U;
-    if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
-        return NULL;
-    }
+#ifdef __APPLE__
+    pthread_jit_write_protect_np(0);
     memcpy(dst, bytes, len);
-    if (mprotect((void *)start, end - start, PROT_READ | PROT_EXEC) != 0) {
-        return NULL;
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(dst, len);
+#else
+    {
+        uintptr_t start = base & ~(uintptr_t)4095U;
+        uintptr_t end = (base + dbt_cache->pool_used + len + 4095U) & ~(uintptr_t)4095U;
+        if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
+            return NULL;
+        }
+        memcpy(dst, bytes, len);
+        if (mprotect((void *)start, end - start, PROT_READ | PROT_EXEC) != 0) {
+            return NULL;
+        }
+        __builtin___clear_cache((char *)dst, (char *)dst + len);
     }
-    __builtin___clear_cache((char *)dst, (char *)dst + len);
+#endif
     dbt_cache->pool_used += len;
     ctx->wx_transitions++;
     ctx->icache_flushes++;

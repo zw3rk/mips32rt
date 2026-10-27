@@ -20,7 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/auxv.h>
+#endif
 
 #include "mips32rt.h"
 #include "rt32/rt32.h"
@@ -83,6 +85,7 @@ static void usage(FILE *out)
  * errno after getauxval, never by comparing the value against 0. */
 static int auxv_exec_fd(void)
 {
+#ifdef __linux__
     unsigned long v;
 
     errno = 0;
@@ -94,6 +97,9 @@ static int auxv_exec_fd(void)
         return -1;
     }
     return (int)v;
+#else
+    return -1;
+#endif
 }
 
 static int parse_engine(const char *s, int *out)
@@ -118,6 +124,9 @@ static int parse_args(mips32_ctx_t *ctx, int argc, char **argv,
     int i = 1;
 
     while (i < argc && strcmp(argv[i], "--") != 0) {
+        if (argv[i][0] != '-') {
+            return i;
+        }
         if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);
             exit(0);
@@ -189,7 +198,7 @@ static int parse_args(mips32_ctx_t *ctx, int argc, char **argv,
         i += 2;
     }
 
-    if (i >= argc) {
+    if (i >= argc || i + 1 >= argc) {
         return -1; /* missing "-- PATH" */
     }
     return i + 1; /* first token after "--" */
@@ -297,7 +306,7 @@ static int run_guest(mips32_ctx_t *ctx, int exec_fd)
     ctx->fr_mode = 0U;
 
     if (ctx->engine < 0) {
-        ctx->engine = MIPS32_ENGINE_INTERP; /* default oracle (Phase 1) */
+        ctx->engine = MIPS32_ENGINE_DBT;
     }
     if (ctx->difftest_enabled && ctx->engine != MIPS32_ENGINE_DBT) {
         (void)fprintf(stderr, "mips32rt: --difftest needs the DBT engine (Phase 2)\n");

@@ -34,6 +34,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#ifdef MAP_ANON
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
 /* RC-U3-R2/R3 shared LL/SC epoch table: 4096 64-bit generations at the
  * unmappable guest address MIPS32_LL_EPOCH_GVA (above
  * MIPS32_TASK_SIZE_TOP, so no guest mapping can alias it and the
@@ -337,6 +343,12 @@ int mips_ll_epoch_ensure(mips32_ctx_t *ctx)
     }
     tab = (void *)(uintptr_t)(ctx->guest_base +
                               (uint64_t)MIPS32_LL_EPOCH_GVA);
+#ifdef __APPLE__
+    (void)res;
+    if (mprotect(tab, 0xC000u, PROT_READ | PROT_WRITE) != 0) {
+        return 0;
+    }
+#else
     res = mmap(tab, (size_t)MIPS32_LL_EPOCH_BYTES,
                PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -346,6 +358,7 @@ int mips_ll_epoch_ensure(mips32_ctx_t *ctx)
         }
         return 0;
     }
+#endif
     memset(tab, 0, (size_t)MIPS32_LL_EPOCH_BYTES);
     atomic_store_explicit(&ll_epoch_mapped_base, ctx->guest_base,
                           memory_order_relaxed);

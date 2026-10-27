@@ -638,6 +638,8 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fp_exec(ctx, cur_pc, d);
         }
         return 0;
+    case 0x13u: /* COP1X: MADD/MSUB/NMADD/NMSUB */
+        return fp_exec(ctx, cur_pc, d);
     case 0x2Fu: /* CACHE */
     case 0x33u: /* PREF */
         return 0;

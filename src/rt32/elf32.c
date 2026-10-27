@@ -24,6 +24,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 #define EI_NIDENT    16U
 #define EI_CLASS     4U
 #define EI_DATA      5U
@@ -131,12 +135,30 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
 static int protect_and_record_seg(mips32_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
+    rt32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
+#ifdef __APPLE__
+    uint32_t h_start = start & ~0x3FFFU;
+    uint32_t h_end   = (end + 0x3FFFU) & ~0x3FFFU;
+    for (uint32_t p = h_start; p < h_end; p += 0x4000U) {
+        uint32_t u_prot = guest_prot;
+        for (size_t r = 0U; r < ctx->region_count; r++) {
+            if (ctx->regions[r].start < p + 0x4000U && ctx->regions[r].end > p) {
+                u_prot |= ctx->regions[r].prot;
+            }
+        }
+        if (mprotect(mips32_guest_ptr(ctx, p), 0x4000U, mips32_host_prot(ctx, u_prot)) != 0) {
+            fprintf(stderr, "mips32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                    label, p, p + 0x4000U, strerror(errno));
+            return -1;
+        }
+    }
+#else
     if (mprotect(mips32_guest_ptr(ctx, start), end - start, mips32_host_prot(ctx, guest_prot)) != 0) {
         fprintf(stderr, "mips32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                 label, start, end, strerror(errno));
         return -1;
     }
-    rt32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
+#endif
     return 0;
 }
 
@@ -361,8 +383,14 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
         uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
         uint32_t merged_prot = highest_mapped_prot | guest_prot;
         if (page_start < map_start) {
+#ifdef __APPLE__
+            uint32_t hs = page_start & ~0x3FFFU;
+            uint32_t he = (shared_end + 0x3FFFU) & ~0x3FFFU;
+            if (mprotect(mips32_guest_ptr(ctx, hs), he - hs, PROT_READ | PROT_WRITE) != 0) {
+#else
             if (mprotect(mips32_guest_ptr(ctx, page_start), shared_end - page_start,
                          PROT_READ | PROT_WRITE) != 0) {
+#endif
                 fprintf(stderr, "mips32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
                 return -1;
@@ -370,6 +398,16 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
         }
 
         if (map_end > map_start) {
+#ifdef __APPLE__
+            uint32_t hs = map_start & ~0x3FFFU;
+            uint32_t he = (map_end + 0x3FFFU) & ~0x3FFFU;
+            if (mprotect(mips32_guest_ptr(ctx, hs), he - hs, PROT_READ | PROT_WRITE) != 0) {
+                fprintf(stderr, "mips32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                        label, map_start, map_end, strerror(errno));
+                return -1;
+            }
+            memset(mips32_guest_ptr(ctx, map_start), 0, map_end - map_start);
+#else
             void *res = mmap(mips32_guest_ptr(ctx, map_start), map_end - map_start,
                              PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -378,6 +416,7 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
                         label, map_start, map_end, strerror(errno));
                 return -1;
             }
+#endif
         }
 
         uint32_t read_file_off = ph->p_offset;

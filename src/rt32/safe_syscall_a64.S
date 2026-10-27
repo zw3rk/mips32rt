@@ -15,6 +15,12 @@
 
 .text
 .p2align 2
+#ifdef __APPLE__
+.globl _mips32_safe_syscall6
+.globl _mips32_safe_syscall_window_begin
+.globl _mips32_safe_syscall_post_svc
+.globl _mips32_safe_syscall_abort
+#endif
 .globl mips32_safe_syscall6
 .globl mips32_safe_syscall_window_begin
 .globl mips32_safe_syscall_post_svc
@@ -24,6 +30,10 @@
  *                           const _Atomic uint32_t *gen, uint32_t expected);
  * x0 = nr, x1 = args, x2 = gen, x3 = expected (w).  Returns the raw
  * kernel result (negative errno style, as from SVC). */
+#ifdef __APPLE__
+_mips32_safe_syscall6:
+_mips32_safe_syscall_window_begin:
+#endif
 mips32_safe_syscall6:
 mips32_safe_syscall_window_begin:
     ldar w9, [x2]
@@ -35,8 +45,14 @@ mips32_safe_syscall_window_begin:
     ldp x2, x3, [x9, #16]
     ldp x4, x5, [x9, #32]
     svc #0
+#ifdef __APPLE__
+_mips32_safe_syscall_post_svc:
+#endif
 mips32_safe_syscall_post_svc:
     ret
+#ifdef __APPLE__
+_mips32_safe_syscall_abort:
+#endif
 mips32_safe_syscall_abort:
     mov x0, #-4                 /* -EINTR: interrupted before the commit */
     ret

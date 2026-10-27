@@ -113,7 +113,9 @@
 
 #define MIPS_THREAD_STACK_SIZE (2U * 1024U * 1024U)
 
+#if defined(__linux__)
 static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status);
+#endif
 
 struct mips_thread {
     mips32_ctx_t ctx;

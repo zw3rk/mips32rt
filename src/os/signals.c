@@ -51,6 +51,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 /* ---- MIPS signal numbers (UAPI asm/signal.h) ---- */
 #define L4A_SIGILL  4U
 #define L4A_SIGFPE  8U
@@ -454,12 +458,20 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
         return 0;
     }
     want = (void *)(uintptr_t)(ctx->guest_base + (uint64_t)MIPS32_SIGTRAMP);
+#ifdef __APPLE__
+    (void)got;
+    if (mprotect((void *)((uintptr_t)want & ~0x3FFFull), 0x4000u,
+                 PROT_READ | PROT_WRITE) != 0) {
+        return -1;
+    }
+#else
     got = mmap(want, (size_t)MIPS32_PAGE_SIZE,
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
         -1, 0);
     if (got != want) {
         return -1;
     }
+#endif
     be = mips_is_be(ctx);
     h = (uint8_t *)want;
     if (be) {
@@ -481,9 +493,11 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
         h[6] = 0x00U;
         h[7] = 0x00U;
     }
+#ifndef __APPLE__
     if (mprotect(want, (size_t)MIPS32_PAGE_SIZE, PROT_READ) != 0) {
         return -1;
     }
+#endif
     /* Register in the authoritative VMA table (not the ctx mirror: the
      * next vm op refreshes the mirror from the table and would drop a
      * mirror-only entry, faulting the handler return).  The host

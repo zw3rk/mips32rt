@@ -854,6 +854,17 @@ static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 
 int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 {
+    if (d->op == 0x13u && ((d->funct & 0x26u) == 0x20u)) {
+        unsigned f = d->funct & 1u, fr = d->rs, ft = d->rt, fs = d->rd, fd = d->sa;
+        struct fp_st s = { ctx, pc, 0u, 0u, 0 };
+        uint64_t v;
+        if (f != 0u && (fp_even(ctx, pc, fr) || fp_even(ctx, pc, ft) || fp_even(ctx, pc, fs) || fp_even(ctx, pc, fd)))
+            return MIPS_FAULT;
+        v = fp_addsub(&s, f, fp_mul(&s, f, ctx->fpr[fs], ctx->fpr[ft]), ctx->fpr[fr], (int)((d->funct >> 3) & 1u));
+        if ((d->funct & 0x10u) != 0u && fp_unpack(f, v, ctx->nan2008).cls != FP_NAN)
+            v ^= (f == 0u) ? 0x80000000ULL : 0x8000000000000000ULL;
+        return (f == 0u) ? fp_write_s(&s, fd, (uint32_t)v) : fp_write_d(&s, fd, v);
+    }
     if (d->op != 0x11u) {
         mips_trap(ctx, 4, pc); /* Reserved COP1-adjacent encoding. */
         return MIPS_FAULT;

@@ -20,6 +20,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
@@ -49,12 +52,23 @@ uint64_t vm_page_align_up(uint64_t v)
 
 int vm_reserve_prot_none(mips32_ctx_t *ctx, uint32_t start, uint32_t len)
 {
+#ifdef __APPLE__
+    uint32_t h_start = (start + 0x3FFFU) & ~0x3FFFU;
+    uint32_t h_end   = (start + len) & ~0x3FFFU;
+    if (h_end > h_start) {
+        if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start), PROT_NONE) != 0) {
+            return -errno;
+        }
+    }
+    return 0;
+#else
     void *res = mmap(mips32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (res == MAP_FAILED) {
         return -errno;
     }
     return 0;
+#endif
 }
 
 /* Translation-cache invalidation on guest mm ops (SMC): the Phase 2 DBT
@@ -382,7 +396,21 @@ static int try_reserve_window(uint64_t base)
     if ((base & (MIPS32_PAGE_SIZE - 1ULL)) != 0ULL || base > UINT64_MAX - RT32_WINDOW_SIZE) {
         return -1;
     }
-
+#ifdef __APPLE__
+    if (base == 0ULL || (base & 0x3FFFULL) != 0ULL) {
+        return -1;
+    }
+    void *res = mmap((void *)(uintptr_t)base, (size_t)RT32_WINDOW_SIZE, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (res == MAP_FAILED) {
+        return -1;
+    }
+    if ((uint64_t)(uintptr_t)res != base) {
+        munmap(res, (size_t)RT32_WINDOW_SIZE);
+        return -1;
+    }
+    return 0;
+#else
     uint64_t map_start = (base == 0ULL) ? (uint64_t)MIPS32_LOW_GUARD_SIZE : base;
     uint64_t map_len   = (base == 0ULL) ? (RT32_WINDOW_SIZE - (uint64_t)MIPS32_LOW_GUARD_SIZE)
                                         : RT32_WINDOW_SIZE;
@@ -401,6 +429,7 @@ static int try_reserve_window(uint64_t base)
         return -1;
     }
     return 0;
+#endif
 }
 
 int rt32_vm_init(mips32_ctx_t *ctx, uint64_t requested_window)
@@ -452,8 +481,18 @@ int rt32_vm_init(mips32_ctx_t *ctx, uint64_t requested_window)
                 }
             }
             if (!found) {
-                fprintf(stderr, "mips32rt: unable to find free 4 GiB guest window\n");
-                return -1;
+#ifdef __APPLE__
+                void *any = mmap(NULL, (size_t)RT32_WINDOW_SIZE, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (any != MAP_FAILED) {
+                    ctx->guest_base = (uint64_t)(uintptr_t)any;
+                    found = true;
+                }
+#endif
+                if (!found) {
+                    fprintf(stderr, "mips32rt: unable to find free 4 GiB guest window\n");
+                    return -1;
+                }
             }
         }
     }
@@ -547,6 +586,18 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
         }
         uint32_t len = new_page - old_page;
         void *host_addr = mips32_guest_ptr(ctx, old_page);
+#ifdef __APPLE__
+        uint32_t h_start = old_page & ~0x3FFFU;
+        uint32_t h_end   = (new_page + 0x3FFFU) & ~0x3FFFU;
+        if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
+                     PROT_READ | PROT_WRITE) != 0) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
+        memset(host_addr, 0, len);
+#else
         void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         if (res == MAP_FAILED) {
@@ -555,6 +606,7 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
+#endif
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
