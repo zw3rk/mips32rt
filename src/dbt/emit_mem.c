@@ -12,6 +12,7 @@
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
 #include "dbt/emit_priv.h"
+#include "dbt/emit_fp_priv.h"
 
 /* w22 = rs + simm (guest effective address, 32-bit wrap). */
 void emit_ea(a64_buf_t *b, unsigned rs, int32_t simm)
@@ -502,14 +503,24 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
 
     emit_sync_pc(b, fpc, ind_slot);
     switch (d->op) {
-    case 0x31u: /* LWC1 */
+    case 0x31u: { /* LWC1 */
+        unsigned slot, creg;
         emit_align_fault(b, 1U, fpc, ind_slot);
         a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
         if (be != 0) {
             a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
         }
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
+        /* Wave P12: populate the FP cache from the loaded word (fresh
+         * memory value: clear both NaN tracking bits). */
+        slot = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U); creg = 16U + slot;
+        a64_emit_fmov_w_to_s(b, creg, A64_TMP1);
+        b->fpr_cache_valid |= (uint16_t)(1U << slot);
+        b->fpr_cache_reg[slot] = (uint8_t)fs;
+        b->fpr_cache_is_d &= (uint16_t)~(1U << slot);
+        b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
         return;
+    }
     case 0x39u: { /* SWC1 */
         size_t ph_slow, ph_done;
 
@@ -535,7 +546,8 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         a64_patch_b_cond(b, ph_done, b->count);
         return;
     }
-    case 0x35u: /* LDC1 */
+    case 0x35u: { /* LDC1 */
+        unsigned slot, creg, lo, hi;
         emit_align_fault(b, 2U, fpc, ind_slot);
         a64_emit_guest_ldrd_w(b, A64_TMP1, A64_TMP2, A64_ADDR);
         if (be != 0) {
@@ -547,7 +559,19 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
             a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
             a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
         }
+        /* Wave P12: populate the FP cache from the loaded doubleword
+         * (EA dead here; W22/W23 scratch; fresh value clears NaN bits). */
+        slot = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U); creg = 16U + slot;
+        lo = (be != 0) ? A64_TMP2 : A64_TMP1; hi = (be != 0) ? A64_TMP1 : A64_TMP2;
+        a64_emit_mov_w(b, 22U, lo); a64_emit_mov_w(b, 23U, hi);
+        a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+        fp_cvt(b, 1U, 1U, 0x07U, creg, 22U);
+        b->fpr_cache_valid |= (uint16_t)(1U << slot);
+        b->fpr_cache_reg[slot] = (uint8_t)fs;
+        b->fpr_cache_is_d |= (uint16_t)(1U << slot);
+        b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
         return;
+    }
     case 0x3du: { /* SDC1 */
         size_t ph_slow, ph_done;
 

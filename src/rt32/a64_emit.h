@@ -93,6 +93,14 @@ typedef struct a64_buf {
      * the batch-final op; fp_batch_open tracks an open batch. */
     uint8_t   fp_defer_finish;
     uint8_t   fp_batch_open;
+    /* Wave P12 16-slot write-through FPR cache in v16..v31 (slot =
+     * ((fs>>1)^((fs&1)<<3))&15, creg = 16+slot; even O32 regs map 1-1)
+     * plus known-non-NaN / known-no-sNaN bitmaps (bit = guest FPR). */
+    uint16_t  fpr_cache_valid;
+    uint16_t  fpr_cache_is_d;
+    uint8_t   fpr_cache_reg[16];
+    uint32_t  fpr_non_nan;
+    uint32_t  fpr_no_snan;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)

@@ -136,36 +136,66 @@ uint32_t fp_slot(unsigned fs)
 
 /* S-reg i is the low 32 bits of fpr[i] (upper half preserved by
  * stores); D-reg fs is the full 64-bit fpr[fs] slot.  FR-agnostic,
- * mirroring fpmove.c LWC1/LDC1. */
+ * mirroring fpmove.c LWC1/LDC1.  Wave P12: 16-slot write-through cache
+ * in v16..v31 (slot = ((fs>>1)^((fs&1)<<3))&15, creg = 16+slot); even
+ * O32 regs map 1-to-1 with zero collisions. */
+static unsigned fpr_slot(unsigned fs)
+{
+    return (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U);
+}
 void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
+    unsigned slot = fpr_slot(fs), creg = 16U + slot;
+    unsigned want_d = (is_d != 0U) ? 1U : 0U;
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
-    if (is_d == 0U) {
-        uint32_t off = fp_slot(fs);
-
-        /* Wave P5: single scalar LDR Sd,[x19,#off] (imm12 = off/4). */
-        a64_emit(b, 0xBD400000U | (((off >> 2U) & 0xFFFU) << 10) |
-            ((A64_XCTX & 31U) << 5) | (vd & 31U));
+    if ((((b->fpr_cache_valid >> slot) & 1U) != 0U) &&
+        b->fpr_cache_reg[slot] == (uint8_t)fs &&
+        (((b->fpr_cache_is_d >> slot) & 1U) == want_d)) {
+        if (vd != creg) {
+            fp_emit1(b, want_d, 0U, 0x10U, vd, creg);
+        }
         return;
     }
-    fp_mem_d(b, 0U, vd, A64_XCTX, fp_slot(fs));
-    return;
+    if (is_d == 0U) {
+        uint32_t off = fp_slot(fs);
+        /* Wave P5: single scalar LDR Sd,[x19,#off] (imm12 = off/4). */
+        a64_emit(b, 0xBD400000U | (((off >> 2U) & 0xFFFU) << 10) |
+            ((A64_XCTX & 31U) << 5) | (creg & 31U));
+    } else {
+        fp_mem_d(b, 0U, creg, A64_XCTX, fp_slot(fs));
+    }
+    b->fpr_cache_valid |= (uint16_t)(1U << slot);
+    b->fpr_cache_reg[slot] = (uint8_t)fs;
+    if (is_d != 0U) { b->fpr_cache_is_d |= (uint16_t)(1U << slot); }
+    else { b->fpr_cache_is_d &= (uint16_t)~(1U << slot); }
+    if (vd != creg) {
+        fp_emit1(b, want_d, 0U, 0x10U, vd, creg);
+    }
 }
 
 void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
+    unsigned slot = fpr_slot(fs), creg = 16U + slot;
+    unsigned want_d = (is_d != 0U) ? 1U : 0U;
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
     if (is_d == 0U) {
         uint32_t off = fp_slot(fs);
-
-        /* Wave P5: single scalar STR Sd,[x19,#off] (imm12 = off/4). */
+        /* Write-through: ctx stays exact so traps/exits see fpr[fs]. */
         a64_emit(b, 0xBD000000U | (((off >> 2U) & 0xFFFU) << 10) |
             ((A64_XCTX & 31U) << 5) | (vd & 31U));
-        return;
+    } else {
+        fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
     }
-    fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
+    if (vd != creg) {
+        fp_emit1(b, want_d, 0U, 0x10U, creg, vd);
+    }
+    b->fpr_cache_valid |= (uint16_t)(1U << slot);
+    b->fpr_cache_reg[slot] = (uint8_t)fs;
+    /* S store preserves the upper half in memory: only S hits. */
+    if (is_d != 0U) { b->fpr_cache_is_d |= (uint16_t)(1U << slot); }
+    else { b->fpr_cache_is_d &= (uint16_t)~(1U << slot); }
 }
 
 /* Sync the host FPCR rounding mode from FCSR (W21) with a fast path
@@ -300,6 +330,22 @@ void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky,
     a64_patch_cbz_w(b, ph2, b->count);
 }
 
+/* Wave P12: skip redundant quiets (no-sNaN via fp_fix, non-NaN via CVT). */
+void fp_quiet_reg(a64_buf_t *b, unsigned vd, unsigned greg, unsigned wsticky,
+                  unsigned is_d)
+{
+    if (greg < 32U &&
+        ((((b->fpr_non_nan | b->fpr_no_snan) >> greg) & 1U) != 0U)) {
+        return;
+    }
+    fp_quiet(b, vd, wsticky, is_d);
+}
+/* fp_fix quiets NaN results: no sNaN survives (qNaN can, clear non-NaN). */
+static void fp_note_arith(a64_buf_t *b, unsigned fd)
+{
+    b->fpr_no_snan |= (1U << fd); b->fpr_non_nan &= ~(1U << fd);
+}
+
 /* Legacy post-canonicalization: clear a set quiet bit (AArch64 default
  * NaNs carry the 2008 MSB); a payload that would vanish becomes the
  * default legacy QNaN (E03). */
@@ -410,8 +456,8 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     fp_ld(b, 1U, ft, be, ptype);
     a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, FP_STICKY, ptype);
-        fp_quiet(b, 1U, FP_STICKY, ptype);
+        fp_quiet_reg(b, 0U, fs, FP_STICKY, ptype);
+        fp_quiet_reg(b, 1U, ft, FP_STICKY, ptype);
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     fp_fpsr_clear(b);
@@ -507,9 +553,9 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     }
     a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, FP_STICKY, ptype);
+        fp_quiet_reg(b, 0U, fs, FP_STICKY, ptype);
         if (opc != 0xFFU) {
-            fp_quiet(b, 1U, FP_STICKY, ptype);
+            fp_quiet_reg(b, 1U, ft, FP_STICKY, ptype);
         }
     }
     if (b->fp_defer_finish != 0U) {
@@ -541,6 +587,7 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
             a64_patch_cbz_w(b, ph_can, b->count);
         }
         fp_st(b, 2U, fd, be, ptype);
+        fp_note_arith(b, fd);
         return 0;
     }
     if (b->fp_batch_open != 0U) {
@@ -582,6 +629,7 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_patch_cbz_w(b, ph_can, b->count);
     }
     fp_st(b, 2U, fd, be, ptype);
+    fp_note_arith(b, fd);
     fp_finish(b, 24U, cur);
     return 0;
 }
@@ -621,9 +669,9 @@ static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_ld(b, 3U, fr, be, ptype);
     a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, FP_STICKY, ptype);
-        fp_quiet(b, 1U, FP_STICKY, ptype);
-        fp_quiet(b, 3U, FP_STICKY, ptype);
+        fp_quiet_reg(b, 0U, fs, FP_STICKY, ptype);
+        fp_quiet_reg(b, 1U, ft, FP_STICKY, ptype);
+        fp_quiet_reg(b, 3U, fr, FP_STICKY, ptype);
     }
     if (b->fp_defer_finish != 0U) {
         if (b->fp_batch_open == 0U) {
@@ -657,6 +705,7 @@ static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
             a64_patch_cbz_w(b, ph_neg, b->count);
         }
         fp_st(b, 2U, fd, be, ptype);
+        fp_note_arith(b, fd);
         return 0;
     }
     if (b->fp_batch_open != 0U) {
@@ -695,6 +744,7 @@ static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_patch_cbz_w(b, ph_neg, b->count);
     }
     fp_st(b, 2U, fd, be, ptype);
+    fp_note_arith(b, fd);
     fp_finish(b, 24U, cur);
     return 0;
 }
@@ -721,6 +771,9 @@ static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
     fp_ld(b, 0U, fs, be, ptype);
     fp_emit1(b, ptype, op5, opc6, 1U, 0U);
     fp_st(b, 1U, fd, be, ptype);
+    /* Sign-bit ops preserve NaN-ness: propagate both tracking bits. */
+    b->fpr_no_snan = (b->fpr_no_snan & ~(1U << fd)) | (((b->fpr_no_snan >> fs) & 1U) << fd);
+    b->fpr_non_nan = (b->fpr_non_nan & ~(1U << fd)) | (((b->fpr_non_nan >> fs) & 1U) << fd);
     return 0;
 }
 
@@ -765,6 +818,11 @@ static int fp_move_op(a64_buf_t *b, const mips_dec_t *d, int be)
         a64_emit_str_imm_w(b, v, A64_XCTX, off);
     } else {
         fp_store_w(b, v, off, be);
+    }
+    /* MTC1/MTHC1 write raw integer bits: fresh value untested, and any
+     * cached FP copy of fpr[fs] is stale, so drop the whole cache. */
+    if (d->rs == FP_RS_MTC1 || d->rs == FP_RS_MTHC1) {
+        b->fpr_cache_valid = 0U; b->fpr_non_nan = 0U; b->fpr_no_snan = 0U;
     }
     return 0;
 }

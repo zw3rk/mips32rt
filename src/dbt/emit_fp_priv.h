@@ -90,6 +90,8 @@ void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur);
 
 /* Legacy-NaN pre/post steps (src/dbt/emit_fp.c). */
 void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky, unsigned is_d);
+void fp_quiet_reg(a64_buf_t *b, unsigned vd, unsigned greg, unsigned wsticky,
+                  unsigned is_d);
 void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d);
 
 /* Conversion ops (src/dbt/emit_fp_cvt.c). */

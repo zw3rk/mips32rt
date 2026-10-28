@@ -188,6 +188,10 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         fp_store_w(b, A64_TMP2, fp_slot(fd) + 4U, be);
     }
     a64_emit_orr_reg_w(b, 22U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
+    /* Integer bit patterns can alias sNaN as floats: drop the cached FP
+     * copy of fpr[fd] and both tracking bits. */
+    b->fpr_cache_valid &= (uint16_t)~(1U << ((((fd >> 1U) ^ ((fd & 1U) << 3U)) & 15U)));
+    b->fpr_non_nan &= ~(1U << fd); b->fpr_no_snan &= ~(1U << fd);
     fp_finish(b, 22U, cur);
     return 0;
 }
@@ -205,7 +209,7 @@ int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_ld(b, 0U, fs, be, is_d ^ 1U);
     a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, FP_STICKY, is_d ^ 1U);
+        fp_quiet_reg(b, 0U, fs, FP_STICKY, is_d ^ 1U);
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     fp_fpsr_clear(b);
@@ -238,6 +242,10 @@ int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_patch_cbz_w(b, ph_can, b->count);
     }
     fp_st(b, 2U, fd, be, is_d);
+    /* FCVT canonicalizes sNaN to qNaN; finite stays finite (D->S Inf
+     * is still non-NaN), so set no-sNaN and propagate non-NaN. */
+    b->fpr_no_snan |= (1U << fd);
+    b->fpr_non_nan = (b->fpr_non_nan & ~(1U << fd)) | (((b->fpr_non_nan >> fs) & 1U) << fd);
     fp_finish(b, 24U, cur);
     return 0;
 }
@@ -289,6 +297,8 @@ int fp_from_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_fpsr_read(b, 22U);
     fp_fpcr_restore(b);
     fp_st(b, 2U, fd, be, is_d);
+    /* Integer-to-float is always finite: set both tracking bits. */
+    b->fpr_no_snan |= (1U << fd); b->fpr_non_nan |= (1U << fd);
     fp_finish(b, 22U, cur);
     return 0;
 }

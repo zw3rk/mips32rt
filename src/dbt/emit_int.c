@@ -686,6 +686,8 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
      * state must not leak into the taken arm (a slot memory op flushes
      * and clears the set, which the taken path still needs). */
     saved_dirty = b->gpr_dirty;
+    /* Wave P12: drop FP cache at the split (ctx is write-through exact). */
+    b->fpr_cache_valid = 0U; b->fpr_non_nan = 0U; b->fpr_no_snan = 0U;
     if (mips_is_branch_likely(d) == 0 && (d->op != MIPS_OP_REGIMM ||
         (d->rt != 0x12U && d->rt != 0x13U))) {
         if (emit_one(b, s, cur + 4U, cur, be, 0, ctx) < 0) return -1;
@@ -693,6 +695,7 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, nottaken, nottaken + 4U);
     a64_patch_b_cond(b, ph_t, b->count);
     b->gpr_dirty = saved_dirty;
+    b->fpr_cache_valid = 0U; b->fpr_non_nan = 0U; b->fpr_no_snan = 0U;
     if (emit_one(b, s, cur + 4U, cur, be, 0, ctx) < 0) return -1;
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, taken, taken + 4U);
     return 0;
