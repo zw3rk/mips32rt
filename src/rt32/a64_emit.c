@@ -124,7 +124,9 @@ void a64_emit_sbc_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, unsi
 
 void a64_emit_add_uxtw_x(a64_buf_t *b, unsigned rd_x, unsigned rn_x, unsigned rm_w)
 {
-    /* ADD Xd, Xn, Wm, UXTW #0 */
+    /* ADD Xd, Xn, Wm, UXTW #0.  rn_x must NOT be A64_ZR: in the extended
+     * form register 31 encodes SP, not XZR (GAS rejects the XZR
+     * spelling); zero-extend with a64_emit_mov_w instead. */
     a64_emit(b, 0x8B204000U | ((rm_w & 31U) << 16) | ((rn_x & 31U) << 5) | (rd_x & 31U));
 }
 

@@ -655,6 +655,12 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         emit_ea(b, d->rs, d->simm);
         emit_mem_aligned(b, d, fpc, be, ind_slot);
         return 0;
+    /* Wave P lane P4: COP1 memory moves (raw opcodes; decode.h names
+     * only the integer memory ops). */
+    case 0x31u: case 0x35u: case 0x39u: case 0x3du: /* LWC1/LDC1/SWC1/SDC1 */
+        emit_ea(b, d->rs, d->simm);
+        emit_fp_mem(b, d, fpc, be, ind_slot);
+        return 0;
     case MIPS_OP_LWL: case MIPS_OP_LWR: case MIPS_OP_SWL: case MIPS_OP_SWR:
         emit_ea(b, d->rs, d->simm);
         emit_mem_unaligned(b, d, fpc, be, ind_slot);
@@ -705,6 +711,9 @@ static int slot_ok(const mips_dec_t *d)
     case MIPS_OP_SH: case MIPS_OP_SW: case MIPS_OP_LWL: case MIPS_OP_LWR:
     case MIPS_OP_SWL: case MIPS_OP_SWR: case MIPS_OP_LL: case MIPS_OP_SC:
     case 0x2FU: case 0x33U: return 1;
+    /* Wave P lane P4: FP memory moves share the fault-sync machinery
+     * with integer memory ops, so they are delay-slot safe. */
+    case 0x31u: case 0x35u: case 0x39u: case 0x3du: return 1;
     default: return 0;
     }
 }

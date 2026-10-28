@@ -66,6 +66,9 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc);
 
 /* Direct chaining memo + RAS + IBTC + block-pool search, in that order. */
 void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc);
+/* In-trampoline chaining step (Wave P lane P4): validated lookup for
+ * ctx->pc, NULL to exit the chain (see dbt.c). */
+void *dbt_chain_next(mips32_ctx_t *ctx);
 
 /*
  * Page-version hooks for RC2 SMC wiring (mprotect/munmap/clear_cache and

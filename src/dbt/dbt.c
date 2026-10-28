@@ -15,9 +15,10 @@
  * (pc & 0xfff) == 0xffc ends the block *before* it; a non-control word at
  * ...0xffc is included and ends the block), and at SYSCALL/BREAK/traps.
  * A block *starting* at (pc & 0xfff) == 0xffc is never compiled: the
- * caller single-steps it with interp_step and resumes. FP-arithmetic
- * (COP1 non-move/non-branch) and unknown encodings likewise fall back to
- * interp_step until Phase 3; the fallback never aborts execution.
+ * caller single-steps it with interp_step and resumes. COP1X/COP2 and
+ * unknown encodings likewise fall back to interp_step (COP1 proper is
+ * natively emitted since Wave P lane P4); the fallback never aborts
+ * execution.
  *
  * Single-threaded in Phase 2 (CLONE/threading arrives in Phase 4).
  */
@@ -176,18 +177,14 @@ static int dbt_is_link(const mips_dec_t *d)
 }
 
 /*
- * FP-arithmetic test: COP1 with rs outside the Phase-1 move set
- * (MFC1/MTC1/CFC1/CTC1) and outside BC branches. Everything else,
- * including COP1X/COP2, is also Phase-3-or-later work; COP0 (other than
- * the L2c-owned RDHWR path) and traps are dispatcher exits.
+ * Still-fallback coprocessor test (Wave P lane P4): COP1 itself is now
+ * fully owned by the L2c/L3b emitter (dbt_emit_fp declines unknown forms
+ * to UNDEF/SINGLE_STEP exits), so only COP1X/COP2 still force a block
+ * break into the interp_step fallback.  COP0 (other than the L2c-owned
+ * RDHWR path) and traps remain dispatcher exits.
  */
-static int dbt_is_fp_arith(const mips_dec_t *d)
+static int dbt_is_unhandled_coproc(const mips_dec_t *d)
 {
-    if (d->op == DBT_OP_COP1) {
-        return d->rs != DBT_COP1_MFC1 && d->rs != DBT_COP1_CFC1 &&
-            d->rs != DBT_COP1_MTC1 && d->rs != DBT_COP1_CTC1 &&
-            d->rs != DBT_COP1_BC;
-    }
     return d->op == DBT_OP_COP1X || d->op == DBT_OP_COP2;
 }
 
@@ -452,6 +449,31 @@ void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
     return dbt_lookup_bi(ctx, pc, NULL);
 }
 
+/* Wave P lane P4 in-trampoline chaining: resolve the next block for
+ * ctx->pc through the normal validated lookup (direct memo, RAS, IBTC,
+ * pool search, all smc_version-checked).  Returns the block entry, or
+ * NULL to exit the chain: uncompiled target (the C dispatch loop
+ * compiles it), or chaining disabled under --difftest / --trace where
+ * instruction/block lockstep parity requires the C dispatch loop to
+ * observe every block boundary.  Each chained block is counted so
+ * stats match the non-chained path.  RAS pushes for link blocks are
+ * skipped inside chains (RAS is a lookup accelerator only; misses
+ * fall through to the IBTC). */
+void *dbt_chain_next(mips32_ctx_t *ctx)
+{
+    void *code;
+
+    if (ctx == NULL || ctx->difftest_enabled || ctx->trace_enabled) {
+        return NULL;
+    }
+    code = dbt_lookup(ctx, ctx->pc);
+    if (code == NULL) {
+        return NULL;
+    }
+    ctx->blocks_executed++;
+    return code;
+}
+
 static void dbt_ras_push(uint32_t pc)
 {
     uint32_t smc;
@@ -559,8 +581,8 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
             break;
         }
         mips_decode(word, d);
-        /* FP arithmetic and unknown system classes fall back to interp. */
-        if (dbt_is_fp_arith(d)) {
+        /* COP1X/COP2 and unknown system classes fall back to interp. */
+        if (dbt_is_unhandled_coproc(d)) {
             break;
         }
         if (dbt_is_trap_exit(d)) {
@@ -599,7 +621,7 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
         cur += 4U;
     }
     if (count == 0U) {
-        /* FP-arithmetic, trap, or cross-page head: single-step it. */
+        /* Fallback-class, trap, or cross-page head: single-step it. */
         return 1;
     }
     if (dbt_emit_int(ctx, pc, insns, count, staging, sizeof(staging),

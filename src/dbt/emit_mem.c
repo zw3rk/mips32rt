@@ -421,6 +421,86 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
     }
 }
 
+/* LWC1/SWC1/LDC1/SDC1 (Wave P lane P4): COP1 memory moves through the
+ * same direct-window guest accessors as integer loads/stores (EA already
+ * in w22).  Semantics mirror interp fpmove_mem: LWC1/SWC1 need word
+ * alignment, LDC1/SDC1 doubleword alignment (AdEL/AdES via
+ * emit_align_fault, honoring FIXADE exactly like integer LW/SW); S-word
+ * ops touch only the low 32 bits of the fpr slot (a 32-bit ctx store
+ * preserves the upper lane); BE guests byte-swap around the host-endian
+ * slot.  Stores serialize under the LL spinlock and bump/break exactly
+ * like integer SW (SDC1 covers both touched words). */
+void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
+                 int be, int ind_slot)
+{
+    unsigned fs = d->rt;
+    uint32_t off = MIPS32_CTX_FPR_OFFSET + fs * 8U;
+
+    emit_sync_pc(b, fpc, ind_slot);
+    switch (d->op) {
+    case 0x31u: /* LWC1 */
+        emit_align_fault(b, 1U, fpc, ind_slot);
+        a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+        }
+        a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
+        return;
+    case 0x39u: /* SWC1 */
+        emit_align_fault(b, 1U, fpc, ind_slot);
+        /* Data loads after the lock: emit_ll_lock clobbers W16/W17. */
+        emit_ll_lock(b);
+        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+        }
+        a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
+        emit_epoch_bump_len(b, A64_ADDR, 4u);
+        emit_reservation_break(b, A64_ADDR, 1);
+        emit_ll_unlock(b);
+        return;
+    case 0x35u: /* LDC1 */
+        emit_align_fault(b, 2U, fpc, ind_slot);
+        a64_emit_guest_ldrd_w(b, A64_TMP1, A64_TMP2, A64_ADDR);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+            a64_emit_rev_w(b, A64_TMP2, A64_TMP2);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, off);
+            a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off + 4U);
+        } else {
+            a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
+        }
+        return;
+    case 0x3du: /* SDC1 */
+        emit_align_fault(b, 2U, fpc, ind_slot);
+        /* Data loads after the lock: emit_ll_lock clobbers W16/W17. */
+        emit_ll_lock(b);
+        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
+        a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+            a64_emit_rev_w(b, A64_TMP2, A64_TMP2);
+        }
+        /* W21 is dead here (no FCSR traffic in this op). */
+        a64_emit_add_imm_w(b, false, A64_TMP3, A64_ADDR, 4U, 0U);
+        if (be != 0) {
+            a64_emit_guest_str_w(b, A64_TMP2, A64_ADDR);
+            a64_emit_guest_str_w(b, A64_TMP1, A64_TMP3);
+        } else {
+            a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
+            a64_emit_guest_str_w(b, A64_TMP2, A64_TMP3);
+        }
+        emit_epoch_bump_len(b, A64_ADDR, 8u);
+        emit_reservation_break(b, A64_ADDR, 0);
+        emit_reservation_break(b, A64_TMP3, 0);
+        emit_ll_unlock(b);
+        return;
+    default:
+        break;
+    }
+}
+
 /* LL: aligned load + llbit/lladdr/llval record (align guard syncs). */
 void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot)

@@ -27,45 +27,7 @@
 #include "mips32rt.h"
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
-
-/* COP1 fmt (rs) selectors. */
-#define FP_FMT_S 16U
-#define FP_FMT_D 17U
-#define FP_FMT_W 18U
-#define FP_FMT_L 19U
-
-/* COP1 move/branch (rs) selectors. */
-#define FP_RS_MFC1 0U
-#define FP_RS_DMFC1 1U
-#define FP_RS_CFC1 2U
-#define FP_RS_MFHC1 3U
-#define FP_RS_MTC1 4U
-#define FP_RS_DMTC1 5U
-#define FP_RS_CTC1 6U
-#define FP_RS_MTHC1 7U
-
-/* COP1 arithmetic funct selectors (fmt S/D). */
-#define FP_FUNCT_ADD 0x00U
-#define FP_FUNCT_SUB 0x01U
-#define FP_FUNCT_MUL 0x02U
-#define FP_FUNCT_DIV 0x03U
-#define FP_FUNCT_SQRT 0x04U
-#define FP_FUNCT_ABS 0x05U
-#define FP_FUNCT_MOV 0x06U
-#define FP_FUNCT_NEG 0x07U
-#define FP_FUNCT_ROUND 0x0CU
-#define FP_FUNCT_TRUNC 0x0DU
-#define FP_FUNCT_CEIL 0x0EU
-#define FP_FUNCT_FLOOR 0x0FU
-#define FP_FUNCT_CVT_S 0x20U
-#define FP_FUNCT_CVT_D 0x21U
-#define FP_FUNCT_CVT_W 0x24U
-#define FP_FUNCT_CVT_L 0x25U
-
-/* FCSR field positions (SPEC 2.1, E03 6). */
-#define FP_FCSR_CAUSE_MASK 0x1F000U
-#define FP_FCSR_ENABLE_SHIFT 7U
-#define FP_FCSR_E_BIT (1U << 17)
+#include "dbt/emit_fp_priv.h"
 
 /* Raw A64 FP/SIMD words (GAS-verified; ptype 0 = S, 1 = D). */
 static void fp_emit2(a64_buf_t *b, unsigned ptype, unsigned opc, unsigned vd,
@@ -76,7 +38,7 @@ static void fp_emit2(a64_buf_t *b, unsigned ptype, unsigned opc, unsigned vd,
                     ((vn & 31U) << 5) | (vd & 31U));
 }
 
-static void fp_emit1(a64_buf_t *b, unsigned ptype, unsigned op5, unsigned opc6,
+void fp_emit1(a64_buf_t *b, unsigned ptype, unsigned op5, unsigned opc6,
                      unsigned vd, unsigned vn)
 {
     a64_emit(b, 0x1E000000U | ((ptype & 1U) << 22) | (1U << 21) |
@@ -93,7 +55,7 @@ static void fp_cmp(a64_buf_t *b, unsigned ptype, unsigned rn, unsigned rm)
 /* Integer <-> FP conversions (sf 0 = W, 1 = X).  Sub-opcodes:
  * 0x18 FCVTZS, 0x19 FCVTZU, 0x02 SCVTF, 0x03 UCVTF, 0x07 FMOV D,X,
  * 0x06 FMOV X,D. */
-static void fp_cvt(a64_buf_t *b, unsigned sf, unsigned ptype, unsigned sub,
+void fp_cvt(a64_buf_t *b, unsigned sf, unsigned ptype, unsigned sub,
                    unsigned rd, unsigned rn)
 {
     a64_emit(b, 0x1E000000U | ((sf & 1U) << 31) | ((ptype & 1U) << 22) |
@@ -111,11 +73,15 @@ static void fp_mem_d(a64_buf_t *b, unsigned is_store, unsigned vt,
                     ((rn_x & 31U) << 5) | (vt & 31U));
 }
 
-/* MRS/MSR FPSR/FPCR (is_msr 0 = MRS Xt,sys; 1 = MSR sys,Xt). */
+/* MRS/MSR FPSR/FPCR (is_msr 0 = MRS Xt,sys; 1 = MSR sys,Xt).
+ * GAS ground truth (Wave P lane P4): S3_4_C4_C4_op2 with CRm=4, i.e.
+ * bases 0xD53B4400/0xD51B4400; op2 (bit 5) selects FPSR (1) vs FPCR
+ * (0).  The pre-existing bases missed CRm and emitted unallocated
+ * system-register words (SIGILL on the first FP arithmetic). */
 static void fp_sys(a64_buf_t *b, unsigned is_msr, unsigned is_fpcr,
                    unsigned xt)
 {
-    uint32_t base = (is_msr != 0U) ? 0xD51B4000U : 0xD53B4000U;
+    uint32_t base = (is_msr != 0U) ? 0xD51B4400U : 0xD53B4400U;
 
     if (is_fpcr == 0U) {
         base |= 0x20U;
@@ -134,7 +100,7 @@ static const uint8_t kFpCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
 
-static unsigned fp_get(a64_buf_t *b, unsigned g, unsigned tmp)
+unsigned fp_get(a64_buf_t *b, unsigned g, unsigned tmp)
 {
     int h;
 
@@ -164,7 +130,7 @@ static void fp_put(a64_buf_t *b, unsigned g, unsigned src)
     a64_emit_str_imm_w(b, src, A64_XCTX, g * 4U);
 }
 
-static uint32_t fp_slot(unsigned fs)
+uint32_t fp_slot(unsigned fs)
 {
     return MIPS32_CTX_FPR_OFFSET + fs * 8U;
 }
@@ -172,7 +138,7 @@ static uint32_t fp_slot(unsigned fs)
 /* S-reg i is the low 32 bits of fpr[i] (upper half preserved by
  * stores); D-reg fs is the full 64-bit fpr[fs] slot.  FR-agnostic,
  * mirroring fpmove.c LWC1/LDC1. */
-static void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
+void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
@@ -185,7 +151,7 @@ static void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
     return;
 }
 
-static void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
+void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
@@ -197,15 +163,30 @@ static void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
     fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
 }
 
-/* Sync the host FPCR rounding mode from FCSR RM (W21).  Only the
- * RM field is touched; the original FPCR is saved in X23 when RM != 0
- * (RN, the common case, emits just the test and skip). */
-static void fp_fpcr_sync(a64_buf_t *b)
+/* Sync the host FPCR rounding mode from FCSR (W21) with a fast path
+ * (Wave P lane P4): when (FCSR & FP_FCSR_FAST_MASK) == 0 the guest runs
+ * round-to-nearest with no enabled traps and no flush-to-zero, so the
+ * host FPCR already matches and the sync is skipped.  Only the slow
+ * path saves the original FPCR in X23 and programs RM.  A64_TMP2
+ * carries the mask: it is dead at every sync/restore call site (the
+ * sync body itself reuses it). */
+/* Sync the host FPCR rounding mode from FCSR (W21) with a fast path
+ * (Wave P lane P4): when (FCSR & FP_FCSR_FAST_MASK) == 0 the guest runs
+ * round-to-nearest with no enabled traps and no flush-to-zero, so the
+ * host FPCR already matches and the sync is skipped.  Only the slow
+ * path saves the original FPCR in X23 and programs RM.  A64_TMP2
+ * carries the mask: it is dead at every sync/restore call site (the
+ * sync body re-extracts RM into it on the slow path). */
+void fp_fpcr_sync(a64_buf_t *b)
 {
     size_t ph;
 
+    a64_emit_mov_imm32(b, A64_TMP2, FP_FCSR_FAST_MASK);
+    a64_emit_and_reg_w(b, true, A64_ZR, 21U, A64_TMP2, A64_SHIFT_LSL,
+                       0U);
+    ph = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
+    /* Slow path: re-extract RM (TMP2 held the mask above). */
     a64_emit_ubfm_w(b, A64_TMP2, 21U, 0U, 1U);
-    ph = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
     fp_sys(b, 0U, 1U, 23U);
     fp_cvt(b, 1U, 1U, 0x07U, 7U, 23U);
     fp_cvt(b, 1U, 1U, 0x06U, 24U, 7U);
@@ -213,31 +194,42 @@ static void fp_fpcr_sync(a64_buf_t *b)
     a64_emit_ubfm_w(b, 22U, A64_TMP2, 1U, 1U);
     a64_emit_eor_reg_w(b, A64_TMP1, A64_TMP1, 22U, A64_SHIFT_LSL, 0U);
     a64_emit_bfm_w(b, A64_TMP1, A64_TMP2, 31U, 0U);
-    a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+    /* Zero-extend via W-form MOV (top zeroed by architecture): the
+     * extended-ADD form cannot take XZR (Rn=31 encodes SP there). */
+    a64_emit_mov_w(b, 22U, A64_TMP1);
     a64_emit_bfi_x(b, 24U, 22U, 22U, 2U);
     fp_sys(b, 1U, 1U, 24U);
-    a64_patch_cbz_w(b, ph, b->count);
+    /* Context-synchronize the new RM (architecturally required after
+     * MSR FPCR; retained even though this host's scalar converts
+     * ignore FPCR RMode — conversions steer via explicit FRINT). */
+    a64_emit_isb(b);
+    a64_patch_b_cond(b, ph, b->count);
 }
 
-static void fp_fpcr_restore(a64_buf_t *b)
+void fp_fpcr_restore(a64_buf_t *b)
 {
     size_t ph;
 
-    a64_emit_ubfm_w(b, A64_TMP2, 21U, 0U, 1U);
-    ph = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
+    a64_emit_mov_imm32(b, A64_TMP2, FP_FCSR_FAST_MASK);
+    a64_emit_and_reg_w(b, true, A64_ZR, 21U, A64_TMP2, A64_SHIFT_LSL,
+                       0U);
+    ph = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
     fp_sys(b, 1U, 1U, 23U);
-    a64_patch_cbz_w(b, ph, b->count);
+    /* Context-synchronize the restored FPCR (architecturally required;
+     * a later fast-path skip relies on the host mode being back). */
+    a64_emit_isb(b);
+    a64_patch_b_cond(b, ph, b->count);
 }
 
 /* Save host FPSR in X24 and clear the cumulative flags. */
-static void fp_fpsr_clear(a64_buf_t *b)
+void fp_fpsr_clear(a64_buf_t *b)
 {
     fp_sys(b, 0U, 0U, 24U);
     fp_sys(b, 1U, 0U, 31U);
 }
 
 /* Read cumulative flags into wdst and restore the saved host FPSR. */
-static void fp_fpsr_read(a64_buf_t *b, unsigned wdst)
+void fp_fpsr_read(a64_buf_t *b, unsigned wdst)
 {
     fp_sys(b, 0U, 0U, 22U);
     a64_emit_mov_w(b, wdst, 22U);
@@ -285,7 +277,7 @@ static void fp_nan_test(a64_buf_t *b, unsigned vd, unsigned is_d,
 
 /* Legacy pre-normalization: set the quiet bit (payload preserved) and
  * record a set input quiet bit (sNaN) in the sticky Invalid bit. */
-static void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky,
+void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky,
                      unsigned is_d)
 {
     size_t ph1, ph2;
@@ -299,8 +291,8 @@ static void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky,
         a64_emit_fmov_w_to_s(b, vd, A64_TMP1);
     } else {
         a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, 23U, A64_SHIFT_LSL, 0U);
-        a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
-        a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+        a64_emit_mov_w(b, 23U, A64_TMP2);
+        a64_emit_mov_w(b, 22U, A64_TMP1);
         a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
         fp_cvt(b, 1U, 1U, 0x07U, vd, 22U);
     }
@@ -311,7 +303,7 @@ static void fp_quiet(a64_buf_t *b, unsigned vd, unsigned wsticky,
 /* Legacy post-canonicalization: clear a set quiet bit (AArch64 default
  * NaNs carry the 2008 MSB); a payload that would vanish becomes the
  * default legacy QNaN (E03). */
-static void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
+void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
 {
     size_t ph1, ph2, ph3, ph4;
     unsigned qbit = (is_d == 0U) ? 22U : 19U;
@@ -336,8 +328,8 @@ static void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
         a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFU);
         a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFU);
         a64_patch_cbz_w(b, ph4, b->count);
-        a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
-        a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+        a64_emit_mov_w(b, 23U, A64_TMP2);
+        a64_emit_mov_w(b, 22U, A64_TMP1);
         a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
         fp_cvt(b, 1U, 1U, 0x07U, vd, 22U);
     }
@@ -354,7 +346,7 @@ static void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
  * updated and emission continues.
  * RBIT maps bit k to bit 31-k, so LSR 15 lands V..I on Cause 16..12
  * and LSR 25 on Flags 6..2. */
-static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
+void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
 {
     size_t ph;
     unsigned i;
@@ -376,7 +368,8 @@ static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
     a64_emit_orr_reg_w(b, 21U, 21U, A64_TMP1, A64_SHIFT_LSL, 0U);
     a64_emit_ubfm_w(b, 22U, 21U, FP_FCSR_ENABLE_SHIFT,
                      FP_FCSR_ENABLE_SHIFT + 4U);
-    a64_emit_shift_imm_w(b, 22U, 22U, A64_SHIFT_LSL, 5U, false, NULL);
+    /* Align Enable[4:0] (V..I) with Cause[16:12]: shift 12, not 5. */
+    a64_emit_shift_imm_w(b, 22U, 22U, A64_SHIFT_LSL, 12U, false, NULL);
     a64_emit_and_reg_w(b, false, 22U, 22U, A64_TMP1, A64_SHIFT_LSL, 0U);
     ph = a64_emit_cbz_w_placeholder(b, false, 22U);
     a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
@@ -398,7 +391,7 @@ static void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
 
 /* C.cond.fmt: ordered/unordered compare per E03, FCC[cc] writeback.
  * Signalling variants set Invalid on unordered input; the sticky bit
- * (W15) carries pre-quiet Invalid through the FPSR merge. */
+ * (FP_STICKY) carries pre-quiet Invalid through the FPSR merge. */
 static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
                      int nan2008)
 {
@@ -419,10 +412,10 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     }
     fp_ld(b, 0U, fs, be, ptype);
     fp_ld(b, 1U, ft, be, ptype);
-    a64_emit_mov_imm32(b, 15U, 0U);
+    a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, 15U, ptype);
-        fp_quiet(b, 1U, 15U, ptype);
+        fp_quiet(b, 0U, FP_STICKY, ptype);
+        fp_quiet(b, 1U, FP_STICKY, ptype);
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     fp_fpsr_clear(b);
@@ -431,7 +424,7 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     a64_emit_mov_imm32(b, 16U, 1U);
     if ((cond & 8U) != 0U) {
         ph = a64_emit_b_cond_placeholder(b, A64_COND_VC);
-        a64_emit_mov_imm32(b, 15U, 1U);
+        a64_emit_mov_imm32(b, FP_STICKY, 1U);
         a64_patch_b_cond(b, ph, b->count);
     }
     /* Ordered predicates need !V; unordered-inclusive ones accept V. */
@@ -450,11 +443,16 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
         }
     }
     fp_fpsr_read(b, 22U);
-    a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
+    a64_emit_orr_reg_w(b, 22U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
+    /* Shelter the compare result in W24: fp_finish reuses W16/W17
+     * (A64_TMP1/TMP2) as scratch, so W17 would not survive.  W24 is
+     * dead across fp_finish (no fp_sys inside) but live across
+     * fp_fpsr_read (MSR reads X24), hence the move goes here. */
+    a64_emit_mov_w(b, 24U, 17U);
     fp_finish(b, 22U, cur);
     a64_emit_mov_imm32(b, 22U, 1U << fccpos);
     a64_emit_bic_reg_w(b, false, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
-    a64_emit_orr_reg_w(b, 21U, 21U, 17U, A64_SHIFT_LSL, fccpos);
+    a64_emit_orr_reg_w(b, 21U, 21U, 24U, A64_SHIFT_LSL, fccpos);
     a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     return 0;
 }
@@ -485,11 +483,11 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     if (opc != 0xFFU) {
         fp_ld(b, 1U, ft, be, ptype);
     }
-    a64_emit_mov_imm32(b, 15U, 0U);
+    a64_emit_mov_imm32(b, FP_STICKY, 0U);
     if (nan2008 == 0) {
-        fp_quiet(b, 0U, 15U, ptype);
+        fp_quiet(b, 0U, FP_STICKY, ptype);
         if (opc != 0xFFU) {
-            fp_quiet(b, 1U, 15U, ptype);
+            fp_quiet(b, 1U, FP_STICKY, ptype);
         }
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
@@ -502,7 +500,10 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     }
     fp_fpsr_read(b, 22U);
     fp_fpcr_restore(b);
-    a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
+    /* Flags + sticky live in W24 from here: fp_fix and the D-canonical
+     * swap below clobber W22 (fp_nan_test ubfm, add X22), while X24 is
+     * dead (host FPSR already restored by fp_fpsr_read). */
+    a64_emit_orr_reg_w(b, 24U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
     if (nan2008 == 0) {
         size_t ph_can;
 
@@ -510,22 +511,22 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         /* Legacy sNaN arithmetic delivers the canonical Legacy QNaN
          * (S 0x7fbfffff, D 0x7ff7ffffffffffff, matching qemu for partial
          * double payloads); W15 nonzero records an sNaN input. */
-        ph_can = a64_emit_cbz_w_placeholder(b, false, 15U);
+        ph_can = a64_emit_cbz_w_placeholder(b, false, FP_STICKY);
         if (ptype == 0u) {
             a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
             a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
         } else {
             a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
             a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
-            a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
-            a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
+            a64_emit_mov_w(b, 23U, A64_TMP2);
+            a64_emit_mov_w(b, 22U, A64_TMP1);
             a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
             fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
         }
         a64_patch_cbz_w(b, ph_can, b->count);
     }
     fp_st(b, 2U, fd, be, ptype);
-    fp_finish(b, 22U, cur);
+    fp_finish(b, 24U, cur);
     return 0;
 }
 
@@ -555,233 +556,10 @@ static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
 }
 
 /* Store a W integer conversion result to an FPR low half (a value). */
-static void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
+void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
 {
     (void)be;
     a64_emit_str_imm_w(b, wsrc, A64_XCTX, off);
-}
-
-/* CVT.W/CVT.L and ROUND/TRUNC/CEIL/FLOOR from S/D.  V0 holds the float
- * (FRINT pre-round for the fixed modes).  NaN inputs select INTMAX with
- * Invalid; negative overflow that set Invalid saturates to INTMAX
- * (matches the positive side; RC3 will confirm against the oracle).
- * Both selections use CSEL on values, so no control flow is needed. */
-static int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                        int be)
-{
-    unsigned fs = d->rd;
-    unsigned fd = d->sa;
-    unsigned is_d = (d->rs == FP_FMT_D) ? 1U : 0U;
-    unsigned is_l = (d->funct == FP_FUNCT_CVT_L) ? 1U : 0U;
-
-    if (fs >= 32U || fd >= 32U) {
-        return -1;
-    }
-    if (d->rs != FP_FMT_S && d->rs != FP_FMT_D) {
-        return -1;
-    }
-    fp_ld(b, 0U, fs, be, is_d);
-    a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-    fp_fpcr_sync(b);
-    fp_fpsr_clear(b);
-    if (d->funct == FP_FUNCT_TRUNC) {
-        fp_emit1(b, is_d, 0x05U, 0x30U, 0U, 0U);
-    } else if (d->funct == FP_FUNCT_CEIL) {
-        fp_emit1(b, is_d, 0x04U, 0x30U, 0U, 0U);
-    } else if (d->funct == FP_FUNCT_FLOOR) {
-        fp_emit1(b, is_d, 0x05U, 0x10U, 0U, 0U);
-    }
-    /* is_nan in W15: exponent all-ones and nonzero fraction. */
-    if (is_d == 0U) {
-        a64_emit_fmov_s_to_w(b, A64_TMP1, 0U);
-        a64_emit_ubfm_w(b, A64_TMP2, A64_TMP1, 23U, 30U);
-        a64_emit_mov_imm32(b, 22U, 0xFFU);
-        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, 22U, A64_SHIFT_LSL,
-                           0U);
-        a64_emit_mov_imm32(b, 22U, 1U);
-        a64_emit_csel_w(b, 15U, 22U, A64_ZR, A64_COND_EQ);
-        a64_emit_ubfm_w(b, A64_TMP2, A64_TMP1, 0U, 22U);
-        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP2,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_csel_w(b, A64_TMP1, 22U, A64_ZR, A64_COND_NE);
-        a64_emit_and_reg_w(b, false, 15U, 15U, A64_TMP1, A64_SHIFT_LSL,
-                           0U);
-    } else {
-        fp_cvt(b, 1U, 1U, 0x06U, 22U, 0U);
-        a64_emit_ubfx_x_to_w(b, A64_TMP2, 22U, 32U, 32U);
-        a64_emit_ubfm_w(b, A64_TMP1, A64_TMP2, 20U, 30U);
-        a64_emit_mov_imm32(b, 23U, 0x7FFU);
-        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, 23U, A64_SHIFT_LSL,
-                           0U);
-        a64_emit_mov_imm32(b, 23U, 1U);
-        a64_emit_csel_w(b, 15U, 23U, A64_ZR, A64_COND_EQ);
-        a64_emit_mov_w(b, A64_TMP1, 22U);
-        a64_emit_ubfm_w(b, 23U, A64_TMP2, 0U, 19U);
-        a64_emit_orr_reg_w(b, 23U, 23U, A64_TMP1, A64_SHIFT_LSL, 0U);
-        a64_emit_and_reg_w(b, true, A64_ZR, 23U, 23U, A64_SHIFT_LSL, 0U);
-        a64_emit_mov_imm32(b, A64_TMP1, 1U);
-        a64_emit_csel_w(b, 23U, A64_TMP1, A64_ZR, A64_COND_NE);
-        a64_emit_and_reg_w(b, false, 15U, 15U, 23U, A64_SHIFT_LSL, 0U);
-    }
-    if (is_l == 0U) {
-        if (is_d == 0U) {
-            a64_emit_fcvtzs_s_to_w(b, A64_TMP1, 0U);
-        } else {
-            a64_emit_fcvtzs_d_to_w(b, A64_TMP1, 0U);
-        }
-    } else {
-        fp_cvt(b, 1U, is_d, 0x18U, 22U, 0U);
-        a64_emit_mov_w(b, A64_TMP1, 22U);
-        a64_emit_ubfx_x_to_w(b, A64_TMP2, 22U, 32U, 32U);
-    }
-    fp_fpsr_read(b, 22U);
-    fp_fpcr_restore(b);
-    /* NaN selects INTMAX; negative overflow with Invalid saturates. */
-    a64_emit_and_reg_w(b, true, A64_ZR, 15U, 15U, A64_SHIFT_LSL, 0U);
-    if (is_l == 0U) {
-        a64_emit_mov_imm32(b, A64_TMP2, 0x7FFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP1, A64_TMP2, A64_TMP1, A64_COND_NE);
-        a64_emit_mov_imm32(b, A64_TMP2, 0x80000000U);
-        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_mov_imm32(b, A64_TMP2, 1U);
-        a64_emit_csel_w(b, A64_TMP2, A64_TMP2, A64_ZR, A64_COND_EQ);
-        a64_emit_ubfm_w(b, 23U, 22U, 0U, 0U);
-        a64_emit_and_reg_w(b, false, A64_TMP2, A64_TMP2, 23U,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP2,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_mov_imm32(b, A64_TMP2, 0x7FFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP1, A64_TMP2, A64_TMP1, A64_COND_NE);
-        fp_store_w(b, A64_TMP1, fp_slot(fd), be);
-    } else {
-        a64_emit_mov_imm32(b, 23U, 0xFFFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP1, 23U, A64_TMP1, A64_COND_NE);
-        a64_emit_mov_imm32(b, 23U, 0x7FFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP2, 23U, A64_TMP2, A64_COND_NE);
-        a64_emit_mov_imm32(b, 23U, 0x80000000U);
-        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, 23U, A64_SHIFT_LSL,
-                           0U);
-        a64_emit_mov_imm32(b, 23U, 1U);
-        a64_emit_csel_w(b, 23U, 23U, A64_ZR, A64_COND_EQ);
-        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP1,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_csel_w(b, A64_TMP1, 23U, A64_ZR, A64_COND_EQ);
-        a64_emit_and_reg_w(b, false, A64_TMP1, 23U, A64_TMP1,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_ubfm_w(b, 23U, 22U, 0U, 0U);
-        a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, 23U,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP1,
-                           A64_SHIFT_LSL, 0U);
-        a64_emit_mov_imm32(b, 23U, 0xFFFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP1, 23U, A64_TMP1, A64_COND_NE);
-        a64_emit_mov_imm32(b, 23U, 0x7FFFFFFFU);
-        a64_emit_csel_w(b, A64_TMP2, 23U, A64_TMP2, A64_COND_NE);
-        fp_store_w(b, A64_TMP1, fp_slot(fd), be);
-        fp_store_w(b, A64_TMP2, fp_slot(fd) + 4U, be);
-    }
-    a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
-    fp_finish(b, 22U, cur);
-    return 0;
-}
-
-/* CVT.S.D / CVT.D.S: exact FCVT, legacy canonicalization both sides. */
-static int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                           int be, int nan2008, unsigned is_d)
-{
-    unsigned fs = d->rd;
-    unsigned fd = d->sa;
-
-    if (fs >= 32U || fd >= 32U) {
-        return -1;
-    }
-    fp_ld(b, 0U, fs, be, is_d ^ 1U);
-    a64_emit_mov_imm32(b, 15U, 0U);
-    if (nan2008 == 0) {
-        fp_quiet(b, 0U, 15U, is_d ^ 1U);
-    }
-    a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-    fp_fpsr_clear(b);
-    if (is_d == 0U) {
-        a64_emit_fcvt_d_to_s(b, 2U, 0U);
-    } else {
-        a64_emit_fcvt_s_to_d(b, 2U, 0U);
-    }
-    fp_fpsr_read(b, 22U);
-    a64_emit_orr_reg_w(b, 22U, 22U, 15U, A64_SHIFT_LSL, 0U);
-    if (nan2008 == 0) {
-        size_t ph_can;
-
-        fp_fix(b, 2U, is_d);
-        ph_can = a64_emit_cbz_w_placeholder(b, false, 15U);
-        if (is_d == 0u) {
-            a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
-            a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
-        } else {
-            a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
-            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
-            a64_emit_add_uxtw_x(b, 23U, A64_ZR, A64_TMP2);
-            a64_emit_add_uxtw_x(b, 22U, A64_ZR, A64_TMP1);
-            a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
-            fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
-        }
-        a64_patch_cbz_w(b, ph_can, b->count);
-    }
-    fp_st(b, 2U, fd, be, is_d);
-    fp_finish(b, 22U, cur);
-    return 0;
-}
-
-/* CVT.S/D from W (single GPR) or L (even-odd GPR pair, O32 order). */
-static int fp_from_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                          int be, unsigned is_d)
-{
-    unsigned rt = d->rt;
-    unsigned fd = d->sa;
-    unsigned src;
-
-    if (rt >= 32U || fd >= 32U) {
-        return -1;
-    }
-    if (d->rs == FP_FMT_W) {
-        src = fp_get(b, rt, A64_TMP1);
-        a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-        fp_fpcr_sync(b);
-        fp_fpsr_clear(b);
-        if (is_d == 0U) {
-            a64_emit_scvtf_w_to_s(b, 2U, src);
-        } else {
-            a64_emit_scvtf_w_to_d(b, 2U, src);
-        }
-    } else if (d->rs == FP_FMT_L) {
-        unsigned lo;
-        unsigned hi;
-        unsigned vlo;
-        unsigned vhi;
-
-        if ((rt & 1U) != 0U || rt + 1U >= 32U) {
-            return -1;
-        }
-        lo = (be != 0) ? rt + 1U : rt;
-        hi = (be != 0) ? rt : rt + 1U;
-        vlo = fp_get(b, lo, A64_TMP1);
-        vhi = fp_get(b, hi, A64_TMP2);
-        a64_emit_add_uxtw_x(b, 22U, A64_ZR, vlo);
-        a64_emit_add_uxtw_x(b, 23U, A64_ZR, vhi);
-        a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
-        a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-        fp_fpcr_sync(b);
-        fp_fpsr_clear(b);
-        fp_cvt(b, 1U, is_d, 0x02U, 2U, 22U);
-    } else {
-        return -1;
-    }
-    fp_fpsr_read(b, 22U);
-    fp_fpcr_restore(b);
-    fp_st(b, 2U, fd, be, is_d);
-    fp_finish(b, 22U, cur);
-    return 0;
 }
 
 /* MFC1/MTC1/MFHC1/MTHC1/CFC1/CTC1: bit moves, mirroring fpmove.c.
