@@ -235,10 +235,15 @@ static int dbt_pool_ensure(mips32_ctx_t *ctx)
     return dbt_cache->pool == MAP_FAILED ? -1 : 0;
 }
 
-/* Drop every cached translation (pool exhaustion or explicit SMC flush). */
-static void dbt_flush_all(void)
+/* Drop every cached translation (pool exhaustion or explicit SMC flush).
+ * Wave P5: also disables the trampoline inline IBTC fast path. */
+static void dbt_flush_all(mips32_ctx_t *ctx)
 {
     size_t i;
+
+    if (ctx != NULL) {
+        ctx->ibtc_ptr = 0U;
+    }
 
     for (i = 0; i < DBT_MAX_BLOCKS; i++) {
         dbt_cache->blocks[i].code = NULL;
@@ -324,7 +329,9 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
     uint32_t page = mips32_page_down(va);
     size_t i;
 
-    (void)ctx;
+    if (ctx != NULL) {
+        ctx->ibtc_ptr = 0U;
+    }
     if (dbt_cache == NULL) {
         return;
     }
@@ -371,13 +378,13 @@ void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
 
     if (ctx == NULL || dbt_cache == NULL || end <= start) {
         if (ctx != NULL && dbt_cache != NULL && end != start) {
-            dbt_flush_all();
+            dbt_flush_all(ctx);
         }
         return;
     }
     span = (uint64_t)end - (uint64_t)start;
     if (span > (uint64_t)DBT_SMC_TABLE_SIZE * MIPS32_PAGE_SIZE) {
-        dbt_flush_all();
+        dbt_flush_all(ctx);
         return;
     }
     for (page = mips32_page_down(start); page < end;
@@ -544,7 +551,7 @@ static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
         return NULL;
     }
     if (dbt_cache->pool_used + len > DBT_CODE_POOL_SIZE) {
-        dbt_flush_all();
+        dbt_flush_all(ctx);
     }
     base = (uintptr_t)dbt_cache->pool;
     dst = (void *)(base + dbt_cache->pool_used);
@@ -672,7 +679,7 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
         return 1;
     }
     if (dbt_cache->block_count >= DBT_MAX_BLOCKS) {
-        dbt_flush_all();
+        dbt_flush_all(ctx);
         code = dbt_publish(ctx, staging, out_len);
         if (code == NULL) {
             return 1;
@@ -804,7 +811,16 @@ int dbt_main(mips32_ctx_t *ctx)
          * both the checkpoint frame and the trampoline call (the
          * frame must stay ancestral to the block).  A converted
          * fault delivers and reports 1 (resume dispatching at the
-         * handler); a normal return leaves the reason in reason. */
+         * handler); a normal return leaves the reason in reason.
+         * Wave P5: arm the trampoline inline IBTC fast path, unless
+         * --difftest/--trace needs block-lockstep parity or any SMC
+         * write has been observed (then the C lookup runs). */
+        if (ctx->difftest_enabled || ctx->trace_enabled ||
+            dbt_cache->smc_used_count != 0U) {
+            ctx->ibtc_ptr = 0U;
+        } else {
+            ctx->ibtc_ptr = (uint64_t)(uintptr_t)dbt_cache->ibtc;
+        }
         if (mips_hostfault_run(ctx, code, &reason) != 0) {
             continue;
         }

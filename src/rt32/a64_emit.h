@@ -89,6 +89,10 @@ typedef struct a64_buf {
     size_t    loop_body_offset;
     uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
     unsigned  exit_slot_count;
+    /* Wave P5 FP batch: fp_defer_finish defers this op's FPSR sync to
+     * the batch-final op; fp_batch_open tracks an open batch. */
+    uint8_t   fp_defer_finish;
+    uint8_t   fp_batch_open;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)

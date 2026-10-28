@@ -142,8 +142,11 @@ void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
 {
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
     if (is_d == 0U) {
-        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, fp_slot(fs));
-        a64_emit_fmov_w_to_s(b, vd, A64_TMP1);
+        uint32_t off = fp_slot(fs);
+
+        /* Wave P5: single scalar LDR Sd,[x19,#off] (imm12 = off/4). */
+        a64_emit(b, 0xBD400000U | (((off >> 2U) & 0xFFFU) << 10) |
+            ((A64_XCTX & 31U) << 5) | (vd & 31U));
         return;
     }
     fp_mem_d(b, 0U, vd, A64_XCTX, fp_slot(fs));
@@ -155,8 +158,11 @@ void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
 {
     (void)be; /* FPR lanes hold values, not guest-ordered bytes. */
     if (is_d == 0U) {
-        a64_emit_fmov_s_to_w(b, A64_TMP1, vd);
-        a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, fp_slot(fs));
+        uint32_t off = fp_slot(fs);
+
+        /* Wave P5: single scalar STR Sd,[x19,#off] (imm12 = off/4). */
+        a64_emit(b, 0xBD000000U | (((off >> 2U) & 0xFFFU) << 10) |
+            ((A64_XCTX & 31U) << 5) | (vd & 31U));
         return;
     }
     fp_mem_d(b, 1U, vd, A64_XCTX, fp_slot(fs));
@@ -446,6 +452,33 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     return 0;
 }
 
+/* Wave P5 FP batch: open accumulates host FPSR + sticky in W24;
+ * flush merges them into ctx->fcsr Flags[6:2] before the final op,
+ * which then replaces Cause and accumulates its own Flags exactly. */
+static void fp_batch_begin(a64_buf_t *b)
+{
+    a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+    fp_fpcr_sync(b);
+    fp_fpsr_clear(b);
+    a64_emit_mov_imm32(b, 24U, 0U);
+    b->fp_batch_open = 1U;
+}
+
+static void fp_batch_flush(a64_buf_t *b)
+{
+    fp_fpsr_read(b, 22U);
+    a64_emit_orr_reg_w(b, 22U, 22U, 24U, A64_SHIFT_LSL, 0U);
+    a64_emit_ubfm_w(b, 22U, 22U, 0U, 4U);
+    a64_emit_rbit_w(b, 22U, 22U);
+    a64_emit_shift_imm_w(b, 22U, 22U, A64_SHIFT_LSR, 25U, false, NULL);
+    a64_emit_mov_imm32(b, A64_TMP1, 0x7CU);
+    a64_emit_and_reg_w(b, false, 22U, 22U, A64_TMP1, A64_SHIFT_LSL, 0U);
+    a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+    a64_emit_orr_reg_w(b, 21U, 21U, 22U, A64_SHIFT_LSL, 0U);
+    a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+    b->fp_batch_open = 0U;
+}
+
 /* S/D ADD/SUB/MUL/DIV/SQRT with FPCR sync, FPSR merge and legacy
  * canonicalization.  Operands in V0/V1 (SQRT uses V0 only), result V2. */
 static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
@@ -478,6 +511,40 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         if (opc != 0xFFU) {
             fp_quiet(b, 1U, FP_STICKY, ptype);
         }
+    }
+    if (b->fp_defer_finish != 0U) {
+        if (b->fp_batch_open == 0U) {
+            fp_batch_begin(b);
+        }
+        if (opc == 0xFFU) {
+            fp_emit1(b, ptype, 0x01U, 0x30U, 2U, 0U);
+        } else {
+            fp_emit2(b, ptype, opc, 2U, 0U, 1U);
+        }
+        a64_emit_orr_reg_w(b, 24U, 24U, FP_STICKY, A64_SHIFT_LSL, 0U);
+        if (nan2008 == 0) {
+            size_t ph_can;
+
+            fp_fix(b, 2U, ptype);
+            ph_can = a64_emit_cbz_w_placeholder(b, false, FP_STICKY);
+            if (ptype == 0u) {
+                a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
+                a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
+            } else {
+                a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
+                a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
+                a64_emit_mov_w(b, 23U, A64_TMP2);
+                a64_emit_mov_w(b, 22U, A64_TMP1);
+                a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+                fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
+            }
+            a64_patch_cbz_w(b, ph_can, b->count);
+        }
+        fp_st(b, 2U, fd, be, ptype);
+        return 0;
+    }
+    if (b->fp_batch_open != 0U) {
+        fp_batch_flush(b);
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     fp_fpcr_sync(b);
@@ -557,6 +624,43 @@ static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         fp_quiet(b, 0U, FP_STICKY, ptype);
         fp_quiet(b, 1U, FP_STICKY, ptype);
         fp_quiet(b, 3U, FP_STICKY, ptype);
+    }
+    if (b->fp_defer_finish != 0U) {
+        if (b->fp_batch_open == 0U) {
+            fp_batch_begin(b);
+        }
+        fp_emit2(b, ptype, 0x02U, 2U, 0U, 1U);
+        fp_emit2(b, ptype, opc2, 2U, 2U, 3U);
+        if (is_neg != 0) {
+            size_t ph_skip;
+
+            fp_cmp(b, ptype, 2U, 2U);
+            ph_skip = a64_emit_b_cond_placeholder(b, A64_COND_VS);
+            fp_emit1(b, ptype, 0x01U, 0x10U, 2U, 2U);
+            a64_patch_b_cond(b, ph_skip, b->count);
+        }
+        a64_emit_orr_reg_w(b, 24U, 24U, FP_STICKY, A64_SHIFT_LSL, 0U);
+        if (nan2008 == 0) {
+            fp_fix(b, 2U, ptype);
+            ph_neg = a64_emit_cbz_w_placeholder(b, false, FP_STICKY);
+            if (ptype == 0u) {
+                a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
+                a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
+            } else {
+                a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
+                a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
+                a64_emit_mov_w(b, 23U, A64_TMP2);
+                a64_emit_mov_w(b, 22U, A64_TMP1);
+                a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+                fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
+            }
+            a64_patch_cbz_w(b, ph_neg, b->count);
+        }
+        fp_st(b, 2U, fd, be, ptype);
+        return 0;
+    }
+    if (b->fp_batch_open != 0U) {
+        fp_batch_flush(b);
     }
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
     fp_fpcr_sync(b);

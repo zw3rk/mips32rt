@@ -14,14 +14,15 @@
  * and advanced ctx->pc), the trampoline chains directly to the next
  * block without returning to mips_hostfault_run: callee-saved x23
  * carries the current/next block entry across the loop (including
- * across the validated C lookup, which preserves it), and w24 is the
- * 4096-block chain budget.  w24 is reloaded from a trampoline stack
- * slot every iteration because emitted blocks freely clobber it; the
- * slot itself survives (blocks and the lookup never touch trampoline
- * stack memory).  Only EXIT_NONE/EXIT_BRANCH chain; the validated
- * lookup exits the chain under --difftest/--trace (block-lockstep
- * parity) and on uncompiled targets.  The budget bounds async-signal
- * and quiescence latency.
+ * across the validated C lookup, which preserves it), and w26 is the
+ * 4096-block chain budget (callee-saved, never touched by emitted
+ * code).  Wave P5 adds an inline IBTC probe: when ctx->ibtc_ptr is
+ * nonzero (zero under --difftest/--trace or after any SMC write),
+ * the probe resolves ctx->pc via ibtc[((pc >> 2) ^ (pc >> 12)) & 4095]
+ * without a C call and counts the hit in x27.  Only EXIT_NONE/
+ * EXIT_BRANCH chain; the validated lookup exits the chain under
+ * --difftest/--trace (block-lockstep parity) and on uncompiled
+ * targets.  The budget bounds async-signal and quiescence latency.
  */
 
 .text
@@ -47,18 +48,30 @@ dbt_trampoline_enter:
     stp x23, x24, [sp, #-16]!
     stp x25, x26, [sp, #-16]!
     stp x27, x28, [sp, #-16]!
-    sub sp, sp, #16
     mov x19, x0
     ldr x20, [x0, #0x0a8]       /* ctx->guest_base (SPEC 2.1 xG) */
     mov x23, x1                 /* x23 = current block entry */
-    movz w24, #4096
-    str w24, [sp]               /* chain budget slot */
+    mov w26, #4096              /* 4096-block chain budget (w26) */
+    mov x27, #0                 /* inline IBTC hit count */
     b .Lchain_enter
 .Lchain_next:
-    ldr w24, [sp]
-    cbz w24, .Lchain_done       /* budget exhausted: w0 holds reason */
-    sub w24, w24, #1
-    str w24, [sp]
+    subs w26, w26, #1
+    b.eq .Lchain_done           /* budget exhausted: w0 holds reason */
+    ldr x21, [x19, #0x0b0]      /* ctx->ibtc_ptr (0 disables fast path) */
+    cbz x21, .Lchain_slow
+    ldr w22, [x19, #0x080]      /* ctx->pc */
+    lsr w16, w22, #2
+    eor w16, w16, w22, lsr #12
+    and w16, w16, #0xfff
+    add x16, x21, x16, lsl #5
+    ldr w17, [x16, #0]          /* entry.guest_pc */
+    ldr x23, [x16, #8]          /* entry.code */
+    cmp w17, w22
+    b.ne .Lchain_slow
+    cbz x23, .Lchain_slow
+    add x27, x27, #1            /* inline chain hit (stats stay in C) */
+    b .Lchain_enter
+.Lchain_slow:
     mov x0, x19                 /* ctx (x19/x20 survive the call) */
 #ifdef __APPLE__
     bl _dbt_chain_next
@@ -74,7 +87,6 @@ dbt_trampoline_enter:
     cmp w0, #1
     b.ls .Lchain_next           /* chain EXIT_NONE(0)/EXIT_BRANCH(1) */
 .Lchain_done:
-    add sp, sp, #16
     ldp x27, x28, [sp], #16
     ldp x25, x26, [sp], #16
     ldp x23, x24, [sp], #16

@@ -70,4 +70,36 @@ void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot);
 
+/* Wave P5 FP batch predicates (emit_int.c gating): arith covers COP1
+ * S/D ADD/SUB/MUL/DIV/SQRT and COP1X MADD/MSUB/NMADD/NMSUB; any covers
+ * every FP op that ends a batch (moves, CFC1/CTC1, cmp, convert, mem). */
+static inline int fp_batch_is_arith(const mips_dec_t *d)
+{
+    if (d == NULL) {
+        return 0;
+    }
+    if (d->op == 0x11U) {
+        if (d->rs != 16U && d->rs != 17U) {
+            return 0;
+        }
+        return d->funct <= 0x04U;
+    }
+    if (d->op == 0x13U) {
+        return (d->funct & 0x26U) == 0x20U;
+    }
+    return 0;
+}
+
+static inline int fp_batch_is_any(const mips_dec_t *d)
+{
+    unsigned o;
+
+    if (d == NULL) {
+        return 0;
+    }
+    o = d->op;
+    return o == 0x11U || o == 0x13U || o == 0x31U || o == 0x35U ||
+        o == 0x39U || o == 0x3DU;
+}
+
 #endif /* MIPS32RT_EMIT_PRIV_H */

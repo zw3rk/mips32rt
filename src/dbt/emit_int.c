@@ -830,20 +830,36 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
     a64_buf_init(&b, (uint32_t *)out, cap / 4U);
     emit_prologue(&b, insns, count);
     cur = pc;
-    for (i = 0U; i < count; i++) {
-        const mips_dec_t *d = &insns[i];
-        int rc;
-        /* Approaching staging capacity: close the block cleanly and
-         * publish its prefix instead of overflowing and discarding
-         * the whole compilation.  256 words of headroom cover the
-         * largest single exit sequence. */
-        if (i > 0U && b.count + 256U > b.cap) {
-            emit_exit_imm(&b, MIPS32_EXIT_BRANCH, 0U, cur, cur + 4U);
-            *out_end = cur; break;
-        }
-        if (d->op == MIPS_OP_COP1 || d->op == 0x13u) {
-            if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode, ctx->nan2008)) { cur += 4U; continue; }
-        }
+    {
+        unsigned k, j;
+        int ok = (ctx->difftest_enabled == 0 &&
+            (ctx->fcsr & 0x01000F83U) == 0U) ? 1 : 0;
+        for (k = 0U; ok != 0 && k < count; k++) if (insns[k].op == MIPS_OP_COP1 && insns[k].rs == 6U) ok = 0;
+        b.fp_batch_open = 0U;
+        for (i = 0U; i < count; i++) {
+            const mips_dec_t *d = &insns[i];
+            int rc;
+            if (i > 0U && b.count + 256U > b.cap) {
+                emit_exit_imm(&b, MIPS32_EXIT_BRANCH, 0U, cur, cur + 4U);
+                *out_end = cur; break;
+            }
+            if (d->op == MIPS_OP_COP1 || d->op == 0x13u) {
+                b.fp_defer_finish = 0U;
+                if (ok != 0 && fp_batch_is_arith(d) != 0) {
+                    for (j = i + 1U; j < count; j++) {
+                        if (is_ctl(&insns[j]) == 0 &&
+                            fp_batch_is_any(&insns[j]) == 0) {
+                            continue;
+                        }
+                        if (fp_batch_is_arith(&insns[j]) != 0) {
+                            b.fp_defer_finish = 1U;
+                        }
+                        break;
+                    }
+                }
+                if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode,
+                    ctx->nan2008)) { cur += 4U; continue; }
+            }
         if (is_ctl(d) != 0) {
             if (i + 1U >= count || slot_ok(&insns[i + 1]) == 0) {
                 emit_exit_imm(&b, MIPS32_EXIT_SINGLE_STEP, 0U, cur, cur + 4U);
@@ -868,6 +884,7 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         if (rc < 0) emit_exit_imm(&b, MIPS32_EXIT_UNDEF, 0U, cur, cur + 4U);
         *out_end = cur + (rc < 0 ? 0U : 4U);
         break;
+        }
     }
     if (b.overflow) { *out_len = 0U; *out_end = pc; return -1; }
     if (i >= count) {

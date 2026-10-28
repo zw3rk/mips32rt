@@ -164,15 +164,16 @@ static void emit_ll_unlock(a64_buf_t *b)
     a64_emit_str_imm_w(b, A64_ZR, A64_TMP1, 0U);
 }
 
-/* Wave P4 ll_active gate: ldrb Wt,[x20,wOff,uxtw] at ACTIVE_OFFSET.
- * Returns a CBZ patch (taken when flag == 0) to the plain-store fast
- * path. Clobbers only W16/X16; A64_ADDR survives. */
+/* Wave P5 ll_active gate: ldrb Wt,[x20,wOff,uxtw] at ACTIVE_OFFSET.
+ * Returns a CBNZ patch (taken when flag != 0) to the slow LL path.
+ * Fast path (flag == 0) falls through to the plain store. Clobbers
+ * only W16/X16; A64_ADDR survives. */
 static size_t emit_active_fast(a64_buf_t *b)
 {
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_ACTIVE_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_TMP1);
     a64_emit_ldrb_imm_w(b, A64_TMP1, A64_TMP1, 0U);
-    return a64_emit_cbz_w_placeholder(b, false, A64_TMP1);
+    return a64_emit_cbz_w_placeholder(b, true, A64_TMP1);
 }
 
 /* Alignment guard (fault info = runtime address in w22).  Linux MIPS
@@ -286,33 +287,40 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         put_rd(b, rt, dst);
         return;
     case MIPS_OP_SB: {
-        size_t ph_fast, ph_done;
+        size_t ph_slow, ph_done;
 
-        ph_fast = emit_active_fast(b);
+        ph_slow = emit_active_fast(b);
+        a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
+        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, ph_slow, b->count);
         emit_ll_lock(b);
         a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
         emit_epoch_bump_len(b, A64_ADDR, 1u);
         emit_reservation_break(b, A64_ADDR, 0);
         emit_ll_unlock(b);
-        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-        a64_patch_cbz_w(b, ph_fast, b->count);
-        a64_emit_guest_strb_w(b, op_val(b, rt, A64_TMP1), A64_ADDR);
         a64_patch_b_cond(b, ph_done, b->count);
         return;
     }
     case MIPS_OP_SH: case MIPS_OP_SW: {
         /* The alignment guard runs first: on a misaligned exit the
          * lock must never be taken (its RET paths skip unlock). */
-        size_t ph_fast, ph_done;
+        size_t ph_slow, ph_done;
         unsigned vf;
 
         emit_align_fault(b, (d->op == MIPS_OP_SH) ? 0U : 1U, fpc,
                          ind_slot);
-        ph_fast = emit_active_fast(b);
-        emit_ll_lock(b);
-        /* TMP2: the check below clobbers TMP1. */
-        v = op_val(b, rt, A64_TMP2);
+        ph_slow = emit_active_fast(b);
+        vf = op_val(b, rt, A64_TMP2);
         if (be == 0) {
+            if (d->op == MIPS_OP_SH) {
+                a64_emit_guest_strh_w(b, vf, A64_ADDR);
+            } else {
+                a64_emit_guest_str_w(b, vf, A64_ADDR);
+            }
+            ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+            a64_patch_cbz_w(b, ph_slow, b->count);
+            emit_ll_lock(b);
+            v = op_val(b, rt, A64_TMP2);
             if (d->op == MIPS_OP_SH) {
                 a64_emit_guest_strh_w(b, v, A64_ADDR);
             } else {
@@ -323,17 +331,23 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
             emit_reservation_break(b, A64_ADDR,
                                    (d->op == MIPS_OP_SW) ? 1 : 0);
             emit_ll_unlock(b);
-            ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-            a64_patch_cbz_w(b, ph_fast, b->count);
-            vf = op_val(b, rt, A64_TMP2);
-            if (d->op == MIPS_OP_SH) {
-                a64_emit_guest_strh_w(b, vf, A64_ADDR);
-            } else {
-                a64_emit_guest_str_w(b, vf, A64_ADDR);
-            }
             a64_patch_b_cond(b, ph_done, b->count);
             return;
         }
+        if (d->op == MIPS_OP_SH) {
+            a64_emit_rev16_w(b, A64_TMP1, vf);
+        } else {
+            a64_emit_rev_w(b, A64_TMP1, vf);
+        }
+        if (d->op == MIPS_OP_SH) {
+            a64_emit_guest_strh_w(b, A64_TMP1, A64_ADDR);
+        } else {
+            a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
+        }
+        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, ph_slow, b->count);
+        emit_ll_lock(b);
+        v = op_val(b, rt, A64_TMP2);
         if (d->op == MIPS_OP_SH) {
             a64_emit_rev16_w(b, A64_TMP1, v);
         } else {
@@ -348,19 +362,6 @@ void emit_mem_aligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_reservation_break(b, A64_ADDR,
                                (d->op == MIPS_OP_SW) ? 1 : 0);
         emit_ll_unlock(b);
-        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-        a64_patch_cbz_w(b, ph_fast, b->count);
-        vf = op_val(b, rt, A64_TMP2);
-        if (d->op == MIPS_OP_SH) {
-            a64_emit_rev16_w(b, A64_TMP1, vf);
-        } else {
-            a64_emit_rev_w(b, A64_TMP1, vf);
-        }
-        if (d->op == MIPS_OP_SH) {
-            a64_emit_guest_strh_w(b, A64_TMP1, A64_ADDR);
-        } else {
-            a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
-        }
         a64_patch_b_cond(b, ph_done, b->count);
         return;
     }
@@ -390,15 +391,16 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
     size_t ph_cbz[3], ph_end[3];
 
     emit_sync_pc(b, fpc, ind_slot);
-    /* Wave P4 gate: when ll_active == 0 skip the lock (fast path shares
-     * the byte loop below; a second gate after the loop skips the
-     * bump/break/unlock). Lock before the k dispatch so every offset
-     * path (0-3) holds it when active. */
+    /* Wave P5 gate: CBNZ to the lock when active; inactive falls
+     * through to the shared byte loop. Lock stays before the k
+     * dispatch so every offset path (0-3) holds it when active. */
     if (is_load == 0) {
-        size_t ph_no_lock = emit_active_fast(b);
+        size_t ph_lock = emit_active_fast(b);
+        size_t ph_loop = a64_emit_b_cond_placeholder(b, A64_COND_AL);
 
+        a64_patch_cbz_w(b, ph_lock, b->count);
         emit_ll_lock(b);
-        a64_patch_cbz_w(b, ph_no_lock, b->count);
+        a64_patch_b_cond(b, ph_loop, b->count);
     }
     a64_emit_ubfm_w(b, A64_TMP1, A64_ADDR, 0U, 1U);
     a64_emit_shift_imm_w(b, A64_TMP3, A64_ADDR, A64_SHIFT_LSR, 2U, false,
@@ -470,14 +472,16 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         /* TMP3 still holds the aligned word base: same-word stores
          * break a live LL reservation.  Written bytes sit inside
          * [pa, pa + 4), so bump both lines in case the group spans a
-         * 64-byte boundary. Wave P4 second gate: skip bump/break/
-         * unlock when ll_active == 0 (fast path: plain bytes only). */
-        size_t ph_no_bump = emit_active_fast(b);
+         * 64-byte boundary. Wave P5 second gate: fast (inactive)
+         * falls through, slow bumps/breaks/unlocks at .Lslow. */
+        size_t ph_slow = emit_active_fast(b);
+        size_t ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
 
+        a64_patch_cbz_w(b, ph_slow, b->count);
         emit_epoch_bump_len(b, A64_TMP3, 4u);
         emit_reservation_break(b, A64_TMP3, 0);
         emit_ll_unlock(b);
-        a64_patch_cbz_w(b, ph_no_bump, b->count);
+        a64_patch_b_cond(b, ph_done, b->count);
     }
 }
 
@@ -507,10 +511,17 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
         return;
     case 0x39u: { /* SWC1 */
-        size_t ph_fast, ph_done;
+        size_t ph_slow, ph_done;
 
         emit_align_fault(b, 1U, fpc, ind_slot);
-        ph_fast = emit_active_fast(b);
+        ph_slow = emit_active_fast(b);
+        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+        }
+        a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
+        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, ph_slow, b->count);
         /* Data loads after the lock: emit_ll_lock clobbers W16/W17. */
         emit_ll_lock(b);
         a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
@@ -521,13 +532,6 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_epoch_bump_len(b, A64_ADDR, 4u);
         emit_reservation_break(b, A64_ADDR, 1);
         emit_ll_unlock(b);
-        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-        a64_patch_cbz_w(b, ph_fast, b->count);
-        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
-        if (be != 0) {
-            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-        }
-        a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
         a64_patch_b_cond(b, ph_done, b->count);
         return;
     }
@@ -545,10 +549,26 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         }
         return;
     case 0x3du: { /* SDC1 */
-        size_t ph_fast, ph_done;
+        size_t ph_slow, ph_done;
 
         emit_align_fault(b, 2U, fpc, ind_slot);
-        ph_fast = emit_active_fast(b);
+        ph_slow = emit_active_fast(b);
+        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
+        a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
+        if (be != 0) {
+            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
+            a64_emit_rev_w(b, A64_TMP2, A64_TMP2);
+        }
+        a64_emit_add_imm_w(b, false, A64_TMP3, A64_ADDR, 4U, 0U);
+        if (be != 0) {
+            a64_emit_guest_str_w(b, A64_TMP2, A64_ADDR);
+            a64_emit_guest_str_w(b, A64_TMP1, A64_TMP3);
+        } else {
+            a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
+            a64_emit_guest_str_w(b, A64_TMP2, A64_TMP3);
+        }
+        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, ph_slow, b->count);
         /* Data loads after the lock: emit_ll_lock clobbers W16/W17. */
         emit_ll_lock(b);
         a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
@@ -557,7 +577,6 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
             a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
             a64_emit_rev_w(b, A64_TMP2, A64_TMP2);
         }
-        /* W21 is dead here (no FCSR traffic in this op). */
         a64_emit_add_imm_w(b, false, A64_TMP3, A64_ADDR, 4U, 0U);
         if (be != 0) {
             a64_emit_guest_str_w(b, A64_TMP2, A64_ADDR);
@@ -570,22 +589,6 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_reservation_break(b, A64_ADDR, 0);
         emit_reservation_break(b, A64_TMP3, 0);
         emit_ll_unlock(b);
-        ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-        a64_patch_cbz_w(b, ph_fast, b->count);
-        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
-        a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
-        if (be != 0) {
-            a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
-            a64_emit_rev_w(b, A64_TMP2, A64_TMP2);
-        }
-        a64_emit_add_imm_w(b, false, A64_TMP3, A64_ADDR, 4U, 0U);
-        if (be != 0) {
-            a64_emit_guest_str_w(b, A64_TMP2, A64_ADDR);
-            a64_emit_guest_str_w(b, A64_TMP1, A64_TMP3);
-        } else {
-            a64_emit_guest_str_w(b, A64_TMP1, A64_ADDR);
-            a64_emit_guest_str_w(b, A64_TMP2, A64_TMP3);
-        }
         a64_patch_b_cond(b, ph_done, b->count);
         return;
     }
