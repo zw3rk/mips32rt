@@ -407,24 +407,25 @@ static void *dbt_lookup_bi(mips32_ctx_t *ctx, uint32_t pc, size_t *bip)
         }
         return dbt_cache->last_code;
     }
-    /* RAS fast path: a return to the recorded guest address pops the top. */
+    /* RAS fast path: a return to the recorded guest address pops the top.
+     * The entry carries its resolved code and block index directly; no
+     * O(N) pool rescan (dbt_main revalidates bi before use). */
     if (dbt_cache->ras_top > 0) {
         dbt_ras_entry_t *r = &dbt_cache->ras[dbt_cache->ras_top - 1];
         if (r->guest_pc == pc && r->code != NULL && r->smc_version == smc) {
-            void *code = dbt_pool_lookup(pc, smc, &bi);
+            void *code = r->code;
 
+            bi = r->blk_idx;
             dbt_cache->ras_top--;
-            if (code != NULL) {
-                dbt_cache->last_pc = pc;
-                dbt_cache->last_code = code;
-                dbt_cache->last_smc = smc;
-                dbt_cache->last_valid = 1;
-                dbt_cache->last_bi = bi;
-                if (bip != NULL) {
-                    *bip = bi;
-                }
-                return code;
+            dbt_cache->last_pc = pc;
+            dbt_cache->last_code = code;
+            dbt_cache->last_smc = smc;
+            dbt_cache->last_valid = 1;
+            dbt_cache->last_bi = bi;
+            if (bip != NULL) {
+                *bip = bi;
             }
+            return code;
         }
     }
     /* 4096-entry IBTC keyed by guest PC, validated by smc_version. */
@@ -478,6 +479,8 @@ static void dbt_ras_push(uint32_t pc)
 {
     uint32_t smc;
     void *code;
+    size_t bi = 0;
+    dbt_ibtc_entry_t *e;
 
     if (dbt_cache->ras_top >= MIPS32_RAS_SIZE) {
         memmove(&dbt_cache->ras[0], &dbt_cache->ras[1],
@@ -485,10 +488,17 @@ static void dbt_ras_push(uint32_t pc)
         dbt_cache->ras_top = MIPS32_RAS_SIZE - 1U;
     }
     smc = dbt_smc_version(NULL, mips32_page_down(pc));
-    code = dbt_pool_lookup(pc, smc, NULL);
+    e = &dbt_cache->ibtc[dbt_ibtc_index(pc)];
+    if (e->code != NULL && e->guest_pc == pc && e->smc_version == smc) {
+        code = e->code;
+        bi = e->blk_idx;
+    } else {
+        code = dbt_pool_lookup(pc, smc, &bi);
+    }
     dbt_cache->ras[dbt_cache->ras_top].guest_pc = pc;
     dbt_cache->ras[dbt_cache->ras_top].code = code;
     dbt_cache->ras[dbt_cache->ras_top].smc_version = smc;
+    dbt_cache->ras[dbt_cache->ras_top].blk_idx = bi;
     dbt_cache->ras_top++;
 }
 

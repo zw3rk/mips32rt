@@ -28,9 +28,9 @@
 
 /* Pool sizes (all counts, never VLAs). */
 #define DBT_MAX_BLOCKS 1024U
-#define DBT_CODE_POOL_SIZE (4U * 1024U * 1024U)
+#define DBT_CODE_POOL_SIZE (16U * 1024U * 1024U)
 #define DBT_SMC_TABLE_SIZE 1024U
-#define DBT_STAGING_SIZE 4096U
+#define DBT_STAGING_SIZE 65536U
 
 /* One IBTC slot: direct-mapped by guest PC, validated by smc_version. */
 typedef struct dbt_ibtc_entry {
@@ -45,6 +45,7 @@ typedef struct dbt_ras_entry {
     uint32_t guest_pc;
     void    *code;
     uint32_t smc_version;
+    size_t   blk_idx; /* index into dbt_cache.blocks (O(1) metadata) */
 } dbt_ras_entry_t;
 
 /* One guest-page version slot for SMC invalidation. */

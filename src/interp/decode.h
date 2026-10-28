@@ -89,11 +89,13 @@
 #define MIPS_FUNCT_SLT   0x2aU
 #define MIPS_FUNCT_SLTU  0x2bU
 
-/* COP1 branch sub-opcodes: op == MIPS_OP_COP1, rs == 8 (BC). */
+/* COP1 branch sub-opcodes: op == MIPS_OP_COP1, rs == 8 (BC).
+ * Values are raw rt bits: bit0 = tf (T/F), bit1 = nd (likely),
+ * bits[4:2] = cc (GAS: bc1t -> rt=1, bc1fl -> rt=2). */
 #define MIPS_COP1_RS_BC  8U
 #define MIPS_COP1_BC1F   0x00U
-#define MIPS_COP1_BC1FL  0x01U
-#define MIPS_COP1_BC1T   0x02U
+#define MIPS_COP1_BC1T   0x01U
+#define MIPS_COP1_BC1FL  0x02U
 #define MIPS_COP1_BC1TL  0x03U
 
 /*

@@ -96,8 +96,8 @@ static const decode_case_t cases[] = {
     { "rdhwr", 0x7c08e83bU, 31, 0, 8, 29, 0, 0x3b, 0xe83b, 0x008e83bU, -6085, 59451U },
     /* COP1. */
     { "mfc1", 0x44084800U, 17, 0, 8, 9, 0, 0x00, 0x4800, 0x00084800U, 18432, 18432U },
-    { "bc1t", 0x45020005U, 17, 8, 2, 0, 0, 0x05, 0x0005, 0x01020005U, 5, 5U },
-    { "bc1fl", 0x4501fff8U, 17, 8, 1, 31, 31, 0x38, 0xfff8, 0x0101fff8U, -8, 65528U }
+    { "bc1fl", 0x45020005U, 17, 8, 2, 0, 0, 0x05, 0x0005, 0x01020005U, 5, 5U },
+    { "bc1t", 0x4501fff8U, 17, 8, 1, 31, 31, 0x38, 0xfff8, 0x0101fff8U, -8, 65528U }
 };
 
 #define N_CASES (sizeof(cases) / sizeof(cases[0]))
@@ -128,8 +128,8 @@ static const class_case_t class_cases[] = {
     { "mfc0", 40, 0, 0, 0, 0 },
     { "rdhwr", 41, 0, 0, 0, 0 },
     { "mfc1", 42, 0, 0, 0, 0 },
-    { "bc1t", 43, 1, 0, 0, 0 },
-    { "bc1fl", 44, 1, 1, 0, 0 }
+    { "bc1fl", 43, 1, 1, 0, 0 },
+    { "bc1t", 44, 1, 0, 0, 0 }
 };
 
 #define N_CLASS (sizeof(class_cases) / sizeof(class_cases[0]))

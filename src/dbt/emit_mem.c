@@ -96,12 +96,12 @@ static void emit_epoch_bump_idx(a64_buf_t *b, unsigned idx_w)
  * W16/W17/X16; addr_w survives. */
 static void emit_epoch_bump_len(a64_buf_t *b, unsigned addr_w, unsigned len)
 {
-    a64_emit_ubfm_w(b, A64_TMP2, addr_w, 6U, 11U);
+    a64_emit_ubfm_w(b, A64_TMP2, addr_w, 6U, 17U);
     emit_epoch_bump_idx(b, A64_TMP2);
     if (len > 1u) {
         a64_emit_add_imm_w(b, false, A64_TMP2, addr_w,
                            (uint16_t)(len - 1u), 0U);
-        a64_emit_ubfm_w(b, A64_TMP2, A64_TMP2, 6U, 11U);
+        a64_emit_ubfm_w(b, A64_TMP2, A64_TMP2, 6U, 17U);
         emit_epoch_bump_idx(b, A64_TMP2);
     }
 }
@@ -111,7 +111,7 @@ static void emit_epoch_bump_len(a64_buf_t *b, unsigned addr_w, unsigned len)
  * addr_w survives. */
 static void emit_epoch_record(a64_buf_t *b, unsigned addr_w)
 {
-    a64_emit_ubfm_w(b, A64_TMP2, addr_w, 6U, 11U);
+    a64_emit_ubfm_w(b, A64_TMP2, addr_w, 6U, 17U);
     emit_epoch_load(b, A64_TMP2, A64_TMP2);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_SEQ_OFFSET);
     a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
@@ -565,7 +565,7 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     /* Epoch gate: the full 64-bit table entry must equal the LL
      * snapshot in ctx->ll_epoch_snap.  Verified BEFORE the store, so
      * a failed SC never commits a write. */
-    a64_emit_ubfm_w(b, A64_TMP2, A64_ADDR, 6U, 11U);
+    a64_emit_ubfm_w(b, A64_TMP2, A64_ADDR, 6U, 17U);
     a64_emit_mov_imm32(b, A64_TMP1, EMIT_LL_EPOCH_OFFSET);
     a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2,
                        A64_SHIFT_LSL, 3U);

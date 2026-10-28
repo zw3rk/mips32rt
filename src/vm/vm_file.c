@@ -260,8 +260,8 @@ int mips32_file_truncate_at(int fd, uint64_t len)
  * mips_syscall_extra cases + frozen src/os/syscall_nr.h numbers) is
  * coordinator-owned; this function is the payload those cases call.
  * 64-bit lengths follow the O32 even-register rule: the 32-bit first
- * argument occupies a0, a1 is padding, and the length arrives as
- * high word in a2 and low word in a3. */
+ * argument occupies a0, a1 is padding, and the length arrives in
+ * a2/a3 (high word first on BE guests, low word first on LE). */
 int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
 {
     int ok = 1;
@@ -287,12 +287,16 @@ int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
             }
             len = (uint64_t)(int64_t)len32;
         } else {
-            uint32_t hi = mips_sc_arg(ctx, sp, 2, &ok);
-            uint32_t lo = mips_sc_arg(ctx, sp, 3, &ok);
+            /* O32 even-register rule: the 64-bit length starts in a2
+             * (a1 is padding).  BE passes high word first, LE passes
+             * low word first. */
+            uint32_t a2 = mips_sc_arg(ctx, sp, 2, &ok);
+            uint32_t a3 = mips_sc_arg(ctx, sp, 3, &ok);
             if (!ok) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
-            len = ((uint64_t)hi << 32) | (uint64_t)lo;
+            len = mips_is_be(ctx) ? (((uint64_t)a2 << 32) | (uint64_t)a3)
+                                  : (((uint64_t)a3 << 32) | (uint64_t)a2);
         }
         rc = mips_sc_read_cstr(ctx, path_va, path);
         if (rc != 0) {
@@ -325,12 +329,16 @@ int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
             }
             len = (uint64_t)(int64_t)len32;
         } else {
-            uint32_t hi = mips_sc_arg(ctx, sp, 2, &ok);
-            uint32_t lo = mips_sc_arg(ctx, sp, 3, &ok);
+            /* O32 even-register rule: the 64-bit length starts in a2
+             * (a1 is padding).  BE passes high word first, LE passes
+             * low word first. */
+            uint32_t a2 = mips_sc_arg(ctx, sp, 2, &ok);
+            uint32_t a3 = mips_sc_arg(ctx, sp, 3, &ok);
             if (!ok) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
-            len = ((uint64_t)hi << 32) | (uint64_t)lo;
+            len = mips_is_be(ctx) ? (((uint64_t)a2 << 32) | (uint64_t)a3)
+                                  : (((uint64_t)a3 << 32) | (uint64_t)a2);
         }
         rc = mips32_file_truncate_at((int)fd, len);
         if (rc != 0) {

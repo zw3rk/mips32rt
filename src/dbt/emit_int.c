@@ -12,6 +12,11 @@
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
 #include "dbt/emit_priv.h"
+/* FP emitter (src/dbt/emit_fp.c): 0 emitted (advance 4), nonzero declines
+ * to the dispatcher's fallback.  BC1 declines here; its native branch
+ * lives in emit_branch below, which owns the delay-slot instruction. */
+int dbt_emit_fp(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, uint32_t fpc,
+                int be, int fr_mode, int nan2008);
 /* Cached guest GPR -> host W register (SPEC 2.1 order). */
 static const int8_t kGprHost[32] = {
     -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
@@ -535,7 +540,8 @@ static int emit_cop0(a64_buf_t *b, const mips_dec_t *d)
 }
 
 static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                    uint32_t fpc, int be, int ind_slot);
+                    uint32_t fpc, int be, int ind_slot,
+                    const mips32_ctx_t *ctx);
 
 /* Control with delay slot (REGIMM 0x12/0x13 included, mirroring interp). */
 static int is_ctl(const mips_dec_t *d)
@@ -559,7 +565,8 @@ static void emit_link_imm(a64_buf_t *b, unsigned rd, uint32_t val)
  * until after the slot: committing first would clobber rs, and a fault
  * in the slot would then re-execute the jump to the wrong target. */
 static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
-                        const mips_dec_t *s, uint32_t cur, int be)
+                        const mips_dec_t *s, uint32_t cur, int be,
+                        const mips32_ctx_t *ctx)
 {
     uint32_t nottaken = cur + 8U, taken = 0U;
     unsigned cond = A64_COND_AL;
@@ -593,6 +600,19 @@ static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
         default: break;
         }
         break;
+    case MIPS_OP_COP1: { /* BC1F/BC1T/BC1FL/BC1TL (rs == 8; only control
+        * COP1 reaches emit_branch).  cc selects the FCSR FCC bit
+        * (bit 23 for cc0, bit 24+cc otherwise); tf selects the sense. */
+        unsigned cc = ((unsigned)d->rt >> 2U) & 7U;
+        unsigned fcc = (cc == 0U) ? 23U : (24U + cc);
+        unsigned tf = (unsigned)d->rt & 1U;
+
+        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+        a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, fcc, fcc);
+        a64_emit_sub_imm_w(b, true, A64_ZR, A64_TMP1, 0U, 0U);
+        cond = (tf != 0U) ? A64_COND_NE : A64_COND_EQ;
+        break;
+    }
     default:
         break;
     }
@@ -612,7 +632,7 @@ static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
         emit_link_imm(b, (unsigned)link_rd, cur + 8U);
     }
     if (indirect != 0) {
-        (void)emit_one(b, s, cur + 4U, cur, be, 1);
+        (void)emit_one(b, s, cur + 4U, cur, be, 1, ctx);
         if (defer_link != 0) {
             emit_link_imm(b, (unsigned)link_rd, cur + 8U);
         }
@@ -620,17 +640,17 @@ static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
         return;
     }
     if (cond == A64_COND_AL) {
-        (void)emit_one(b, s, cur + 4U, cur, be, 0);
+        (void)emit_one(b, s, cur + 4U, cur, be, 0, ctx);
         emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, taken, taken + 4U);
         return;
     }
     ph_t = a64_emit_b_cond_placeholder(b, cond);
     if (mips_is_branch_likely(d) == 0 && (d->op != MIPS_OP_REGIMM ||
         (d->rt != 0x12U && d->rt != 0x13U)))
-        (void)emit_one(b, s, cur + 4U, cur, be, 0);
+        (void)emit_one(b, s, cur + 4U, cur, be, 0, ctx);
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, nottaken, nottaken + 4U);
     a64_patch_b_cond(b, ph_t, b->count);
-    (void)emit_one(b, s, cur + 4U, cur, be, 0);
+    (void)emit_one(b, s, cur + 4U, cur, be, 0, ctx);
     emit_exit_imm(b, MIPS32_EXIT_BRANCH, 0U, taken, taken + 4U);
 }
 
@@ -638,7 +658,8 @@ static void emit_branch(a64_buf_t *b, const mips_dec_t *d,
  * marks a JR/JALR delay slot (fault exits recover next_pc from
  * ctx->delay_target). */
 static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
-                    uint32_t fpc, int be, int ind_slot)
+                    uint32_t fpc, int be, int ind_slot,
+                    const mips32_ctx_t *ctx)
 {
     switch (d->op) {
     case MIPS_OP_SPECIAL: return emit_special(b, d, cur, fpc, ind_slot);
@@ -650,6 +671,11 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     case MIPS_OP_XORI: case MIPS_OP_LUI:
         return emit_imm_op(b, d, cur, fpc, ind_slot);
     case MIPS_OP_COP0: return emit_cop0(b, d);
+    case MIPS_OP_COP1: /* Non-branch COP1 (moves/arithmetic): BC1 declines
+        * in dbt_emit_fp and falls back to interp_step. */
+        return (ctx != NULL &&
+            dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
+            ? 0 : -1;
     case MIPS_OP_LB: case MIPS_OP_LH: case MIPS_OP_LW: case MIPS_OP_LBU:
     case MIPS_OP_LHU: case MIPS_OP_SB: case MIPS_OP_SH: case MIPS_OP_SW:
         emit_ea(b, d->rs, d->simm);
@@ -714,6 +740,9 @@ static int slot_ok(const mips_dec_t *d)
     /* Wave P lane P4: FP memory moves share the fault-sync machinery
      * with integer memory ops, so they are delay-slot safe. */
     case 0x31u: case 0x35u: case 0x39u: case 0x3du: return 1;
+    /* Non-branch COP1 (moves/arithmetic) inlines with no exit of its
+     * own; BC1 branches keep delay-slot ownership in emit_branch. */
+    case MIPS_OP_COP1: return d->rs != 0x08U;
     default: return 0;
     }
 }
@@ -755,19 +784,18 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         const mips_dec_t *d = &insns[i];
         int rc;
         if (d->op == MIPS_OP_COP1) {
-            int dbt_emit_fp(a64_buf_t *, const mips_dec_t *, uint32_t, uint32_t, int, int, int);
             if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode, ctx->nan2008)) { cur += 4U; continue; }
         }
         if (is_ctl(d) != 0) {
-            if (d->op == MIPS_OP_COP1 || i + 1U >= count || slot_ok(&insns[i + 1]) == 0) {
+            if (i + 1U >= count || slot_ok(&insns[i + 1]) == 0) {
                 emit_exit_imm(&b, MIPS32_EXIT_SINGLE_STEP, 0U, cur, cur + 4U);
                 *out_end = cur; break;
             }
-            emit_branch(&b, d, &insns[i + 1], cur, be);
+            emit_branch(&b, d, &insns[i + 1], cur, be, ctx);
             *out_end = cur + 8U;
             break;
         }
-        rc = emit_one(&b, d, cur, cur, be, 0);
+        rc = emit_one(&b, d, cur, cur, be, 0, ctx);
         if (rc == 0) { cur += 4U; continue; }
         if (rc < 0) emit_exit_imm(&b, MIPS32_EXIT_UNDEF, 0U, cur, cur + 4U);
         *out_end = cur + (rc < 0 ? 0U : 4U);
