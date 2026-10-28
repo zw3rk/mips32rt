@@ -409,6 +409,63 @@ __attribute__((noinline)) static void t_jr(void)
     check("jr", d == 1 && f == 0 && t == 7, db);
 }
 
+/* FP op in a JR delay slot (Wave P3 astra): the slot op spills FPCR
+ * through w23, which also carries the indirect target; the indirect
+ * exit must reload w23 from ctx->delay_target. */
+__attribute__((noinline)) static void t_jr_fp_slot(void)
+{
+    char db[96];
+    int landed = 0;
+    uint32_t back = 0u;
+    uint32_t a = 0x3fc00000u; /* 1.5f */
+    uint32_t b = 0x40200000u; /* 2.5f */
+    void *tgt = NULL;
+    __asm__ volatile(
+        "mtc1 %3, $f2\n"
+        "mtc1 %4, $f4\n"
+        ".set noreorder\n"
+        "la %2, 1f\n"
+        "jr %2\n"
+        "add.s $f0, $f2, $f4\n" /* slot: must not divert the jump */
+        "addiu %0, $0, 99\n"    /* trap pad: never executes */
+        "j 2f\n"
+        "nop\n"
+        "1:\n"
+        "addiu %0, %0, 1\n"
+        "mfc1 %1, $f0\n"
+        "2:\n"
+        ".set reorder\n"
+        : "+r"(landed), "=&r"(back), "=&r"(tgt)
+        : "r"(a), "r"(b)
+        : "memory", "$f0", "$f2", "$f4");
+    snprintf(db, sizeof db, "landed=%d bits=0x%08x", landed, back);
+    check("jr-fp-slot", landed == 1 && back == 0x40800000u, db);
+}
+
+/* Declined COP1 op in a branch delay slot (Wave P3 astra): cfc1 $0
+ * (FIR) is not natively emitted, so the DBT must rewind the branch
+ * and single-step the pair instead of silently skipping the slot. */
+__attribute__((noinline)) static void t_cfc1_slot(void)
+{
+    char db[96];
+    uint32_t v = 0u;
+    int f = 0;
+    int t = 0;
+    __asm__ volatile(
+        ".set noreorder\n"
+        "beq %2, %3, 1f\n"
+        "cfc1 %0, $0\n" /* declined slot: must still execute */
+        "addiu %1, $0, 100\n"
+        "1:\n"
+        "addiu %1, %1, 7\n"
+        ".set reorder\n"
+        : "=&r"(v), "+r"(f)
+        : "r"(t), "r"(t)
+        : "memory");
+    snprintf(db, sizeof db, "fir=0x%08x f=%d", v, f);
+    check("cfc1-slot", v == 0x00739300u && f == 7, db);
+}
+
 /* ================= fault capture (page-end + delay-slot) ================= */
 
 static volatile int g_sig;
@@ -932,6 +989,8 @@ int main(void)
     t_jlink();
     t_jalr();
     t_jr();
+    t_jr_fp_slot();
+    t_cfc1_slot();
     t_beql_pageend();
     t_delayslot_sigpc();
     t_llsc();

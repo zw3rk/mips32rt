@@ -43,10 +43,14 @@ void emit_ea(a64_buf_t *b, unsigned rs, int32_t simm)
 /* RC4: flush cached GPRs + record fpc in ctx->pc before a guest-memory
  * access that can host-fault (delivery reads ctx).  In a JR/JALR delay
  * slot ctx->next_pc also recovers from ctx->delay_target (the dynamic
- * jump target is otherwise only in x23, lost on a host fault). */
+ * jump target is otherwise only in x23, lost on a host fault).  The
+ * straight-line flush makes every cached GPR clean in ctx->r[], so the
+ * dirty set is cleared (out-of-line fault/branch exits keep flushing
+ * whatever is still dirty). */
 static void emit_sync_pc(a64_buf_t *b, uint32_t fpc, int ind_slot)
 {
     emit_flush(b);
+    b->gpr_dirty = 0U;
     a64_emit_mov_imm32(b, A64_TMP1, fpc);
     a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
     if (ind_slot != 0) {

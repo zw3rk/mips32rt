@@ -76,6 +76,10 @@ typedef struct a64_buf {
     size_t    count;
     size_t    cap;
     bool      overflow;
+    /* Bit g set: cached guest GPR g holds a value newer than ctx->r[g]
+     * and must be stored back by the next flush.  Bit index is the
+     * guest register number (only the 16 kCached GPRs are ever set). */
+    uint32_t  gpr_dirty;
     unsigned  cond_branch_depth;
     uint32_t  guest_start_pc;
     uint32_t  guest_end_pc;
@@ -92,6 +96,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     memset(b, 0, sizeof(*b));
     b->words = storage;
     b->cap   = cap;
+    b->gpr_dirty = 0U;
 }
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)

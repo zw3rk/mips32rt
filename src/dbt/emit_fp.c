@@ -125,6 +125,7 @@ static void fp_put(a64_buf_t *b, unsigned g, unsigned src)
     h = (g < 32U) ? (int)kFpGprHost[g] : -1;
     if (h >= 0) {
         a64_emit_mov_w(b, (unsigned)h, src);
+        b->gpr_dirty |= (1U << g);
         return;
     }
     a64_emit_str_imm_w(b, src, A64_XCTX, g * 4U);
@@ -221,19 +222,19 @@ void fp_fpcr_restore(a64_buf_t *b)
     a64_patch_b_cond(b, ph, b->count);
 }
 
-/* Save host FPSR in X24 and clear the cumulative flags. */
+/* Clear the host cumulative flags (host FPSR is caller-clobbered, so
+ * no save/restore is needed around an op: clear runs before the op,
+ * read collects its flags right after). */
 void fp_fpsr_clear(a64_buf_t *b)
 {
-    fp_sys(b, 0U, 0U, 24U);
     fp_sys(b, 1U, 0U, 31U);
 }
 
-/* Read cumulative flags into wdst and restore the saved host FPSR. */
+/* Read cumulative flags into wdst. */
 void fp_fpsr_read(a64_buf_t *b, unsigned wdst)
 {
     fp_sys(b, 0U, 0U, 22U);
     a64_emit_mov_w(b, wdst, 22U);
-    fp_sys(b, 1U, 0U, 24U);
 }
 
 /* Split operand Vd into halves (hi W17, lo W16); S operands copy the
@@ -250,28 +251,23 @@ static void fp_halves(a64_buf_t *b, unsigned vd, unsigned is_d)
     }
 }
 
-/* Shared NaN classifier: halves in W17/W16, quiet-bit in W22.
- * Non-NaN (or infinite) inputs branch to the caller's end; the caller
- * patches ph1/ph2 after emitting its writeback. */
+/* Shared NaN classifier: FCMP sets V iff vd is NaN, so B.VC skips
+ * the cold path with no FPR->GPR traffic on ordinary values (quiet
+ * runs before the FPSR clear, fix runs after the FPSR read, so the
+ * FCMP cannot pollute the operation's FPSR flags).  The cold path
+ * reconstructs the halves and the quiet bit exactly as before; the
+ * caller patches ph1/ph2 after emitting its writeback.  ph2 is a
+ * never-taken CBNZ WZR (CBNZ on the zero register never fires), which
+ * keeps the caller's patch slot valid while falling through. */
 static void fp_nan_test(a64_buf_t *b, unsigned vd, unsigned is_d,
                         size_t *ph1, size_t *ph2)
 {
-    unsigned elsb = (is_d == 0U) ? 23U : 20U;
-    unsigned emax = (is_d == 0U) ? 0xFFU : 0x7FFU;
     unsigned qbit = (is_d == 0U) ? 22U : 19U;
 
+    fp_cmp(b, is_d, vd, vd);
+    *ph1 = a64_emit_b_cond_placeholder(b, A64_COND_VC);
     fp_halves(b, vd, is_d);
-    a64_emit_ubfm_w(b, 22U, A64_TMP2, elsb, 30U);
-    a64_emit_mov_imm32(b, 23U, emax);
-    a64_emit_sub_reg_w(b, true, A64_ZR, 22U, 23U, A64_SHIFT_LSL, 0U);
-    *ph1 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-    if (is_d == 0U) {
-        a64_emit_ubfm_w(b, 22U, A64_TMP1, 0U, 22U);
-    } else {
-        a64_emit_ubfm_w(b, 22U, A64_TMP2, 0U, 19U);
-        a64_emit_orr_reg_w(b, 22U, 22U, A64_TMP1, A64_SHIFT_LSL, 0U);
-    }
-    *ph2 = a64_emit_cbz_w_placeholder(b, false, 22U);
+    *ph2 = a64_emit_cbz_w_placeholder(b, true, A64_ZR);
     a64_emit_ubfm_w(b, 22U, (is_d == 0U) ? A64_TMP1 : A64_TMP2, qbit, qbit);
 }
 
@@ -445,9 +441,8 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     fp_fpsr_read(b, 22U);
     a64_emit_orr_reg_w(b, 22U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
     /* Shelter the compare result in W24: fp_finish reuses W16/W17
-     * (A64_TMP1/TMP2) as scratch, so W17 would not survive.  W24 is
-     * dead across fp_finish (no fp_sys inside) but live across
-     * fp_fpsr_read (MSR reads X24), hence the move goes here. */
+     * (A64_TMP1/TMP2) as scratch, so W17 would not survive.  X24 is
+     * otherwise dead (fp_fpsr_* no longer save/restore host FPSR). */
     a64_emit_mov_w(b, 24U, 17U);
     fp_finish(b, 22U, cur);
     a64_emit_mov_imm32(b, 22U, 1U << fccpos);
@@ -501,8 +496,8 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_fpsr_read(b, 22U);
     fp_fpcr_restore(b);
     /* Flags + sticky live in W24 from here: fp_fix and the D-canonical
-     * swap below clobber W22 (fp_nan_test ubfm, add X22), while X24 is
-     * dead (host FPSR already restored by fp_fpsr_read). */
+     * swap below clobber W22 (fp_halves FMOV, quiet-bit ubfm), while
+     * X24 is dead (fp_fpsr_* no longer save/restore host FPSR). */
     a64_emit_orr_reg_w(b, 24U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
     if (nan2008 == 0) {
         size_t ph_can;

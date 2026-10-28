@@ -50,6 +50,8 @@ P1 j: PASS d=1 f=0 t=7
 P1 jal-link: PASS marker=0x51 ra==land=1
 P1 jalr: PASS marker=0x33 ra==land=1
 P1 jr: PASS d=1 f=0 t=7
+P1 jr-fp-slot: PASS landed=1 bits=0x40800000
+P1 cfc1-slot: PASS fir=0x00739300 f=7
 P1 beql-pageend-nottaken: PASS qemu-fetch sig=11 branch-pc=1 p2base=1
 P1 beql-pageend-taken: PASS qemu-fetch sig=11 branch-pc=1 p2base=1
 P1 delayslot-sigpc: PASS sig=11 null-addr=1 loaded=-1
@@ -64,6 +66,6 @@ qemu: uncaught target signal 10 (Bus error) - core dumped
 P1 unaligned-child: PASS child termsig=10 (qemu AdEL->SIGBUS=10; translator fault contract: exit 139)
 P1-RAW-WRITE: ok
 P1 raw-write: PASS raw-write ret=17 a3=0
-P1 checks: 55 pass, 0 fail
+P1 checks: 57 pass, 0 fail
 P1-RESULT: PASS
 LE-EXIT=0
