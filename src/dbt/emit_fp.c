@@ -28,6 +28,7 @@
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
 #include "dbt/emit_fp_priv.h"
+#include "dbt/emit_priv.h"
 
 /* Raw A64 FP/SIMD words (GAS-verified; ptype 0 = S, 1 = D). */
 static void fp_emit2(a64_buf_t *b, unsigned ptype, unsigned opc, unsigned vd,
@@ -90,14 +91,11 @@ static void fp_sys(a64_buf_t *b, unsigned is_msr, unsigned is_fpcr,
 }
 
 /* Cached guest GPR -> host W register (SPEC 2.1; mirrors emit_int.c).
- * $0 reads as zero and is never written back. */
+ * $0 reads as zero and is never written back. Wave P4: fp_finish uses
+ * emit_flush(b) so no local cached list is needed. */
 static const int8_t kFpGprHost[32] = {
     -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -1,
     12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, -1, 15
-};
-
-static const uint8_t kFpCached[16] = {
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
 
 unsigned fp_get(a64_buf_t *b, unsigned g, unsigned tmp)
@@ -345,7 +343,6 @@ void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
 void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
 {
     size_t ph;
-    unsigned i;
 
     a64_emit_ubfm_w(b, 22U, wfpsr5, 0U, 4U);
     a64_emit_rbit_w(b, 22U, 22U);
@@ -369,10 +366,7 @@ void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
     a64_emit_and_reg_w(b, false, 22U, 22U, A64_TMP1, A64_SHIFT_LSL, 0U);
     ph = a64_emit_cbz_w_placeholder(b, false, 22U);
     a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-    for (i = 0U; i < 16U; i++) {
-        a64_emit_str_imm_w(b, (unsigned)kFpGprHost[kFpCached[i]], A64_XCTX,
-                           (uint32_t)kFpCached[i] * 4U);
-    }
+    emit_flush(b);
     a64_emit_mov_imm32(b, A64_TMP1, cur);
     a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
     a64_emit_mov_imm32(b, A64_TMP1, cur + 4U);
@@ -525,6 +519,82 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     return 0;
 }
 
+/* COP1X MADD/MSUB/NMADD/NMSUB (op 0x13, funct & 0x26 == 0x20):
+ * unfused FMUL V2,V0,V1 then FADD/FSUB V2,V2,V3, plus non-NaN FNEG
+ * for NMADD/NMSUB after reading FPSR (matches interp fp.c:857).
+ * fr=rs, ft=rt, fs=rd, fd=sa, f=funct&1. */
+static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
+                      int be, int fr_mode, int nan2008)
+{
+    unsigned funct = d->funct;
+    unsigned f = funct & 1U;
+    unsigned fr = d->rs;
+    unsigned ft = d->rt;
+    unsigned fs = d->rd;
+    unsigned fd = d->sa;
+    unsigned ptype = f;
+    unsigned opc2;
+    size_t ph_neg = 0;
+    int is_sub = (int)((funct >> 3) & 1U);
+    int is_neg = (int)((funct & 0x10U) != 0U);
+
+    if ((funct & 0x26U) != 0x20U) {
+        return -1;
+    }
+    if (fr >= 32U || ft >= 32U || fs >= 32U || fd >= 32U) {
+        return -1;
+    }
+    if (f != 0U && fr_mode == 0 &&
+        (((fr | ft | fs | fd) & 1U) != 0U)) {
+        return -1;
+    }
+    opc2 = (is_sub != 0) ? 0x0EU : 0x0AU;
+    fp_ld(b, 0U, fs, be, ptype);
+    fp_ld(b, 1U, ft, be, ptype);
+    fp_ld(b, 3U, fr, be, ptype);
+    a64_emit_mov_imm32(b, FP_STICKY, 0U);
+    if (nan2008 == 0) {
+        fp_quiet(b, 0U, FP_STICKY, ptype);
+        fp_quiet(b, 1U, FP_STICKY, ptype);
+        fp_quiet(b, 3U, FP_STICKY, ptype);
+    }
+    a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+    fp_fpcr_sync(b);
+    fp_fpsr_clear(b);
+    fp_emit2(b, ptype, 0x02U, 2U, 0U, 1U);
+    fp_emit2(b, ptype, opc2, 2U, 2U, 3U);
+    fp_fpsr_read(b, 22U);
+    fp_fpcr_restore(b);
+    if (is_neg != 0) {
+        size_t ph_skip;
+
+        fp_cmp(b, ptype, 2U, 2U);
+        ph_skip = a64_emit_b_cond_placeholder(b, A64_COND_VS);
+        fp_emit1(b, ptype, 0x01U, 0x10U, 2U, 2U);
+        a64_patch_b_cond(b, ph_skip, b->count);
+    }
+    a64_emit_orr_reg_w(b, 24U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
+    if (nan2008 == 0) {
+        fp_fix(b, 2U, ptype);
+        ph_neg = a64_emit_cbz_w_placeholder(b, false, FP_STICKY);
+        if (ptype == 0u) {
+            a64_emit_mov_imm32(b, A64_TMP1, 0x7FBFFFFFu);
+            a64_emit_fmov_w_to_s(b, 2U, A64_TMP1);
+        } else {
+            a64_emit_mov_imm32(b, A64_TMP2, 0x7FF7FFFFu);
+            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFFFFFu);
+            a64_emit_mov_w(b, 23U, A64_TMP2);
+            a64_emit_mov_w(b, 22U, A64_TMP1);
+            a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
+            fp_cvt(b, 1U, 1U, 0x07U, 2U, 22U);
+        }
+        a64_patch_cbz_w(b, ph_neg, b->count);
+    }
+    fp_st(b, 2U, fd, be, ptype);
+    fp_finish(b, 24U, cur);
+    return 0;
+}
+
 /* ABS/NEG/MOV: non-arithmetic sign-bit operations (E03: never signal,
  * no FCSR update) shared by both NaN modes. */
 static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
@@ -606,11 +676,15 @@ int dbt_emit_fp(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, uint32_t fpc,
     if (b == NULL || d == NULL) {
         return -1;
     }
-    if (d->op != MIPS_OP_COP1) {
-        return -1;
-    }
     /* Mode flags are single bits; anything else declines. */
     if ((unsigned)(be | fr_mode | nan2008) > 1U) {
+        return -1;
+    }
+    /* Wave P4 COP1X MADD family (op 0x13). */
+    if (d->op == 0x13u) {
+        return fp_madd_op(b, d, cur, be, fr_mode, nan2008);
+    }
+    if (d->op != MIPS_OP_COP1) {
         return -1;
     }
     if (d->rs <= FP_RS_MTHC1) {

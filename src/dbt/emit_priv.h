@@ -39,6 +39,10 @@ _Static_assert(offsetof(mips32_ctx_t, ll_epoch_snap) % 8u == 0u,
 /* Guest VA of the 64-bit LL exclusion spinlock: the first word after
  * the epoch table. JIT forms Xlock = x20 + LOCK_OFF. */
 #define EMIT_LL_LOCK_OFFSET (0xFFFF0000u + 4096u * 8u)
+/* Wave P4 ll_active flag: unused upper 32 bits of tab[4096] (lock word).
+ * JIT tests ldrb Wt,[x20,wOff,uxtw] here; 0 skips all spinlock/DMB/epoch
+ * traffic and runs only the plain guest store. */
+#define EMIT_LL_ACTIVE_OFFSET (0xFFFF0000u + 4096u * 8u + 4u)
 
 /* Register-cache core (src/dbt/emit_int.c). */
 int      gpr_host(unsigned g);

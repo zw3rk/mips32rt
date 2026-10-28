@@ -105,12 +105,30 @@ void emit_load_delay_target(a64_buf_t *b, unsigned dst)
     a64_emit_ldr_imm_w(b, dst, A64_TMP1, 0U);
 }
 
-static void emit_prologue(a64_buf_t *b)
+static void emit_prologue(a64_buf_t *b, const mips_dec_t *insns,
+                          unsigned count)
 {
+    uint32_t mask = 0U;
     unsigned i;
-    for (i = 0U; i < 16U; i++)
-        a64_emit_ldr_imm_w(b, (unsigned)kGprHost[kCached[i]], A64_XCTX,
-                           (uint32_t)kCached[i] * 4U);
+
+    for (i = 0U; i < count; i++) {
+        const mips_dec_t *d = &insns[i];
+
+        mask |= (1U << d->rs) | (1U << d->rt) | (1U << d->rd);
+        if (d->op == 0x03U ||
+            (d->op == MIPS_OP_SPECIAL && d->funct == 0x09U) ||
+            (d->op == MIPS_OP_REGIMM && d->rt >= 0x10U && d->rt <= 0x13U)) {
+            mask |= (1U << MIPS32_REG_RA);
+        }
+    }
+    for (i = 0U; i < 16U; i++) {
+        unsigned g = kCached[i];
+
+        if ((mask & (1U << g)) != 0U) {
+            a64_emit_ldr_imm_w(b, (unsigned)kGprHost[g], A64_XCTX,
+                               (uint32_t)g * 4U);
+        }
+    }
 }
 /* Store back only the cached GPRs written since the last flush (or
  * block start): fault/exit paths flush whatever is dirty, while
@@ -702,6 +720,10 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         return (ctx != NULL &&
             dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
             ? 0 : -1;
+    case 0x13u: /* Wave P4 COP1X MADD family. */
+        return (ctx != NULL &&
+            dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
+            ? 0 : -1;
     case MIPS_OP_LB: case MIPS_OP_LH: case MIPS_OP_LW: case MIPS_OP_LBU:
     case MIPS_OP_LHU: case MIPS_OP_SB: case MIPS_OP_SH: case MIPS_OP_SW:
         emit_ea(b, d->rs, d->simm);
@@ -769,6 +791,8 @@ static int slot_ok(const mips_dec_t *d)
     /* Non-branch COP1 (moves/arithmetic) inlines with no exit of its
      * own; BC1 branches keep delay-slot ownership in emit_branch. */
     case MIPS_OP_COP1: return d->rs != 0x08U;
+    /* Wave P4 COP1X MADD family inlines with no exit of its own. */
+    case 0x13u: return ((d->funct & 0x26U) == 0x20U) ? 1 : 0;
     default: return 0;
     }
 }
@@ -804,7 +828,7 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         }
     }
     a64_buf_init(&b, (uint32_t *)out, cap / 4U);
-    emit_prologue(&b);
+    emit_prologue(&b, insns, count);
     cur = pc;
     for (i = 0U; i < count; i++) {
         const mips_dec_t *d = &insns[i];
@@ -817,7 +841,7 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
             emit_exit_imm(&b, MIPS32_EXIT_BRANCH, 0U, cur, cur + 4U);
             *out_end = cur; break;
         }
-        if (d->op == MIPS_OP_COP1) {
+        if (d->op == MIPS_OP_COP1 || d->op == 0x13u) {
             if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode, ctx->nan2008)) { cur += 4U; continue; }
         }
         if (is_ctl(d) != 0) {

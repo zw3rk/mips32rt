@@ -56,6 +56,10 @@
 #define MIPS32_LL_EPOCH_BYTES (4096u * 8u + 16u)
 #define MIPS32_LL_LOCK_OFFSET (4096u * 8u)
 #define MIPS32_LL_OWNER_OFFSET (4096u * 8u + 8u)
+/* Wave P4 ll_active flag: unused upper 32 bits of tab[4096] (lock word).
+ * mips_ll_record sets it to 1 (release); ordinary stores test it and
+ * skip all spinlock/epoch traffic when it is 0. */
+#define MIPS32_LL_ACTIVE_OFFSET (4096u * 8u + 4u)
 
 static _Atomic uint64_t *ll_epoch_table(mips32_ctx_t *ctx);
 
@@ -424,10 +428,13 @@ static uint64_t ll_seq_saved(const mips32_ctx_t *ctx)
 }
 
 /* RC-U3-R2 LL record (interp LL path): llbit/lladdr/llval plus the
- * epoch snapshot the later SC verifies. */
+ * epoch snapshot the later SC verifies. Wave P4: also sets the
+ * ll_active flag (release) so later ordinary stores take the slow
+ * epoch path. */
 void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val)
 {
     _Atomic uint64_t *tab;
+    _Atomic uint8_t *flag;
 
     if (ctx == NULL) {
         return;
@@ -442,6 +449,9 @@ void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val)
     }
     ll_seq_save(ctx, atomic_load_explicit(&tab[ll_epoch_idx(addr)],
                                           memory_order_relaxed));
+    flag = (_Atomic uint8_t *)(void *)((uint8_t *)(void *)tab +
+                                       MIPS32_LL_ACTIVE_OFFSET);
+    atomic_store_explicit(flag, (uint8_t)1u, memory_order_release);
 }
 
 /* RC-U3 LL/SC: an ordinary store overlapping the reserved word breaks
@@ -473,12 +483,26 @@ static void note_store_locked(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
 
 /* Locked guest store: data write plus epoch/reservation update under
  * one mips_ll_lock critical section. All interp stores go through
- * here so an SC's check-and-store can never interleave with them. */
+ * here so an SC's check-and-store can never interleave with them.
+ * Wave P4: when the ll_active flag is 0 (no LL ever recorded) run
+ * only the plain guest store with zero spinlock/epoch traffic. */
 static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
     const void *src, uint32_t len)
 {
+    _Atomic uint64_t *tab;
+    _Atomic uint8_t *flag;
+
     if (ctx == NULL || src == NULL || len == 0u) {
         return;
+    }
+    tab = ll_epoch_table(ctx);
+    if (tab != NULL) {
+        flag = (_Atomic uint8_t *)(void *)((uint8_t *)(void *)tab +
+                                           MIPS32_LL_ACTIVE_OFFSET);
+        if (atomic_load_explicit(flag, memory_order_acquire) == 0u) {
+            memcpy(mips32_guest_ptr(ctx, va), src, len);
+            return;
+        }
     }
     mips_ll_lock(ctx);
     memcpy(mips32_guest_ptr(ctx, va), src, len);

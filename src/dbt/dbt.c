@@ -81,6 +81,7 @@ typedef struct dbt_cache {
     dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
     unsigned    ras_top;
     dbt_smc_entry_t smc[DBT_SMC_TABLE_SIZE];
+    unsigned    smc_used_count; /* Wave P4: live SMC slots */
     uint8_t    *pool;
     size_t      pool_used;
     uint32_t    last_pc;
@@ -92,6 +93,8 @@ typedef struct dbt_cache {
     uint32_t    smc_memo_version;
     int         smc_memo_valid;
 } dbt_cache_t;
+
+static void dbt_ras_push(uint32_t pc);
 
 /* RC4 threads: one cache per host thread.  A shared cache would race
  * concurrent compiles (bump allocator, block/ibtc/ras tables, SMC
@@ -185,7 +188,13 @@ static int dbt_is_link(const mips_dec_t *d)
  */
 static int dbt_is_unhandled_coproc(const mips_dec_t *d)
 {
-    return d->op == DBT_OP_COP1X || d->op == DBT_OP_COP2;
+    if (d->op == DBT_OP_COP2) {
+        return 1;
+    }
+    if (d->op == DBT_OP_COP1X) {
+        return ((d->funct & 0x26U) == 0x20U) ? 0 : 1;
+    }
+    return 0;
 }
 
 /* SYSCALL/BREAK, trap instructions, and ERET end a block before them. */
@@ -242,8 +251,12 @@ static void dbt_flush_all(void)
     for (i = 0; i < MIPS32_RAS_SIZE; i++) {
         dbt_cache->ras[i].code = NULL;
     }
+    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
+        dbt_cache->smc[i].used = 0U;
+    }
     dbt_cache->block_count = 0;
     dbt_cache->ras_top = 0;
+    dbt_cache->smc_used_count = 0;
     dbt_cache->pool_used = 0;
     dbt_cache->last_valid = 0;
     dbt_cache->last_bi = 0;
@@ -282,6 +295,11 @@ uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page)
 
     (void)ctx;
     if (dbt_cache == NULL) {
+        return 1U;
+    }
+    /* Wave P4: no live SMC slots means no page can have a version;
+     * skip the 1024-slot scan (cross-page loops hit this). */
+    if (dbt_cache->smc_used_count == 0U) {
         return 1U;
     }
     /* H3: hot loops re-query 1-2 pages per dispatch; memoize the last
@@ -325,6 +343,7 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
             dbt_cache->smc[i].page = page;
             dbt_cache->smc[i].version = 2U;
             dbt_cache->smc[i].used = 1U;
+            dbt_cache->smc_used_count++;
             dbt_cache->smc_memo_valid = 0;
             return;
         }
@@ -466,6 +485,13 @@ void *dbt_chain_next(mips32_ctx_t *ctx)
 
     if (ctx == NULL || ctx->difftest_enabled || ctx->trace_enabled) {
         return NULL;
+    }
+    /* Wave P4: the previous link block's return address is its
+     * guest_end; push it so the chained return hits the RAS. */
+    if (dbt_cache != NULL && dbt_cache->last_valid != 0 &&
+        dbt_cache->last_bi < dbt_cache->block_count &&
+        dbt_cache->block_link[dbt_cache->last_bi] != 0U) {
+        dbt_ras_push(dbt_cache->blocks[dbt_cache->last_bi].guest_end);
     }
     code = dbt_lookup(ctx, ctx->pc);
     if (code == NULL) {
