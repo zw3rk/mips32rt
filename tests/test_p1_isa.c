@@ -904,6 +904,26 @@ __attribute__((noinline)) static void t_rdhwr(void)
  * contract maps any such fault to process exit 139; here the child must
  * die by signal so the suite itself survives and exits 0. */
 
+/* Wave U3 FIXADE control: the translator emulates unaligned integer
+ * accesses by default (fixade_enabled = 1, mirroring Linux MIPS
+ * TIF_FIXADE). Fault-behavior tests opt out explicitly with raw O32
+ * sysmips(MIPS_FIXADE = 7, 0) (nr 4149 = __NR_Linux + 149); the result
+ * is ignored because qemu-user has no FIXADE state and keeps faulting,
+ * so the oracle output is unchanged. */
+__attribute__((noinline)) static void fixade_off(void)
+{
+    register unsigned long r_v0 __asm__("$2") = 4149u;
+    register unsigned long r_a0 __asm__("$4") = 7u;
+    register unsigned long r_a1 __asm__("$5") = 0u;
+    register unsigned long r_a3 __asm__("$7");
+    __asm__ volatile("syscall"
+                     : "+r"(r_v0), "=r"(r_a3)
+                     : "r"(r_a0), "r"(r_a1)
+                     : "memory");
+    (void)r_v0;
+    (void)r_a3;
+}
+
 __attribute__((noinline)) static void t_unaligned_child(void)
 {
     char db[160];
@@ -924,6 +944,7 @@ __attribute__((noinline)) static void t_unaligned_child(void)
         unsigned char *p;
         signal(SIGBUS, SIG_DFL);
         signal(SIGSEGV, SIG_DFL);
+        fixade_off(); /* fault, don't emulate (Wave U3 default-on) */
         reset_mem();
         p = area + 1;
         __asm__ volatile("lw %0,0(%1)" : "=r"(r) : "r"(p) : "memory");

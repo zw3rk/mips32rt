@@ -1020,6 +1020,24 @@ static void t_fcsr(void)
     write_fcsr(save);
 }
 
+/* Wave U3 FIXADE control: the translator emulates unaligned accesses by
+ * default (fixade_enabled = 1); fault-behavior tests opt out explicitly
+ * with raw O32 sysmips(MIPS_FIXADE = 7, 0) (nr 4149). The result is
+ * ignored because qemu-user has no FIXADE state and keeps faulting. */
+__attribute__((noinline)) static void fixade_off(void)
+{
+    register unsigned long r_v0 __asm__("$2") = 4149u;
+    register unsigned long r_a0 __asm__("$4") = 7u;
+    register unsigned long r_a1 __asm__("$5") = 0u;
+    register unsigned long r_a3 __asm__("$7");
+    __asm__ volatile("syscall"
+                     : "+r"(r_v0), "=r"(r_a3)
+                     : "r"(r_a0), "r"(r_a1)
+                     : "memory");
+    (void)r_v0;
+    (void)r_a3;
+}
+
 static void t_mem(void)
 {
     char db[96];
@@ -1050,6 +1068,7 @@ static void t_mem(void)
             static volatile int dummy;
 
             (void)dummy;
+            fixade_off(); /* fault, don't emulate (Wave U3 default-on) */
             {
                 const float *up =
                     (const float *)(buf + 1); /* misaligned */

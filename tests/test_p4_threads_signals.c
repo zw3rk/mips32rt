@@ -187,6 +187,26 @@ static void bus_handler(int sig, siginfo_t *si, void *ctx)
     _exit(92);
 }
 
+/* Wave U3 FIXADE control: the translator emulates unaligned integer
+ * accesses by default (fixade_enabled = 1, mirroring Linux MIPS
+ * TIF_FIXADE). This fault-behavior test opts out explicitly with raw
+ * O32 sysmips(MIPS_FIXADE = 7, arg) (nr 4149 = __NR_Linux + 149) and
+ * restores the default afterwards; the result is ignored because
+ * qemu-user has no FIXADE state and keeps faulting. */
+__attribute__((noinline)) static void fixade_set(unsigned arg)
+{
+    register unsigned long r_v0 __asm__("$2") = 4149u;
+    register unsigned long r_a0 __asm__("$4") = 7u;
+    register unsigned long r_a1 __asm__("$5") = (unsigned long)arg;
+    register unsigned long r_a3 __asm__("$7");
+    __asm__ volatile("syscall"
+                     : "+r"(r_v0), "=r"(r_a3)
+                     : "r"(r_a0), "r"(r_a1)
+                     : "memory");
+    (void)r_v0;
+    (void)r_a3;
+}
+
 __attribute__((noinline)) static void t_sigbus_misaligned(void)
 {
     char db[160];
@@ -209,12 +229,14 @@ __attribute__((noinline)) static void t_sigbus_misaligned(void)
     area[1] = 0x55667788u;
     p = (volatile unsigned *)((uintptr_t)&area[0] + 1);
     g_bus_armed = 1;
+    fixade_set(0u); /* fault, don't emulate (Wave U3 default-on) */
     if (sigsetjmp(g_bus_jb, 1) == 0) {
         __asm__ volatile("lw %0,0(%1)" : "=r"(v) : "r"(p) : "memory");
     } else {
         got = 1;
     }
     g_bus_armed = 0;
+    fixade_set(1u); /* restore translator default for later tests */
     snprintf(db, sizeof db, "sig=%d addr-ok=%d kept=%x", g_bus_sig,
              g_bus_addr == (uintptr_t)p, v);
     check("sigbus-misaligned",
