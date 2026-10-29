@@ -511,8 +511,10 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
             a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
         }
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, off);
-        /* Wave P12: populate the FP cache from the loaded word (fresh
-         * memory value: clear both NaN tracking bits). */
+        /* Wave P13: a single-precision write also supersedes the pair
+         * double ((fs & ~1u)); drop it before repopulating this lane
+         * (fresh memory value: clear both NaN tracking bits). */
+        fp_invalidate_single(b, fs);
         slot = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U); creg = 16U + slot;
         a64_emit_fmov_w_to_s(b, creg, A64_TMP1);
         b->fpr_cache_valid |= (uint16_t)(1U << slot);
@@ -574,11 +576,24 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
     }
     case 0x3du: { /* SDC1 */
         size_t ph_slow, ph_done;
+        unsigned slot, creg;
 
         emit_align_fault(b, 2U, fpc, ind_slot);
         ph_slow = emit_active_fast(b);
-        a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
-        a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
+        /* Wave P13: a cached pair double feeds both words via FMOV
+         * (lo lands in W16, hi is extracted from X16, which the fast
+         * path gate leaves dead); otherwise load the write-through
+         * ctx lanes as before. */
+        slot = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U); creg = 16U + slot;
+        if ((((b->fpr_cache_valid >> slot) & 1U) != 0U) &&
+            b->fpr_cache_reg[slot] == (uint8_t)fs &&
+            (((b->fpr_cache_is_d >> slot) & 1U) != 0U)) {
+            fp_cvt(b, 1U, 1U, 0x06U, 16U, creg);
+            a64_emit_ubfx_x_to_w(b, A64_TMP2, 16U, 32U, 32U);
+        } else {
+            a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, off);
+            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, off + 4U);
+        }
         if (be != 0) {
             a64_emit_rev_w(b, A64_TMP1, A64_TMP1);
             a64_emit_rev_w(b, A64_TMP2, A64_TMP2);

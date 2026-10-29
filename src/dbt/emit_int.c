@@ -609,6 +609,9 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
     int indirect = 0, link_rd = -1, defer_link = 0;
     uint32_t saved_dirty;
     size_t ph_t;
+    /* Wave P13: delay slots inherit no deferral (a stale flag would
+     * strand a slot arithmetic batch past the block end). */
+    b->fp_defer_finish = 0U;
     switch (d->op) {
     case MIPS_OP_J: case MIPS_OP_JAL:
         taken = ((cur + 4U) & 0xF0000000U) | (d->target << 2);
@@ -848,16 +851,13 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
             }
             if (d->op == MIPS_OP_COP1 || d->op == 0x13u) {
                 b.fp_defer_finish = 0U;
-                if (ok != 0 && fp_batch_is_arith(d) != 0) {
+                if (ok != 0 && fp_batch_starts(d) != 0) {
                     for (j = i + 1U; j < count; j++) {
-                        if (is_ctl(&insns[j]) == 0 &&
-                            fp_batch_is_any(&insns[j]) == 0) {
-                            continue;
-                        }
                         if (fp_batch_is_arith(&insns[j]) != 0) {
                             b.fp_defer_finish = 1U;
+                            break;
                         }
-                        break;
+                        if (fp_batch_is_transparent(&insns[j]) == 0) break;
                     }
                 }
                 if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode,

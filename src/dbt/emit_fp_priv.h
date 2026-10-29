@@ -79,7 +79,13 @@ uint32_t fp_slot(unsigned fs);
 unsigned fp_get(a64_buf_t *b, unsigned g, unsigned tmp);
 void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be, unsigned is_d);
 void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be, unsigned is_d);
+/* Single-precision FPR writes (src/dbt/emit_fp_cvt.c): fp_store_w
+ * stores a W conversion result to an FPR low half, and
+ * fp_invalidate_single drops the cached copies a single-precision
+ * write to fs invalidates (the same-reg entry plus the pair double
+ * (fs & ~1u), covering odd/even aliasing). */
 void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be);
+void fp_invalidate_single(a64_buf_t *b, unsigned fs);
 
 /* FPCR/FPSR sync + finish (src/dbt/emit_fp.c). */
 void fp_fpcr_sync(a64_buf_t *b);

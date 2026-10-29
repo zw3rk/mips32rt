@@ -70,9 +70,15 @@ void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot);
 
-/* Wave P5 FP batch predicates (emit_int.c gating): arith covers COP1
- * S/D ADD/SUB/MUL/DIV/SQRT and COP1X MADD/MSUB/NMADD/NMSUB; any covers
- * every FP op that ends a batch (moves, CFC1/CTC1, cmp, convert, mem). */
+/* Wave P5/P13 FP batch predicates (emit_int.c gating): arith covers
+ * COP1 S/D ADD/SUB/MUL/DIV/SQRT and COP1X MADD/MSUB/NMADD/NMSUB;
+ * unary covers COP1 S/D MOV/ABS/NEG (sign-bit ops that never touch
+ * FPSR/FPCR, so a deferred batch stays open across them); transparent
+ * covers every instruction the next-FP-arithmetic lookahead may skip
+ * (FP memory moves, unary ops, and the non-trapping integer ALU ops
+ * that vfp_simd interleaves for pointer arithmetic).  Everything else
+ * (CFC1/CTC1/MFC1/MTC1/BC1, C.cond.fmt, CVT.*, branches, traps,
+ * trapping ALU, unknown/D2 words) stops the scan. */
 static inline int fp_batch_is_arith(const mips_dec_t *d)
 {
     if (d == NULL) {
@@ -90,7 +96,25 @@ static inline int fp_batch_is_arith(const mips_dec_t *d)
     return 0;
 }
 
-static inline int fp_batch_is_any(const mips_dec_t *d)
+static inline int fp_batch_is_unary(const mips_dec_t *d)
+{
+    if (d == NULL || d->op != 0x11U) {
+        return 0;
+    }
+    if (d->rs != 16U && d->rs != 17U) {
+        return 0;
+    }
+    return d->funct == 0x05U || d->funct == 0x06U || d->funct == 0x07U;
+}
+
+/* An FP batch starts on arithmetic and stays open across unary ops
+ * while a later arithmetic op still needs the accumulated flags. */
+static inline int fp_batch_starts(const mips_dec_t *d)
+{
+    return fp_batch_is_arith(d) != 0 || fp_batch_is_unary(d) != 0;
+}
+
+static inline int fp_batch_is_transparent(const mips_dec_t *d)
 {
     unsigned o;
 
@@ -98,8 +122,36 @@ static inline int fp_batch_is_any(const mips_dec_t *d)
         return 0;
     }
     o = d->op;
-    return o == 0x11U || o == 0x13U || o == 0x31U || o == 0x35U ||
-        o == 0x39U || o == 0x3DU;
+    /* LWC1/LDC1/SWC1/SDC1: no FCSR interaction (double loads populate
+     * the d16..d23 write-through cache, stores read it on hits). */
+    if (o == 0x31U || o == 0x35U || o == 0x39U || o == 0x3DU) {
+        return 1;
+    }
+    if (o == 0x11U) {
+        return fp_batch_is_unary(d);
+    }
+    /* Non-trapping integer ALU only (trapping ADD/SUB, MULT/DIV/MADD,
+     * shifts with variable counts, loads/stores, and LUI stop the
+     * scan: a fault or HI/LO write between batched ops ends the run). */
+    if (o == MIPS_OP_ADDIU || o == MIPS_OP_SLTI || o == MIPS_OP_SLTIU ||
+        o == MIPS_OP_ANDI || o == MIPS_OP_ORI || o == MIPS_OP_XORI) {
+        return 1;
+    }
+    if (o != MIPS_OP_SPECIAL) {
+        return 0;
+    }
+    switch (d->funct) {
+    case MIPS_FUNCT_SLL:
+    case MIPS_FUNCT_SRL:
+    case MIPS_FUNCT_SRA:
+    case MIPS_FUNCT_ADDU:
+    case 0x23U: /* SUBU (no decode.h macro; cf. emit_int.c) */
+    case MIPS_FUNCT_SLT:
+    case MIPS_FUNCT_SLTU:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 #endif /* MIPS32RT_EMIT_PRIV_H */

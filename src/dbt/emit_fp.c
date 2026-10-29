@@ -768,6 +768,12 @@ static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
     case FP_FUNCT_MOV: op5 = 0x00U; opc6 = 0x10U; break;
     default: return -1;
     }
+    /* Wave P13: sign-bit ops never touch FPSR/FPCR: keep a deferred
+     * batch open only while fp_defer_finish expects another arithmetic
+     * op, and close it here otherwise. */
+    if (b->fp_batch_open != 0U && b->fp_defer_finish == 0U) {
+        fp_batch_flush(b);
+    }
     fp_ld(b, 0U, fs, be, ptype);
     fp_emit1(b, ptype, op5, opc6, 1U, 0U);
     fp_st(b, 1U, fd, be, ptype);
@@ -775,13 +781,6 @@ static int fp_unary_op(a64_buf_t *b, const mips_dec_t *d, int be)
     b->fpr_no_snan = (b->fpr_no_snan & ~(1U << fd)) | (((b->fpr_no_snan >> fs) & 1U) << fd);
     b->fpr_non_nan = (b->fpr_non_nan & ~(1U << fd)) | (((b->fpr_non_nan >> fs) & 1U) << fd);
     return 0;
-}
-
-/* Store a W integer conversion result to an FPR low half (a value). */
-void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
-{
-    (void)be;
-    a64_emit_str_imm_w(b, wsrc, A64_XCTX, off);
 }
 
 /* MFC1/MTC1/MFHC1/MTHC1/CFC1/CTC1: bit moves, mirroring fpmove.c.
@@ -819,10 +818,12 @@ static int fp_move_op(a64_buf_t *b, const mips_dec_t *d, int be)
     } else {
         fp_store_w(b, v, off, be);
     }
-    /* MTC1/MTHC1 write raw integer bits: fresh value untested, and any
-     * cached FP copy of fpr[fs] is stale, so drop the whole cache. */
+    /* MTC1/MTHC1 write raw integer bits: the fresh value is untested,
+     * so clear the lane's NaN tracking.  Cache entries are dropped by
+     * fp_store_w (same-reg plus the pair double); the write-through
+     * ctx stays exact for every other lane. */
     if (d->rs == FP_RS_MTC1 || d->rs == FP_RS_MTHC1) {
-        b->fpr_cache_valid = 0U; b->fpr_non_nan = 0U; b->fpr_no_snan = 0U;
+        b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
     }
     return 0;
 }

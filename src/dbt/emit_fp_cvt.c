@@ -19,6 +19,34 @@
 #include "interp/decode.h"
 #include "dbt/emit_fp_priv.h"
 
+/* Wave P13: single-precision FPR writes invalidate the cached copies
+ * they supersede.  The cache slot hash is local to src/dbt/emit_fp.c;
+ * the same hash is repeated here (verified identical to fpr_slot by
+ * the difftest suites, which fail on any stale FPR cache hit). */
+void fp_invalidate_single(a64_buf_t *b, unsigned fs)
+{
+    unsigned pair = fs & ~1u;
+    unsigned s0 = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U);
+    unsigned s1 = (((pair >> 1U) ^ ((pair & 1U) << 3U)) & 15U);
+
+    if (b->fpr_cache_reg[s0] == (uint8_t)fs) {
+        b->fpr_cache_valid &= (uint16_t)~(1U << s0);
+    }
+    if (b->fpr_cache_reg[s1] == (uint8_t)pair) {
+        b->fpr_cache_valid &= (uint16_t)~(1U << s1);
+    }
+}
+
+/* Store a W integer conversion result to an FPR low half (a value).
+ * The raw bits supersede any cached FP copy of the lane (and its
+ * pair double), so invalidate before returning. */
+void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
+{
+    (void)be;
+    a64_emit_str_imm_w(b, wsrc, A64_XCTX, off);
+    fp_invalidate_single(b, (off - MIPS32_CTX_FPR_OFFSET) >> 3U);
+}
+
 /* CVT.W/CVT.L and ROUND/TRUNC/CEIL/FLOOR from S/D.  V0 holds the float
  * (FRINT pre-round for the fixed modes).  NaN inputs select INTMAX with
  * Invalid; negative overflow that set Invalid saturates to INTMAX
