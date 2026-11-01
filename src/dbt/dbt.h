@@ -67,6 +67,16 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc);
 
 /* Direct chaining memo + RAS + IBTC + block-pool search, in that order. */
 void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc);
+/* Trace replay for --trace/--difftest parity (src/dbt/trace.c). */
+void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b);
+/* Wave C2 difftest parity: replay the trace lines for a fault converted
+ * by the hostfault guard (src/os/hostfault.c calls this before delivery
+ * while ctx->pc still names the faulting insn). The normal dispatcher
+ * path skips these blocks (it continues before tracing), so without
+ * this hook every converted guest fault diverges interp-vs-dbt. */
+void dbt_trace_converted_fault(mips32_ctx_t *ctx);
+/* Block table accessor for the trace replay (defined in dbt.c). */
+size_t dbt_trace_table(const dbt_block_t **out);
 /* In-trampoline chaining step (Wave P lane P4): validated lookup for
  * ctx->pc, NULL to exit the chain (see dbt.c). */
 void *dbt_chain_next(mips32_ctx_t *ctx);

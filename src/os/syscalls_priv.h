@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
 
 /* ---- MIPS O32 constants (SPEC 2.3; values from asm/fcntl.h above) ---- */
@@ -96,6 +97,9 @@ int      mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va,
 /* Truncate payload (defined in src/vm/vm_file.c; wired here). */
 int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp,
                                 uint32_t nr);
+/* Sysroot-prefixed absolute loads (defined in src/vm/vm_file.c). */
+int mips_sysroot_open(const mips32_ctx_t *ctx, int dirfd, const char *path,
+                      int host_flags, mode_t mode);
 int      mips_sc_read_ts(const mips32_ctx_t *ctx, uint32_t va,
                          struct timespec *out);
 int      mips_sc_write_ts(mips32_ctx_t *ctx, uint32_t va,
@@ -118,5 +122,20 @@ int32_t mips_sc_getrandom(mips32_ctx_t *ctx, uint32_t sp);
 int32_t mips_sc_futex(mips32_ctx_t *ctx, uint32_t sp);
 int32_t mips_sc_getxid(mips32_ctx_t *ctx, uint32_t nr);
 int32_t mips_sc_robust(mips32_ctx_t *ctx, uint32_t sp, int is_set);
+/* Kill-class delivery (defined in src/os/kill.c): kill/tkill/tgkill to
+ * the calling thread complete with 0 in $v0/$a3, advance pc past the
+ * trap, then redirect at the guest handler. The engine keeps the moved
+ * pc (exec_syscall dispatcher-moved-pc contract); sigreturn restores
+ * the post-syscall registers. */
+int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp);
+/* Hosting thread id for --trace attribution (defined in threads.c):
+ * the raw host gettid on Linux (fresh every call, so fork children
+ * attribute correctly), getpid elsewhere. Harness-only; never affects
+ * guest execution. */
+long mips_trace_tid(void);
+/* Explicit-code frame build + SIG_IGN query (defined in signals.c). */
+int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
+    uint32_t fault_addr);
+int mips_signal_is_ignored(int signo);
 
 #endif /* MIPS32_SYSCALLS_PRIV_H */

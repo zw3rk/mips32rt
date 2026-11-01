@@ -1,0 +1,19 @@
+--- toolchain ---
+mipsel-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+qemu-mipsel version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
+--- build ---
+  Class:                             ELF32
+  Data:                              2's complement, little endian
+  Machine:                           MIPS R3000
+--- run under qemu-mipsel ---
+== TCG multiarch smoke (guest pagesize=4096) ==
+PASS [tcg]: signals SIGUSR1 x1
+PASS [tcg]: segfault si_signo + si_addr page offset
+PASS [tcg]: prot-none trap + restore
+PASS [tcg]: test-mmap sub-page permissions
+FAIL [tcg]: testthread (thread result mismatch)
+PASS [tcg]: float_convs double->long goldens + accum interval
+PASS [tcg]: sha1 KAT abc=a9993e36...
+TCG_SMOKE RESULT: pass=6 fail=1 skip=0
+TCG_SMOKE FAIL
+LE-EXIT=1

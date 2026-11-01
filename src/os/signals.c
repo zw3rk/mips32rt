@@ -576,7 +576,8 @@ static int32_t l4a_fault_code(int signo, uint32_t fault_addr,
 /* Frozen contract: build the E04 rt_sigframe on the guest stack and
  * redirect the thread to the handler. Returns 0 on delivery, -1 when
  * the caller must kill the guest (no handler, depth/space failure). */
-int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
+int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
+    uint32_t fault_addr)
 {
     l4a_action_t act;
     int be;
@@ -630,8 +631,7 @@ int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
     memset(mips32_guest_ptr(ctx, newsp), 0, sizeof(mips_rt_sigframe_t));
     /* siginfo: signo@frame+24, code@+28, errno@+32(=0), addr@+36. */
     l4a_put32(ctx, newsp + 24U, (uint32_t)signo, be);
-    l4a_put32(ctx, newsp + 28U, (uint32_t)l4a_fault_code(signo, fault_addr,
-        ctx), be);
+    l4a_put32(ctx, newsp + 28U, (uint32_t)si_code, be);
     l4a_put32(ctx, newsp + 36U, fault_addr, be);
     /* sigcontext: branch pc when the fault hit a delay slot (SPEC 2.2),
      * so sigreturn re-executes the branch and its delay slot. */
@@ -681,6 +681,28 @@ int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
     ctx->exit_reason = MIPS32_EXIT_NONE;
     ctx->exit_info = 0U;
     return 0;
+}
+
+/* Frozen-contract wrapper: fault-class delivery computes the siginfo code
+ * from the fault address (SEGV MAPERR/ACCERR, BUS ADRALN/ADRERR, ILL/FPE
+ * trap codes, SI_KERNEL otherwise). Kill-class delivery uses
+ * mips_raise_guest_code directly with SI_USER/SI_TKILL. */
+int mips_raise_guest(mips32_ctx_t *ctx, int signo, uint32_t fault_addr)
+{
+    return mips_raise_guest_code(ctx, signo,
+        l4a_fault_code(signo, fault_addr, ctx), fault_addr);
+}
+
+/* True when signo is recorded with the SIG_IGN disposition (delivery is
+ * a no-op success, unlike SIG_DFL which kills). Kill-class syscalls use
+ * this to distinguish ignore from default. */
+int mips_signal_is_ignored(int signo)
+{
+    if (!l4a_valid_signo(signo)) {
+        return 0;
+    }
+    return g_actions[(unsigned)signo].installed &&
+        g_actions[(unsigned)signo].handler == L4A_SIG_IGN;
 }
 
 /* Frozen contract: restore the thread from the frame at $sp. The frame

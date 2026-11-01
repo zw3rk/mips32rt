@@ -129,6 +129,20 @@ struct mips_thread {
     _Atomic int  child_tid;
 };
 
+/* Hosting thread id for --trace attribution: fresh every call (no
+ * cache: fork children must attribute to their own tid, and a
+ * per-print gettid costs microseconds against millisecond traces).
+ * Unconditional (darwin builds trace too); harness-only, never
+ * affects guest execution. */
+long mips_trace_tid(void)
+{
+#if defined(__linux__) && defined(SYS_gettid)
+    return syscall(SYS_gettid);
+#else
+    return (long)getpid();
+#endif
+}
+
 #if defined(__linux__) && defined(SYS_futex) && defined(SYS_clone) && \
     defined(SYS_exit) && defined(SYS_gettid)
 

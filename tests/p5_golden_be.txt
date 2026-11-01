@@ -1,0 +1,15 @@
+--- toolchain ---
+mips-linux-gnu-gcc (Debian 12.2.0-14) 12.2.0
+qemu-mips version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)
+--- build ---
+  Class:                             ELF32
+  Data:                              2's complement, big endian
+  Machine:                           MIPS R3000
+--- run under qemu-mips ---
+P5 shared-libc: ok qsort+malloc+strcmp n=3
+P5 tls: ok main=1 child=100,200 isolated
+P5 dlopen: ok ./p5helper-be.so add=42 tls=7,14
+P5 argv-env-auxv: ok argc=2 entry_off=0x7f0 marker=p5-lane-l5b
+P5-SUMMARY: pass=4 fail=0
+P5-RESULT: PASS
+BE-EXIT=0

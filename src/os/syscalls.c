@@ -400,7 +400,14 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
     if (mips_sc_flags_to_host(mips_flags, &host_flags) != 0) {
         return mips_sc_ret(ctx, -EINVAL);
     }
-    fd = openat((int)(int32_t)dirfd, path, host_flags, (mode_t)(mode & 07777U));
+    /* Wave C2: absolute library loads resolve under --sysroot first
+     * (PT_INTERP + DT_NEEDED/RPATH); fall back to the raw host path. */
+    fd = mips_sysroot_open(ctx, (int)(int32_t)dirfd, path, host_flags,
+        (mode_t)(mode & 07777U));
+    if (fd < 0) {
+        fd = openat((int)(int32_t)dirfd, path, host_flags,
+            (mode_t)(mode & 07777U));
+    }
     if (fd < 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
     }

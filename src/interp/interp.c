@@ -18,6 +18,7 @@
 #include "mips32rt.h"
 #include "interp/fp.h"
 #include "interp/interp.h"
+#include "os/syscalls_priv.h"
 
 static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d);
 
@@ -66,7 +67,10 @@ static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
         return MIPS_FAULT;
     }
     if (ctx->trace_enabled) {
-        (void)fprintf(stderr, "I %08x %08x\n", pc, word);
+        /* Wave C2: hosting-tid attribution lets the difftest harness
+         * compare per-thread streams (scheduling order varies). */
+        (void)fprintf(stderr, "I %08lx %08x %08x\n",
+                      (unsigned long)mips_trace_tid(), pc, word);
     }
     mips_decode(word, d);
     return 0;

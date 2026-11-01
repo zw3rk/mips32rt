@@ -181,6 +181,10 @@ int mips_hostfault_run(mips32_ctx_t *ctx, void *code, uint32_t *reasonp)
         }
         (void)ctx;
         gva = (uint32_t)((uintptr_t)hf_addr - rc->guest_base);
+        /* Wave C2 difftest parity: replay this block's trace lines now,
+         * while rc->pc still names the faulting insn (the dispatcher
+         * continues before tracing on this path). */
+        dbt_trace_converted_fault(rc);
         if (mips_raise_guest(rc, signo, gva) != 0) {
             _Exit(128 + (signo & 0x7F));
         }

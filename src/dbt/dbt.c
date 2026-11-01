@@ -46,6 +46,7 @@
 #endif
 
 #include "mips32rt.h"
+#include "dbt/aot_emit.h"
 #include "dbt/dbt.h"
 
 /* MIPS major opcodes needed for block-boundary classification. */
@@ -691,6 +692,8 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     b->code = code;
     b->code_len = out_len;
     b->smc_version = smc;
+    /* Wave C2 --cache cold emit: record the published guest range. */
+    mips32_aot_note_block(ctx, pc, b->guest_end);
     dbt_cache->block_link[dbt_cache->block_count] = (uint8_t)link;
     dbt_ibtc_fill(pc, code, smc, dbt_cache->block_count);
     dbt_cache->block_count++;
@@ -700,31 +703,20 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
 
 /*
  * Trace replay for --trace/--difftest parity: re-fetch the words in
- * [start, end) and print the same "I %08x %08x" lines the interpreter
+ * [start, end) and print the same "I <tid> %08x %08x" lines the interpreter
  * prints at fetch time (the interpreter fetches an annulled likely
  * delay slot too, so the slot line is always replayed when mapped).
  * On fault exits the replay stops at the faulting word when it lies
  * inside the block.
  */
-static void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b)
+/* Wave C2: trace replay lives in src/dbt/trace.c (file-size discipline);
+ * this accessor exposes the block table it replays. */
+size_t dbt_trace_table(const dbt_block_t **out)
 {
-    uint32_t start = b->guest_pc;
-    uint32_t end = b->guest_end;
-    uint32_t limit = end;
-    uint32_t p;
-
-    if (ctx->exit_reason == MIPS32_EXIT_FAULT && ctx->exit_info >= start &&
-        ctx->exit_info < end) {
-        limit = ctx->exit_info + 4U;
+    if (out != NULL) {
+        *out = (dbt_cache != NULL) ? dbt_cache->blocks : NULL;
     }
-    for (p = start; p < limit; p += 4U) {
-        uint32_t word = 0;
-
-        if (mips_fetch(ctx, p, &word) != 0) {
-            break;
-        }
-        (void)fprintf(stderr, "I %08x %08x\n", p, word);
-    }
+    return (dbt_cache != NULL) ? dbt_cache->block_count : 0U;
 }
 
 static int dbt_step_fallback(mips32_ctx_t *ctx)
@@ -753,6 +745,9 @@ int dbt_main(mips32_ctx_t *ctx)
     if (ctx == NULL || dbt_cache_ensure(ctx) != 0) {
         return 1;
     }
+    /* Wave C2 --cache warm reload: validate an existing cache file
+     * (silent best-effort; failure runs the guest cold). */
+    mips32_aot_warm(ctx);
     /* RC4: translate host SIGSEGV/SIGBUS inside emitted code into guest
      * fault delivery (src/os/hostfault.c). */
     mips_hostfault_install(dbt_cache->pool, DBT_CODE_POOL_SIZE);

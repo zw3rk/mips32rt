@@ -348,3 +348,37 @@ int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
     }
     return mips_sc_ret(ctx, -ENOSYS);
 }
+
+/* Wave C2: sysroot-prefixed absolute loads for the dynamic linker.
+ * Read-only, non-creating opens of absolute guest paths (AT_FDCWD)
+ * try sysroot+path first, so the committed tests/sysroot fixture can
+ * serve PT_INTERP and DT_NEEDED/RPATH libraries.  Any failure falls
+ * through to the raw host path (returned -1 here), so /proc, /dev,
+ * guest writes, and missing fixture entries behave exactly as before.
+ * Returns the sysroot fd, or -1 when the caller must use the raw path.
+ * Pure C11.  Never touches x18. */
+int mips_sysroot_open(const mips32_ctx_t *ctx, int dirfd, const char *path,
+    int host_flags, mode_t mode)
+{
+    char resolved[MIPS_PATH_MAX];
+    int n;
+    int fd;
+
+    if (ctx == NULL || path == NULL || path[0] != '/' ||
+        dirfd != (int)MIPS_AT_FDCWD || ctx->sysroot == NULL ||
+        ctx->sysroot[0] == '\0') {
+        return -1;
+    }
+    if ((host_flags & 3) != 0 || (host_flags & O_CREAT) != 0) {
+        return -1;
+    }
+    n = snprintf(resolved, sizeof(resolved), "%s%s", ctx->sysroot, path);
+    if (n <= 0 || (size_t)n >= sizeof(resolved)) {
+        return -1;
+    }
+    fd = open(resolved, host_flags, mode);
+    if (fd < 0) {
+        return -1;
+    }
+    return fd;
+}

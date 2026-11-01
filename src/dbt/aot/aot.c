@@ -91,7 +91,13 @@ int mips32_aot_writer_add_block(mips32_aot_writer_t *w, uint32_t guest_pc,
 {
     mips32_aot_block_rec_t *r;
 
-    if (w == NULL || code == NULL || code_len == 0u) {
+    if (w == NULL) {
+        return -EFAULT;
+    }
+    /* Metadata-only records (guest range, no host payload: the Wave C2
+     * --cache emit path) carry code == NULL with code_len == 0; a
+     * half-specified payload is rejected. */
+    if ((code == NULL) != (code_len == 0u)) {
         return -EFAULT;
     }
     if (w->block_count >= MIPS32_AOT_MAX_BLOCKS) {
@@ -107,12 +113,11 @@ int mips32_aot_writer_add_block(mips32_aot_writer_t *w, uint32_t guest_pc,
     r->site_count = site_count;
     r->smc_version = smc_version;
     r->reserved = 0u;
-    r->code_offset = 0u; /* patched at finish: records-then-payload */
+    r->code_offset = 0u; /* no payload section: records only */
     r->site_offset = 0u;
-    /* Payload bytes are staged in memory; the finish pass writes the
-     * header, the record array, then code+sites contiguously.  For
-     * the U3 lane the writer buffers via the record only when the
-     * caller keeps code/slices alive until finish (documented). */
+    /* Only the records persist (header + record array at finish);
+     * host code bytes and site tables are never written, so the file
+     * is position-independent across processes and PIE rebasing. */
     (void)code;
     (void)sites;
     w->block_count++;

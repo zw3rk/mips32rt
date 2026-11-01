@@ -67,6 +67,21 @@ extern long syscall(long __n, ...);
 #define MIPS32_NR_SYSMIPS 4149U
 #define MIPS32_SYSMIPS_FIXADE 7U
 
+/* Wave C2: O32 tkill = __NR_Linux + 236, tgkill = __NR_Linux + 266,
+ * gettid = __NR_Linux + 222 (asm/unistd_o32.h, matching the
+ * MIPS32_NR_TID_ADDRESS precedent: defined locally so the frozen
+ * src/os/syscall_nr.h stays untouched).  kill (+37) is already frozen.
+ * glibc raise() lowers to getpid + gettid + tgkill. */
+#define MIPS32_NR_TKILL 4236U
+#define MIPS32_NR_TGKILL 4266U
+#define MIPS32_NR_GETTID 4222U
+
+/* Kill-class self-delivery (src/os/kill.c, Wave C2). */
+int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp);
+
+/* AOT cache cold emit on guest exit (src/dbt/aot_emit.c, Wave C2). */
+void mips32_aot_flush(mips32_ctx_t *ctx);
+
 /* Cross-lane hook (same weak-reference pattern as src/os/proc.c): the
  * Phase 2 DBT provides mips32_dbt_invalidate_range; without it
  * (interp-only link) cacheflush is a successful no-op. */
@@ -351,6 +366,10 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
             mips_thread_exit(ctx, (int)(status & 0xFFU));
             return sc_ret(ctx, 0); /* unreachable */
         }
+        /* Wave C2 --cache cold emit: persist noted DBT blocks before
+         * the group teardown (silent best-effort; CLONE_VM threads
+         * took the mips_thread_exit path above). */
+        mips32_aot_flush(ctx);
 #if defined(__linux__) && defined(SYS_exit_group)
         (void)syscall(SYS_exit_group, (int)(status & 0xFFU));
 #else
@@ -496,6 +515,27 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         }
         ctx->fixade_enabled = (arg != 0U) ? 1u : 0u;
         return sc_ret(ctx, 0);
+    }
+    /* Wave C2: kill-class self-delivery (raise/tgkill path). */
+    case (uint32_t)MIPS32_NR_kill:
+    case (uint32_t)MIPS32_NR_TKILL:
+    case (uint32_t)MIPS32_NR_TGKILL:
+        return mips_sc_kill(ctx, sp);
+    case (uint32_t)MIPS32_NR_GETTID: {
+        /* O32 gettid: the main thread is the group leader (host gettid
+         * == host getpid); clone threads cached their host tid at
+         * spawn (threads.c). glibc raise() needs this for tgkill. */
+        long tid;
+#if defined(__linux__) && defined(SYS_gettid)
+        if (ctx->is_thread_clone && ctx->host_tid != 0) {
+            tid = (long)ctx->host_tid;
+        } else {
+            tid = syscall(SYS_gettid);
+        }
+#else
+        tid = (long)getpid();
+#endif
+        return sc_ret(ctx, (int32_t)tid);
     }
     case MIPS32_NR_set_thread_area: {
         /* O32 takes the TLS base directly in $a0 (E06); rdhwr $29 reads
