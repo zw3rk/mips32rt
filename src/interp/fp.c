@@ -802,7 +802,7 @@ static int fp_fmt_wl(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
  * interp_step with in_delay_slot set, and a slot-internal branch wins. */
 static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 {
-    unsigned cc = (d->rt >> 2) & 7u;
+    unsigned cc = (d->rt >> 2) & 7u, pre_depth = ctx->sig_depth;
     int taken = (((ctx->fcsr & fp_fcc_mask(cc)) != 0) == ((d->rt & 1u) != 0));
     uint32_t target = pc + 4u + (uint32_t)(d->simm * 4);
     mips_dec_t sl;
@@ -819,7 +819,8 @@ static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     ctx->pc = pc + 4u;
     ctx->next_pc = pc + 8u;
     if (mips_fetch(ctx, pc + 4u, &w) != 0) {
-        if (ctx->exit_reason == MIPS32_EXIT_NONE)
+        if (ctx->exit_reason == MIPS32_EXIT_NONE &&
+            ctx->sig_depth == pre_depth && ctx->pc == pc + 4u)
             mips_fault(ctx, pc + 4u);
         ctx->in_delay_slot = 0;
         if (ctx->exit_reason != MIPS32_EXIT_NONE) {

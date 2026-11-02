@@ -503,11 +503,27 @@ int32_t mips_sc_readlinkat(mips32_ctx_t *ctx, uint32_t sp, int is_readlink)
     if (bufsiz == 0U || bufsiz > MIPS_PATH_MAX) {
         return mips_sc_ret(ctx, -EINVAL);
     }
-    if (mips_sc_read_cstr(ctx, path_va, path) != 0) {
-        return mips_sc_ret(ctx, -EFAULT);
+    {
+        int rc = mips_sc_read_cstr(ctx, path_va, path);
+        if (rc != 0) {
+            return mips_sc_ret(ctx, rc);
+        }
     }
     if (!mips_sc_range_ok(ctx, buf_va, bufsiz, (uint32_t)PROT_WRITE)) {
         return mips_sc_ret(ctx, -EFAULT);
+    }
+    {
+        int pkind = mips_proc_classify(path);
+        if (pkind != 0) {
+            long pn = mips_proc_readlink(ctx, pkind, host_buf, (unsigned long)bufsiz);
+            if (pn < 0) {
+                return mips_sc_ret(ctx, (int32_t)pn);
+            }
+            if (mips_sc_copy_to(ctx, buf_va, host_buf, (uint32_t)pn) != 0) {
+                return mips_sc_ret(ctx, -EFAULT);
+            }
+            return mips_sc_ret(ctx, (int32_t)pn);
+        }
     }
     n = readlinkat((int)(int32_t)dirfd, path, host_buf, (size_t)bufsiz);
     if (n < 0) {

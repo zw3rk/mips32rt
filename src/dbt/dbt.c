@@ -832,7 +832,9 @@ int dbt_main(mips32_ctx_t *ctx)
             ctx->exit_reason = MIPS32_EXIT_NONE;
             ctx->exit_info = 0;
             ctx->llbit = 0;
+            ctx->sc_pc_advanced = 1U;
             (void)mips_syscall(ctx);
+            ctx->sc_pc_advanced = 0U;
             ctx->syscalls_executed++;
             if (ctx->exit_reason != MIPS32_EXIT_NONE) {
                 (void)fprintf(stderr,

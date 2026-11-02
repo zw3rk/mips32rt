@@ -132,104 +132,55 @@ static void l4a_mask_scrub(mips_sigset_t *m)
     l4a_mask_clear(m, (int)L4A_SIGSTOP);
 }
 
-static int l4a_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
-    uint32_t need)
+static void buf_put32(uint8_t *p, size_t off, uint32_t v, int be)
 {
-    return mips32_range_ok(ctx, va, len, need);
-}
-
-static void l4a_put32(mips32_ctx_t *ctx, uint32_t va, uint32_t v, int be)
-{
-    uint8_t *p = (uint8_t *)mips32_guest_ptr(ctx, va);
-
     if (be) {
-        p[0] = (uint8_t)((v >> 24) & 0xFFU);
-        p[1] = (uint8_t)((v >> 16) & 0xFFU);
-        p[2] = (uint8_t)((v >> 8) & 0xFFU);
-        p[3] = (uint8_t)(v & 0xFFU);
+        p[off + 0U] = (uint8_t)((v >> 24) & 0xFFU);
+        p[off + 1U] = (uint8_t)((v >> 16) & 0xFFU);
+        p[off + 2U] = (uint8_t)((v >> 8) & 0xFFU);
+        p[off + 3U] = (uint8_t)(v & 0xFFU);
     } else {
-        p[0] = (uint8_t)(v & 0xFFU);
-        p[1] = (uint8_t)((v >> 8) & 0xFFU);
-        p[2] = (uint8_t)((v >> 16) & 0xFFU);
-        p[3] = (uint8_t)((v >> 24) & 0xFFU);
+        p[off + 0U] = (uint8_t)(v & 0xFFU);
+        p[off + 1U] = (uint8_t)((v >> 8) & 0xFFU);
+        p[off + 2U] = (uint8_t)((v >> 16) & 0xFFU);
+        p[off + 3U] = (uint8_t)((v >> 24) & 0xFFU);
     }
 }
 
-static void l4a_put64(mips32_ctx_t *ctx, uint32_t va, uint64_t v, int be)
+static void buf_put64(uint8_t *p, size_t off, uint64_t v, int be)
 {
     if (be) {
-        l4a_put32(ctx, va, (uint32_t)(v >> 32), be);
-        l4a_put32(ctx, va + 4U, (uint32_t)(v & 0xFFFFFFFFULL), be);
+        buf_put32(p, off, (uint32_t)(v >> 32), be);
+        buf_put32(p, off + 4U, (uint32_t)(v & 0xFFFFFFFFULL), be);
     } else {
-        l4a_put32(ctx, va, (uint32_t)(v & 0xFFFFFFFFULL), be);
-        l4a_put32(ctx, va + 4U, (uint32_t)(v >> 32), be);
+        buf_put32(p, off, (uint32_t)(v & 0xFFFFFFFFULL), be);
+        buf_put32(p, off + 4U, (uint32_t)(v >> 32), be);
     }
 }
 
-static uint32_t l4a_get32(const mips32_ctx_t *ctx, uint32_t va, int be)
+static uint32_t buf_get32(const uint8_t *p, size_t off, int be)
 {
-    const uint8_t *p = (const uint8_t *)mips32_guest_ptr(ctx, va);
-
     if (be) {
-        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-               ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        return ((uint32_t)p[off + 0U] << 24) | ((uint32_t)p[off + 1U] << 16) |
+               ((uint32_t)p[off + 2U] << 8) | (uint32_t)p[off + 3U];
     }
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return (uint32_t)p[off + 0U] | ((uint32_t)p[off + 1U] << 8) |
+           ((uint32_t)p[off + 2U] << 16) | ((uint32_t)p[off + 3U] << 24);
 }
 
-static uint64_t l4a_get64(const mips32_ctx_t *ctx, uint32_t va, int be)
+static uint64_t buf_get64(const uint8_t *p, size_t off, int be)
 {
     uint32_t hi;
     uint32_t lo;
 
     if (be) {
-        hi = l4a_get32(ctx, va, be);
-        lo = l4a_get32(ctx, va + 4U, be);
+        hi = buf_get32(p, off, be);
+        lo = buf_get32(p, off + 4U, be);
     } else {
-        lo = l4a_get32(ctx, va, be);
-        hi = l4a_get32(ctx, va + 4U, be);
+        lo = buf_get32(p, off, be);
+        hi = buf_get32(p, off + 4U, be);
     }
     return ((uint64_t)hi << 32) | (uint64_t)lo;
-}
-
-/* O32 syscall argument fetch: $a0..$a3, then guest stack sp+16/+20... */
-static uint32_t l4a_arg(const mips32_ctx_t *ctx, uint32_t sp, unsigned i,
-    int *ok)
-{
-    int be;
-
-    if (ctx == NULL || ok == NULL) {
-        if (ok != NULL) {
-            *ok = 0;
-        }
-        return 0;
-    }
-    be = mips_is_be(ctx);
-    if (i < 4U) {
-        return ctx->gpr[MIPS32_REG_A0 + i];
-    }
-    if (!l4a_range_ok(ctx, sp + (uint32_t)(16U + 4U * (i - 4U)), 4U,
-            (uint32_t)PROT_READ)) {
-        *ok = 0;
-        return 0;
-    }
-    return l4a_get32(ctx, sp + (uint32_t)(16U + 4U * (i - 4U)), be);
-}
-
-/* $a3 convention writeback; returns the raw host-style value. */
-static int32_t l4a_ret(mips32_ctx_t *ctx, int32_t raw)
-{
-    if (raw < 0) {
-        int32_t e = -raw;
-
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)(e == 38 ? 89 : e);
-        ctx->gpr[MIPS32_REG_A3] = 1U;
-    } else {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)raw;
-        ctx->gpr[MIPS32_REG_A3] = 0U;
-    }
-    return raw;
 }
 
 /* mem.c fault hook: true when signo has a real guest handler. */
@@ -259,6 +210,70 @@ int mips_signal_is_blocked(const mips32_ctx_t *ctx, int signo)
     return (ctx->sig_blocked[bit / 32U] & (uint32_t)(1U << (bit % 32U))) != 0U;
 }
 
+static void l4a_rt_purge_signo(mips32_ctx_t *ctx, int signo)
+{
+    uint32_t r;
+    uint32_t w = 0U;
+    unsigned bit;
+
+    if (ctx == NULL || !l4a_valid_signo(signo)) {
+        return;
+    }
+    bit = (unsigned)(signo - 1);
+    ctx->sig_pending[bit / 32U] &= ~(uint32_t)(1U << (bit % 32U));
+    for (r = 0U; r < ctx->sig_rt_count && r < MIPS32_RT_SIG_QUEUE_CAP; r++) {
+        if (ctx->sig_rt_signo[r] != (uint8_t)signo) {
+            ctx->sig_rt_signo[w] = ctx->sig_rt_signo[r];
+            ctx->sig_rt_code[w] = ctx->sig_rt_code[r];
+            w++;
+        }
+    }
+    ctx->sig_rt_count = w;
+}
+
+static int l4a_pop_pending(mips32_ctx_t *ctx, unsigned signo, int32_t *out_code)
+{
+    unsigned bit = signo - 1U;
+    uint32_t mask = (uint32_t)(1U << (bit % 32U));
+
+    if ((ctx->sig_pending[bit / 32U] & mask) == 0U ||
+        (ctx->sig_blocked[bit / 32U] & mask) != 0U) {
+        return 0;
+    }
+    if (signo >= 32U) {
+        uint32_t q;
+
+        for (q = 0U; q < ctx->sig_rt_count && q < MIPS32_RT_SIG_QUEUE_CAP; q++) {
+            if (ctx->sig_rt_signo[q] == (uint8_t)signo) {
+                uint32_t k;
+                int more = 0;
+
+                *out_code = ctx->sig_rt_code[q];
+                for (k = q + 1U; k < ctx->sig_rt_count && k < MIPS32_RT_SIG_QUEUE_CAP; k++) {
+                    ctx->sig_rt_signo[k - 1U] = ctx->sig_rt_signo[k];
+                    ctx->sig_rt_code[k - 1U] = ctx->sig_rt_code[k];
+                    if (ctx->sig_rt_signo[k - 1U] == (uint8_t)signo) {
+                        more = 1;
+                    }
+                }
+                for (k = 0U; k < q; k++) {
+                    if (ctx->sig_rt_signo[k] == (uint8_t)signo) {
+                        more = 1;
+                    }
+                }
+                ctx->sig_rt_count--;
+                if (!more) {
+                    ctx->sig_pending[bit / 32U] &= ~mask;
+                }
+                return 1;
+            }
+        }
+    }
+    ctx->sig_pending[bit / 32U] &= ~mask;
+    *out_code = ctx->sig_pending_code[signo];
+    return 1;
+}
+
 void mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code)
 {
     unsigned bit;
@@ -267,6 +282,11 @@ void mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code)
         return;
     }
     bit = (unsigned)(signo - 1);
+    if (signo >= 32 && ctx->sig_rt_count < MIPS32_RT_SIG_QUEUE_CAP) {
+        ctx->sig_rt_signo[ctx->sig_rt_count] = (uint8_t)signo;
+        ctx->sig_rt_code[ctx->sig_rt_count] = si_code;
+        ctx->sig_rt_count++;
+    }
     ctx->sig_pending[bit / 32U] |= (uint32_t)(1U << (bit % 32U));
     ctx->sig_pending_code[signo] = si_code;
 }
@@ -279,40 +299,27 @@ void mips_signal_deliver_pending(mips32_ctx_t *ctx)
         return;
     }
     for (signo = 1U; signo <= L4A_NSIG; signo++) {
-        unsigned bit = signo - 1U;
-        uint32_t mask = (uint32_t)(1U << (bit % 32U));
-        int32_t code;
+        int32_t code = 0;
 
-        if ((ctx->sig_pending[bit / 32U] & mask) == 0U ||
-            (ctx->sig_blocked[bit / 32U] & mask) != 0U) {
-            continue;
-        }
-        ctx->sig_pending[bit / 32U] &= ~mask;
-        code = ctx->sig_pending_code[signo];
-        if (mips_signal_is_ignored((int)signo)) {
-            continue;
-        }
-        if (mips_signal_has_handler((int)signo)) {
-            uint32_t word = 0U;
-
-            if (mips_fetch(ctx, ctx->pc, &word) == 0 && word == 0x0000000CU) {
-                ctx->pc += 4U;
-                ctx->next_pc = ctx->pc + 4U;
-                ctx->in_delay_slot = 0U;
+        while (l4a_pop_pending(ctx, signo, &code)) {
+            if (mips_signal_is_ignored((int)signo)) {
+                continue;
             }
-            if (mips_raise_guest_code(ctx, (int)signo, code, 0U) != 0) {
-                mips_signal_default_die((int)signo);
+            if (mips_signal_has_handler((int)signo)) {
+                if (mips_raise_guest_code(ctx, (int)signo, code, 0U) != 0) {
+                    mips_signal_default_die((int)signo);
+                }
+                return;
             }
-            return;
+            if (mips_signal_default_ignore((int)signo)) {
+                continue;
+            }
+            if (mips_signal_default_stop((int)signo)) {
+                (void)kill(getpid(), SIGSTOP);
+                continue;
+            }
+            mips_signal_default_die((int)signo);
         }
-        if (mips_signal_default_ignore((int)signo)) {
-            continue;
-        }
-        if (mips_signal_default_stop((int)signo)) {
-            (void)kill(getpid(), SIGSTOP);
-            continue;
-        }
-        mips_signal_default_die((int)signo);
     }
 }
 
@@ -320,59 +327,57 @@ void mips_signal_deliver_pending(mips32_ctx_t *ctx)
 int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
 {
     int ok = 1;
-    int be;
     uint32_t sig;
     uint32_t act_va;
     uint32_t oact_va;
     uint32_t setsize;
     l4a_action_t cur;
-    uint32_t base;
     unsigned w;
 
     if (ctx == NULL) {
         return -L4A_EFAULT;
     }
-    sig = l4a_arg(ctx, sp, 0, &ok);
-    act_va = l4a_arg(ctx, sp, 1, &ok);
-    oact_va = l4a_arg(ctx, sp, 2, &ok);
-    setsize = l4a_arg(ctx, sp, 3, &ok);
+    sig = mips_sc_arg(ctx, sp, 0, &ok);
+    act_va = mips_sc_arg(ctx, sp, 1, &ok);
+    oact_va = mips_sc_arg(ctx, sp, 2, &ok);
+    setsize = mips_sc_arg(ctx, sp, 3, &ok);
     if (!ok) {
-        return l4a_ret(ctx, -L4A_EFAULT);
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
     if (!l4a_valid_signo((int)sig) || l4a_uncatchable((int)sig)) {
-        return l4a_ret(ctx, -L4A_EINVAL);
+        return mips_sc_ret(ctx, -L4A_EINVAL);
     }
     if (setsize != 16U) {
-        return l4a_ret(ctx, -L4A_EINVAL);
+        return mips_sc_ret(ctx, -L4A_EINVAL);
     }
-    be = mips_is_be(ctx);
     mips32_spin_lock(&g_sig_lock);
     cur = g_actions[sig];
     mips32_spin_unlock(&g_sig_lock);
     if (oact_va != 0U) {
-        if (!l4a_range_ok(ctx, oact_va, L4A_KERN_SIGACTION_SIZE,
-                (uint32_t)PROT_WRITE)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
-        }
-        l4a_put32(ctx, oact_va, cur.flags, be);
-        l4a_put32(ctx, oact_va + 4U,
-            cur.installed ? cur.handler : L4A_SIG_DFL, be);
+        uint8_t obuf[L4A_KERN_SIGACTION_SIZE];
+        int be = mips_is_be(ctx);
+
+        buf_put32(obuf, 0U, cur.flags, be);
+        buf_put32(obuf, 4U, cur.installed ? cur.handler : L4A_SIG_DFL, be);
         for (w = 0; w < 4U; w++) {
-            l4a_put32(ctx, oact_va + 8U + 4U * w, cur.mask.sig[w], be);
+            buf_put32(obuf, 8U + 4U * w, cur.mask.sig[w], be);
+        }
+        if (mips_sc_copy_to(ctx, oact_va, obuf, sizeof(obuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
         }
     }
     if (act_va != 0U) {
+        uint8_t ibuf[L4A_KERN_SIGACTION_SIZE];
+        int be = mips_is_be(ctx);
         l4a_action_t next;
 
-        if (!l4a_range_ok(ctx, act_va, L4A_KERN_SIGACTION_SIZE,
-                (uint32_t)PROT_READ)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
+        if (mips_sc_copy_from(ctx, ibuf, act_va, sizeof(ibuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
         }
-        base = act_va;
-        next.flags = l4a_get32(ctx, base, be);
-        next.handler = l4a_get32(ctx, base + 4U, be);
+        next.flags = buf_get32(ibuf, 0U, be);
+        next.handler = buf_get32(ibuf, 4U, be);
         for (w = 0; w < 4U; w++) {
-            next.mask.sig[w] = l4a_get32(ctx, base + 8U + 4U * w, be);
+            next.mask.sig[w] = buf_get32(ibuf, 8U + 4U * w, be);
         }
         next.restorer = 0U;
         l4a_mask_scrub(&next.mask);
@@ -390,11 +395,10 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
         mips32_spin_unlock(&g_sig_lock);
         if (next.handler == L4A_SIG_IGN ||
             (next.handler == L4A_SIG_DFL && mips_signal_default_ignore((int)sig))) {
-            unsigned bit = sig - 1U;
-            ctx->sig_pending[bit / 32U] &= ~(uint32_t)(1U << (bit % 32U));
+            l4a_rt_purge_signo(ctx, (int)sig);
         }
     }
-    return l4a_ret(ctx, 0);
+    return mips_sc_ret(ctx, 0);
 }
 
 /* rt_sigprocmask(how, set, oldset, sigsetsize): record-only; the host
@@ -412,37 +416,40 @@ int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
     if (ctx == NULL) {
         return -L4A_EFAULT;
     }
-    how = l4a_arg(ctx, sp, 0, &ok);
-    set_va = l4a_arg(ctx, sp, 1, &ok);
-    old_va = l4a_arg(ctx, sp, 2, &ok);
-    setsize = l4a_arg(ctx, sp, 3, &ok);
+    how = mips_sc_arg(ctx, sp, 0, &ok);
+    set_va = mips_sc_arg(ctx, sp, 1, &ok);
+    old_va = mips_sc_arg(ctx, sp, 2, &ok);
+    setsize = mips_sc_arg(ctx, sp, 3, &ok);
     if (!ok) {
-        return l4a_ret(ctx, -L4A_EFAULT);
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
     if (how != L4A_SIG_BLOCK && how != L4A_SIG_UNBLOCK &&
         how != L4A_SIG_SETMASK) {
-        return l4a_ret(ctx, -L4A_EINVAL);
+        return mips_sc_ret(ctx, -L4A_EINVAL);
     }
     if (setsize != 16U) {
-        return l4a_ret(ctx, -L4A_EINVAL);
+        return mips_sc_ret(ctx, -L4A_EINVAL);
     }
     be = mips_is_be(ctx);
     if (old_va != 0U) {
-        if (!l4a_range_ok(ctx, old_va, 16U, (uint32_t)PROT_WRITE)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
-        }
+        uint8_t obuf[16];
+
         for (w = 0; w < 4U; w++) {
-            l4a_put32(ctx, old_va + 4U * w, ctx->sig_blocked[w], be);
+            buf_put32(obuf, 4U * w, ctx->sig_blocked[w], be);
+        }
+        if (mips_sc_copy_to(ctx, old_va, obuf, sizeof(obuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
         }
     }
     if (set_va != 0U) {
+        uint8_t ibuf[16];
         mips_sigset_t next;
 
-        if (!l4a_range_ok(ctx, set_va, 16U, (uint32_t)PROT_READ)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
+        if (mips_sc_copy_from(ctx, ibuf, set_va, sizeof(ibuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
         }
         for (w = 0; w < 4U; w++) {
-            next.sig[w] = l4a_get32(ctx, set_va + 4U * w, be);
+            next.sig[w] = buf_get32(ibuf, 4U * w, be);
         }
         l4a_mask_scrub(&next);
         if (how == L4A_SIG_BLOCK) {
@@ -459,7 +466,8 @@ int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
             }
         }
     }
-    (void)l4a_ret(ctx, 0);
+    (void)mips_sc_ret(ctx, 0);
+    mips_sc_advance_pc_once(ctx);
     mips_signal_deliver_pending(ctx);
     return 0;
 }
@@ -474,7 +482,8 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
     uint8_t *h;
     int be;
 
-    if (l4a_range_ok(ctx, MIPS32_SIGTRAMP, 8U, (uint32_t)PROT_READ)) {
+    rt32_vm_sync_ctx(ctx);
+    if (mips32_range_ok(ctx, MIPS32_SIGTRAMP, 8U, (uint32_t)PROT_READ)) {
         return 0;
     }
     want = (void *)(uintptr_t)(ctx->guest_base + (uint64_t)MIPS32_SIGTRAMP);
@@ -534,6 +543,9 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
 static int l4a_range_mapped(const mips32_ctx_t *ctx, uint32_t va,
     uint32_t len)
 {
+    if (ctx != NULL) {
+        rt32_vm_sync_ctx((mips32_ctx_t *)ctx);
+    }
     return mips32_range_mapped(ctx, va, len);
 }
 
@@ -574,6 +586,7 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
     uint32_t branch_pc;
     unsigned i;
     mips_sigset_t entry_mask;
+    uint8_t frame[sizeof(mips_rt_sigframe_t)];
 
     if (ctx == NULL || !l4a_valid_signo(signo) ||
         !mips_signal_has_handler(signo)) {
@@ -598,13 +611,6 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
         }
         newsp = (base - (uint32_t)sizeof(mips_rt_sigframe_t)) &
                 (uint32_t)~7U;
-        if ((ctx->gpr[MIPS32_REG_SP] & 7U) != 0U) {
-            ctx->gpr[MIPS32_REG_SP] &= (uint32_t)~7U;
-        }
-    }
-    if (!l4a_range_ok(ctx, newsp, (uint32_t)sizeof(mips_rt_sigframe_t),
-            (uint32_t)PROT_WRITE)) {
-        return -1;
     }
     if (act.restorer != 0U) {
         ra = act.restorer;
@@ -615,25 +621,31 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
         ra = MIPS32_SIGTRAMP;
     }
     be = mips_is_be(ctx);
-    memset(mips32_guest_ptr(ctx, newsp), 0, sizeof(mips_rt_sigframe_t));
+    memset(frame, 0, sizeof(frame));
     /* siginfo: signo@frame+24, code@+28, errno@+32(=0), addr@+36. */
-    l4a_put32(ctx, newsp + 24U, (uint32_t)signo, be);
-    l4a_put32(ctx, newsp + 28U, (uint32_t)si_code, be);
-    l4a_put32(ctx, newsp + 36U, fault_addr, be);
+    buf_put32(frame, 24U, (uint32_t)signo, be);
+    buf_put32(frame, 28U, (uint32_t)si_code, be);
+    buf_put32(frame, 36U, fault_addr, be);
     branch_pc = ctx->in_delay_slot != 0U ? ctx->pc - 4U : ctx->pc;
-    l4a_put64(ctx, newsp + 184U, (uint64_t)branch_pc, be);
+    buf_put64(frame, 184U, (uint64_t)branch_pc, be);
     for (i = 0; i < 32U; i++) {
-        l4a_put64(ctx, newsp + 192U + 8U * i, (uint64_t)ctx->gpr[i], be);
-        l4a_put64(ctx, newsp + 448U + 8U * i, ctx->fpr[i], be);
+        uint32_t reg_val = (i == MIPS32_REG_SP)
+            ? (ctx->gpr[i] & (uint32_t)~7U)
+            : ctx->gpr[i];
+        buf_put64(frame, 192U + 8U * i, (uint64_t)reg_val, be);
+        buf_put64(frame, 448U + 8U * i, ctx->fpr[i], be);
     }
-    l4a_put32(ctx, newsp + 704U, 1U, be); /* sc_ownedfp */
-    l4a_put32(ctx, newsp + 708U, ctx->fcsr, be); /* sc_fpc_csr */
-    l4a_put32(ctx, newsp + 716U, 1U, be); /* sc_used_math */
-    l4a_put64(ctx, newsp + 728U, (uint64_t)ctx->hi, be); /* sc_mdhi */
-    l4a_put64(ctx, newsp + 736U, (uint64_t)ctx->lo, be); /* sc_mdlo */
+    buf_put32(frame, 704U, 1U, be); /* sc_ownedfp */
+    buf_put32(frame, 708U, ctx->fcsr, be); /* sc_fpc_csr */
+    buf_put32(frame, 716U, 1U, be); /* sc_used_math */
+    buf_put64(frame, 728U, (uint64_t)ctx->hi, be); /* sc_mdhi */
+    buf_put64(frame, 736U, (uint64_t)ctx->lo, be); /* sc_mdlo */
     for (i = 0; i < 4U; i++) {
-        l4a_put32(ctx, newsp + 768U + 4U * i, ctx->sig_blocked[i], be);
+        buf_put32(frame, 768U + 4U * i, ctx->sig_blocked[i], be);
         entry_mask.sig[i] = ctx->sig_blocked[i] | act.mask.sig[i];
+    }
+    if (mips_sc_copy_to(ctx, newsp, frame, sizeof(frame)) != 0) {
+        return -1;
     }
     if ((act.flags & L4A_SA_NODEFER) == 0U) {
         l4a_mask_set(&entry_mask, signo);
@@ -694,15 +706,14 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
     unsigned i;
     int found = 0;
     mips_sigset_t saved;
+    uint8_t frame[sizeof(mips_rt_sigframe_t)];
 
     if (ctx == NULL) {
         return -L4A_EFAULT;
     }
     sp = ctx->gpr[MIPS32_REG_SP];
     if ((sp & 7U) != 0U) {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)L4A_EFAULT;
-        ctx->gpr[MIPS32_REG_A3] = 1U;
-        return -L4A_EFAULT;
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
     for (i = 0; i < ctx->sig_depth; i++) {
         if (ctx->sig_frame_sp[i] == sp) {
@@ -712,32 +723,26 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
         }
     }
     if (!found) {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)L4A_EFAULT;
-        ctx->gpr[MIPS32_REG_A3] = 1U;
-        return -L4A_EFAULT;
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
-    if (!l4a_range_ok(ctx, sp, (uint32_t)sizeof(mips_rt_sigframe_t),
-            (uint32_t)PROT_READ)) {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)L4A_EFAULT;
-        ctx->gpr[MIPS32_REG_A3] = 1U;
-        return -L4A_EFAULT;
+    if (mips_sc_copy_from(ctx, frame, sp, sizeof(frame)) != 0) {
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
     be = mips_is_be(ctx);
     for (i = 1; i < 32U; i++) {
-        ctx->gpr[i] =
-            (uint32_t)l4a_get64(ctx, sp + 192U + 8U * i, be);
+        ctx->gpr[i] = (uint32_t)buf_get64(frame, 192U + 8U * i, be);
     }
     ctx->gpr[MIPS32_REG_ZERO] = 0U;
     for (i = 0; i < 32U; i++) {
-        ctx->fpr[i] = l4a_get64(ctx, sp + 448U + 8U * i, be);
+        ctx->fpr[i] = buf_get64(frame, 448U + 8U * i, be);
     }
-    ctx->pc = (uint32_t)l4a_get64(ctx, sp + 184U, be);
+    ctx->pc = (uint32_t)buf_get64(frame, 184U, be);
     ctx->next_pc = ctx->pc + 4U;
-    ctx->fcsr = l4a_get32(ctx, sp + 708U, be);
-    ctx->hi = (uint32_t)l4a_get64(ctx, sp + 728U, be);
-    ctx->lo = (uint32_t)l4a_get64(ctx, sp + 736U, be);
+    ctx->fcsr = buf_get32(frame, 708U, be);
+    ctx->hi = (uint32_t)buf_get64(frame, 728U, be);
+    ctx->lo = (uint32_t)buf_get64(frame, 736U, be);
     for (i = 0; i < 4U; i++) {
-        saved.sig[i] = l4a_get32(ctx, sp + 768U + 4U * i, be);
+        saved.sig[i] = buf_get32(frame, 768U + 4U * i, be);
     }
     l4a_mask_scrub(&saved);
     for (i = 0; i < 4U; i++) {
@@ -787,58 +792,60 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
     if (ctx == NULL) {
         return -L4A_EFAULT;
     }
-    ss_va = l4a_arg(ctx, sp, 0, &ok);
-    oss_va = l4a_arg(ctx, sp, 1, &ok);
+    ss_va = mips_sc_arg(ctx, sp, 0, &ok);
+    oss_va = mips_sc_arg(ctx, sp, 1, &ok);
     if (!ok) {
-        return l4a_ret(ctx, -L4A_EFAULT);
+        return mips_sc_ret(ctx, -L4A_EFAULT);
     }
     be = mips_is_be(ctx);
     if (oss_va != 0U) {
+        uint8_t obuf[12];
         uint32_t flags;
 
-        if (!l4a_range_ok(ctx, oss_va, 12U, (uint32_t)PROT_WRITE)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
-        }
         flags = ((ctx->sigalt_flags & L4A_SS_DISABLE) != 0U ||
                  ctx->sigalt_size == 0U)
                     ? L4A_SS_DISABLE
                     : (l4a_on_altstack(ctx) ? L4A_SS_ONSTACK : 0U);
-        l4a_put32(ctx, oss_va, ctx->sigalt_sp, be);
-        l4a_put32(ctx, oss_va + 4U, ctx->sigalt_size, be);
-        l4a_put32(ctx, oss_va + 8U, flags, be);
+        buf_put32(obuf, 0U, ctx->sigalt_sp, be);
+        buf_put32(obuf, 4U, ctx->sigalt_size, be);
+        buf_put32(obuf, 8U, flags, be);
+        if (mips_sc_copy_to(ctx, oss_va, obuf, sizeof(obuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
+        }
     }
     if (ss_va != 0U) {
+        uint8_t ibuf[12];
         uint32_t nsp;
         uint32_t nflags;
         uint32_t nsize;
 
-        if (!l4a_range_ok(ctx, ss_va, 12U, (uint32_t)PROT_READ)) {
-            return l4a_ret(ctx, -L4A_EFAULT);
+        if (mips_sc_copy_from(ctx, ibuf, ss_va, sizeof(ibuf)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
         }
-        nsp = l4a_get32(ctx, ss_va, be);
-        nsize = l4a_get32(ctx, ss_va + 4U, be);
-        nflags = l4a_get32(ctx, ss_va + 8U, be);
+        nsp = buf_get32(ibuf, 0U, be);
+        nsize = buf_get32(ibuf, 4U, be);
+        nflags = buf_get32(ibuf, 8U, be);
         if (nflags != L4A_SS_DISABLE && nflags != 0U &&
             nflags != L4A_SS_ONSTACK) {
-            return l4a_ret(ctx, -L4A_EINVAL);
+            return mips_sc_ret(ctx, -L4A_EINVAL);
         }
         if (nflags == L4A_SS_DISABLE) {
             ctx->sigalt_flags = L4A_SS_DISABLE;
             ctx->sigalt_size = 0U;
             ctx->sigalt_sp = 0U;
-            return l4a_ret(ctx, 0);
+            return mips_sc_ret(ctx, 0);
         }
         if (l4a_on_altstack(ctx)) {
-            return l4a_ret(ctx, -L4A_EPERM);
+            return mips_sc_ret(ctx, -L4A_EPERM);
         }
         if (nsize < L4A_MINSIGSTKSZ) {
-            return l4a_ret(ctx, -L4A_ENOMEM);
+            return mips_sc_ret(ctx, -L4A_ENOMEM);
         }
         ctx->sigalt_sp = nsp;
         ctx->sigalt_size = nsize;
         ctx->sigalt_flags = 0U;
     }
-    return l4a_ret(ctx, 0);
+    return mips_sc_ret(ctx, 0);
 }
 
 /* execve: drop every disposition, mask, live frame and altstack
@@ -860,6 +867,7 @@ void mips32_signals_reset_for_exec(mips32_ctx_t *ctx)
         memset(ctx->sig_blocked, 0, sizeof(ctx->sig_blocked));
         memset(ctx->sig_pending, 0, sizeof(ctx->sig_pending));
         memset(ctx->sig_pending_code, 0, sizeof(ctx->sig_pending_code));
+        ctx->sig_rt_count = 0U;
         memset(ctx->sig_frame_sp, 0, sizeof(ctx->sig_frame_sp));
         ctx->sig_depth = 0U;
         ctx->sigalt_sp = 0U;

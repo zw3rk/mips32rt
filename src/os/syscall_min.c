@@ -39,6 +39,7 @@
 #include "mips32rt.h"
 
 #include "os/syscall_nr.h"
+#include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
 
 #include <errno.h>
@@ -100,49 +101,16 @@ static int range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
     return mips32_range_ok(ctx, va, len, need);
 }
 
-static int32_t mips_errno_from_host(int host_errno)
-{
-    if (host_errno == ENOSYS) {
-        return 89; /* MIPS ENOSYS (asm/errno.h), not asm-generic 38 */
-    }
-    return (int32_t)host_errno;
-}
-
 /* Record the $a3 convention in the guest regs; return raw host value. */
 static int32_t sc_ret(mips32_ctx_t *ctx, int32_t raw)
 {
-    if (raw < 0) {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)mips_errno_from_host(-raw);
-        ctx->gpr[MIPS32_REG_A3] = 1U;
-    } else {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)raw;
-        ctx->gpr[MIPS32_REG_A3] = 0U;
-    }
-    return raw;
+    return mips_sc_ret(ctx, raw);
 }
 
-/*
- * Fetch O32 argument i (0-based): $a0..$a3 for i<4, guest stack slot at
- * sp+16+4*(i-4) otherwise.  The readability pre-check keeps a bad stack
- * from recording EXIT_FAULT: failure yields ok=0 for an -EFAULT return.
- */
+/* Fetch O32 argument i (0-based) via shared lock-held syscall helper. */
 static uint32_t o32_arg(mips32_ctx_t *ctx, uint32_t sp, unsigned i, int *ok)
 {
-    uint32_t va;
-    uint32_t val = 0U;
-
-    if (i < 4U) {
-        *ok = 1;
-        return ctx->gpr[MIPS32_REG_A0 + i];
-    }
-    va = sp + 16U + 4U * (i - 4U);
-    if ((va & 3U) != 0U || !range_ok(ctx, va, 4U, (uint32_t)PROT_READ) ||
-        guest_ld32(ctx, va, &val) != 0) {
-        *ok = 0;
-        return 0U;
-    }
-    *ok = 1;
-    return val;
+    return mips_sc_arg(ctx, sp, i, ok);
 }
 
 static void copy_uts_field(uint8_t *dst, const char *src)
@@ -211,6 +179,9 @@ static int32_t sc_write(mips32_ctx_t *ctx, uint32_t sp)
     n        = write((int)fd, host_buf, (size_t)count);
     if (n < 0) {
         return sc_ret(ctx, -(int32_t)errno);
+    }
+    if (n > 0) {
+        rt32_vm_sync_shared_fd((int)fd);
     }
     if (n > 0x7FFFFFFFL) {
         n = 0x7FFFFFFFL;

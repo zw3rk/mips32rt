@@ -44,12 +44,19 @@ void vm_sync_from_ctx(mips32_ctx_t *ctx);
 void vm_sync_brk_to_ctx(mips32_ctx_t *ctx);
 void vm_sync_to_ctx(mips32_ctx_t *ctx);
 
-/* Per-region file-backing metadata (M32-3, M32-4). */
+/* Per-region file-backing metadata (M32-3, M32-4, M32-R2-2). */
 typedef struct {
     int      fd;        /* retained dup'd fd for file mappings, or -1 */
     uint64_t file_off;  /* byte offset in fd at region->start */
+    uint64_t dev;       /* st_dev when fd >= 0 */
+    uint64_t ino;       /* st_ino when fd >= 0 */
     uint8_t  darw_sync; /* 1 when Darwin sub-16KiB MAP_SHARED needs writeback */
 } vm_backing_t;
+
+extern mips32_ctx_t   *g_vm_root_ctx;
+extern mips32_region_t g_vm_regions[MIPS32_MAX_REGIONS];
+extern vm_backing_t    g_vm_backing[MIPS32_MAX_REGIONS];
+extern size_t          g_vm_region_count;
 
 /* Locked VMA-table primitives (defined in vm.c; caller holds the lock). */
 void vm_remove_region_at(size_t idx);
@@ -59,6 +66,10 @@ int  vm_insert_region_backed(uint32_t start, uint32_t end, uint32_t prot,
                              uint32_t flags, const char *name,
                              vm_backing_t back);
 void vm_coalesce_regions_locked(void);
+int  vm_can_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end,
+                                 size_t extra_insert);
+int  vm_flush_darw_range_locked(uint32_t start, uint32_t end);
+void vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino);
 void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
 int  vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,
                              uint32_t flags, const char *name);

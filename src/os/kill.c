@@ -227,19 +227,8 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
     }
     /* Resume-after semantics: the frame snapshots the post-syscall
      * state (return 0 in $v0/$a3, pc past the trap insn), or sigreturn
-     * would re-execute the trap and redeliver forever.  The engines
-     * disagree at entry (interp leaves pc at the insn, DBT pre-advances
-     * past it), so probe the word at pc: only a literal SYSCALL trap
-     * (0x0000000c) advances. */
-    {
-        uint32_t word = 0U;
-
-        if (mips_fetch(ctx, ctx->pc, &word) == 0 && word == 0x0000000CU) {
-            ctx->pc += 4U;
-            ctx->next_pc = ctx->pc + 4U;
-            ctx->in_delay_slot = 0U;
-        }
-    }
+     * would re-execute the trap and redeliver forever. */
+    mips_sc_advance_pc_once(ctx);
     ctx->gpr[MIPS32_REG_V0] = 0U;
     ctx->gpr[MIPS32_REG_A3] = 0U;
     /* Synchronous self-delivery: the frame redirects ctx->pc at the

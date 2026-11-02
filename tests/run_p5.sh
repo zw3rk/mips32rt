@@ -29,6 +29,7 @@ T="$ROOT/tests"
 SRC="$ROOT/_build/p5src"
 NAME="mips32rt-l5a-$$"
 IMG="debian:bookworm-slim"
+docker image inspect mips32rt-tool:latest >/dev/null 2>&1 && IMG="mips32rt-tool:latest"
 
 fail() {
     echo "P5 FAIL: $1"
@@ -41,8 +42,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "=== P5 rebuild translator (host nix cross CC) ==="
+rm -rf "$ROOT/_build/obj" "$ROOT/_build/mips32rt"
 nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.stdenv.cc -c \
-    make -C "$ROOT" clean build CC=aarch64-unknown-linux-musl-gcc
+    make -C "$ROOT" build CC=aarch64-unknown-linux-musl-gcc
 test -x "$ROOT/_build/mips32rt" || fail "no translator binary"
 
 echo "=== P5 stage gate sources (gitignored _build scratch) ==="
@@ -570,10 +572,12 @@ p5fail() {
 }
 
 echo "=== P5 container setup ==="
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    gcc qemu-user gcc-mipsel-linux-gnu gcc-mips-linux-gnu \
-    libc6-dev-mipsel-cross libc6-dev-mips-cross
+command -v mipsel-linux-gnu-gcc >/dev/null 2>&1 || {
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        gcc qemu-user gcc-mipsel-linux-gnu gcc-mips-linux-gnu \
+        libc6-dev-mipsel-cross libc6-dev-mips-cross
+}
 test -x /w/_build/mips32rt || { echo "P5 FAIL: no translator binary"; exit 1; }
 
 echo "=== P5 build dynamic probes ==="
@@ -711,10 +715,14 @@ for endian in le be; do
 done
 
 echo "=== P5 /proc synthesis unit test (host-native) ==="
-cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -I/w/include -I/w/src \
-    -o /tmp/p5unit /w/_build/p5src/p5_proc_unit.c \
-    /w/_build/p5src/p5_proc_stubs.c /w/src/os/proc.c || p5fail "unit compile"
+if [ -x /w/_build/p5src/p5unit ]; then
+    cp /w/_build/p5src/p5unit /tmp/p5unit
+else
+    cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+        -I/w/include -I/w/src \
+        -o /tmp/p5unit /w/_build/p5src/p5_proc_unit.c \
+        /w/_build/p5src/p5_proc_stubs.c /w/src/os/proc.c || p5fail "unit compile"
+fi
 (cd /tmp && ./p5unit) || p5fail "/proc unit test"
 
 if [ "$fails" -eq 0 ]; then
@@ -724,6 +732,11 @@ else
     exit 1
 fi
 GATEEOF
+
+nix shell nixpkgs#pkgsCross.aarch64-multiplatform-musl.stdenv.cc -c \
+    aarch64-unknown-linux-musl-gcc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -static -I"$ROOT/include" -I"$ROOT/src" \
+    -o "$SRC/p5unit" "$SRC/p5_proc_unit.c" "$SRC/p5_proc_stubs.c" "$ROOT/src/os/proc.c"
 
 echo "=== P5 container run ($IMG) ==="
 docker run -d --name "$NAME" --memory 2g --cpus 2 \

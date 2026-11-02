@@ -55,6 +55,7 @@ void     rt32_vm_sync_ctx(mips32_ctx_t *ctx);
 int      rt32_vm_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va, uint32_t len);
 int      rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len);
 int      rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len);
+void     rt32_vm_sync_shared_fd(int fd);
 
 /* ELF32 loader & initial stack (elf32.c, stack32.c) */
 typedef struct rt32_elf_info {

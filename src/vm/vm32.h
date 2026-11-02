@@ -86,16 +86,6 @@ _Static_assert(sizeof(mips32_mem_site_t) == 24,
 #define MIPS32_VM_REGIME_A1    1u /* H == 4096: direct [x20, wAddr, uxtw] */
 #define MIPS32_VM_REGIME_A2    2u /* H > 4096: Soft-TLB over MAP_PRIVATE arena */
 
-/* Per-4KiB page states (Provider A, UNIFICATION-PLAN.md 5.1). */
-#define MIPS32_PAGE_ANON      0u
-#define MIPS32_PAGE_COW_CLEAN 1u /* MAP_PRIVATE file page, not yet written */
-#define MIPS32_PAGE_COW_DIRTY 2u /* promoted in place; HVA unchanged */
-#define MIPS32_PAGE_SHARED    3u /* MAP_SHARED page */
-
-/* Per-4KiB page flags. */
-#define MIPS32_PAGE_HAS_CODE           0x01u /* live DBT blocks: trap stores */
-#define MIPS32_PAGE_HAS_SW_RESERVATION 0x02u /* active LL: trap stores */
-
 /* Linux MIPS sysmips(2) command for address-error fixing control. */
 #define MIPS32_SYSMIPS_FIXADE 7 /* MIPS_FIXADE (Linux sys/sysmips.h) */
 

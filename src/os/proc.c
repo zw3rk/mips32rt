@@ -33,6 +33,7 @@
 #include "mips32rt.h"
 
 #include "os/syscall_nr.h"
+#include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
 
 #include <errno.h>
@@ -46,7 +47,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Local caps (mirror the L2a sizes without including its private header). */
+/* Local caps (mirror the L2a sizes). */
 #define PROC_PATH_MAX   4096U
 #define PROC_PTR_CAP    512U
 #define PROC_RUSAGE_SIZE 72U /* MIPS32 struct rusage: 2x timeval(8B) + 14x u32 */
@@ -58,26 +59,33 @@
  *
  * mips32_dbt_invalidate_range is provided by the Phase 2 DBT; without it
  * (interp-only link) execve still works because no code cache exists.
- * mips32_signals_reset_for_exec will be provided by lane L4a's
- * guest-owned signal table; without it there is no signal state to reset
- * (Phase 2 rt_sigprocmask records nothing).
+ * mips32_signals_reset_for_exec is provided by lane L4a's guest-owned
+ * signal table; rt32_vm_copy_from/to are weak so standalone host unit
+ * harnesses that compile proc.c without vm.c still link.
  */
 __attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
                                                       uint32_t start,
                                                       uint32_t end);
 __attribute__((weak)) void mips32_signals_reset_for_exec(mips32_ctx_t *ctx);
+__attribute__((weak)) int rt32_vm_copy_from(const mips32_ctx_t *ctx, void *dst,
+                                            uint32_t va, uint32_t len);
+__attribute__((weak)) int rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va,
+                                          const void *src, uint32_t len);
 
 /* ---- local guest-memory + return helpers (self-contained, lane-owned) ---- */
+
+static uint32_t proc_swap32(uint32_t v)
+{
+    return ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |
+           ((v & 0x00FF0000U) >> 8) | ((v & 0xFF000000U) >> 24);
+}
 
 static int32_t proc_ret(mips32_ctx_t *ctx, int32_t raw)
 {
     int32_t err;
 
     if (raw < 0) {
-        err = -raw;
-        if (err == ENOSYS) {
-            err = 89; /* MIPS ENOSYS, not the host value 38 */
-        }
+        err = mips_errno_from_host((int)(-raw));
         ctx->gpr[MIPS32_REG_V0] = (uint32_t)err;
         ctx->gpr[MIPS32_REG_A3] = 1U;
     } else {
@@ -87,11 +95,44 @@ static int32_t proc_ret(mips32_ctx_t *ctx, int32_t raw)
     return raw;
 }
 
-/* True when [va, va+len) is fully covered by recorded regions with need. */
-static int proc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
-                         uint32_t need)
+static int proc_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va,
+                          uint32_t len)
 {
-    return mips32_range_ok(ctx, va, len, need);
+    int (*fn)(const mips32_ctx_t *, void *, uint32_t, uint32_t) =
+        rt32_vm_copy_from;
+
+    if (fn != NULL) {
+        return fn(ctx, dst, va, len);
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    if (ctx == NULL || dst == NULL ||
+        !mips32_range_ok(ctx, va, len, (uint32_t)PROT_READ)) {
+        return -EFAULT;
+    }
+    memcpy(dst, mips32_guest_ptr(ctx, va), (size_t)len);
+    return 0;
+}
+
+static int proc_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src,
+                        uint32_t len)
+{
+    int (*fn)(mips32_ctx_t *, uint32_t, const void *, uint32_t) =
+        rt32_vm_copy_to;
+
+    if (fn != NULL) {
+        return fn(ctx, va, src, len);
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    if (ctx == NULL || src == NULL ||
+        !mips32_range_ok(ctx, va, len, (uint32_t)PROT_WRITE)) {
+        return -EFAULT;
+    }
+    memcpy(mips32_guest_ptr(ctx, va), src, (size_t)len);
+    return 0;
 }
 
 /*
@@ -108,20 +149,12 @@ static uint32_t proc_arg(mips32_ctx_t *ctx, uint32_t sp, unsigned i, int *ok)
         return ctx->gpr[MIPS32_REG_A0 + i];
     }
     va = sp + 16U + 4U * (i - 4U);
-    if ((va & 3U) != 0U ||
-        !proc_range_ok(ctx, va, 4U, (uint32_t)PROT_READ)) {
+    if ((va & 3U) != 0U || proc_copy_from(ctx, &val, va, 4U) != 0) {
         *ok = 0;
         return 0U;
     }
-    memcpy(&val, mips32_guest_ptr(ctx, va), 4U);
     *ok = 1;
-    return val;
-}
-
-static uint32_t proc_swap32(uint32_t v)
-{
-    return ((v & 0x000000FFU) << 24) | ((v & 0x0000FF00U) << 8) |
-           ((v & 0x00FF0000U) >> 8) | ((v & 0xFF000000U) >> 24);
+    return mips_is_be(ctx) ? proc_swap32(val) : val;
 }
 
 /* Guest-endian u32 load/store (host window bytes are always LE). */
@@ -129,10 +162,9 @@ static int proc_ld32(const mips32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     uint32_t v = 0U;
 
-    if (!proc_range_ok(ctx, va, 4U, (uint32_t)PROT_READ)) {
+    if (proc_copy_from(ctx, &v, va, 4U) != 0) {
         return -EFAULT;
     }
-    memcpy(&v, mips32_guest_ptr(ctx, va), 4U);
     *out = mips_is_be(ctx) ? proc_swap32(v) : v;
     return 0;
 }
@@ -141,10 +173,9 @@ static int proc_st32(mips32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     uint32_t w = mips_is_be(ctx) ? proc_swap32(v) : v;
 
-    if (!proc_range_ok(ctx, va, 4U, (uint32_t)PROT_WRITE)) {
+    if (proc_copy_to(ctx, va, &w, 4U) != 0) {
         return -EFAULT;
     }
-    memcpy(mips32_guest_ptr(ctx, va), &w, 4U);
     return 0;
 }
 
@@ -157,10 +188,9 @@ static int proc_read_cstr(const mips32_ctx_t *ctx, uint32_t va,
     for (i = 0; i < PROC_PATH_MAX; i++) {
         char b = 0;
 
-        if (!proc_range_ok(ctx, va + i, 1U, (uint32_t)PROT_READ)) {
+        if (proc_copy_from(ctx, &b, va + i, 1U) != 0) {
             return -EFAULT;
         }
-        memcpy(&b, mips32_guest_ptr(ctx, va + i), 1U);
         host_buf[i] = b;
         if (b == '\0') {
             return 0;
@@ -239,8 +269,8 @@ static int copy_guest_strvec(mips32_ctx_t *ctx, uint32_t vec_va,
     return 0;
 }
 
-/* Close every fd flagged O_CLOEXEC (POSIX exec semantics). */
-static void close_cloexec_fds(void)
+/* Close every fd flagged O_CLOEXEC (POSIX exec semantics), except keep_fd. */
+static void close_cloexec_fds(int keep_fd)
 {
     long lim = sysconf(_SC_OPEN_MAX);
     long n;
@@ -253,8 +283,12 @@ static void close_cloexec_fds(void)
         lim = (long)PROC_FD_HARD_CAP;
     }
     for (fd = 0L, n = lim; fd < n; fd++) {
-        int flags = fcntl((int)fd, F_GETFD);
+        int flags;
 
+        if ((int)fd == keep_fd) {
+            continue;
+        }
+        flags = fcntl((int)fd, F_GETFD);
         if (flags >= 0 && (flags & FD_CLOEXEC) != 0) {
             (void)close((int)fd);
         }
@@ -281,6 +315,9 @@ int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp)
         ctx->llbit = 0U; /* SPEC 2.2: LL reservation never crosses fork */
         ctx->is_thread_clone = false;
         ctx->host_tid = (int)getpid();
+        memset(ctx->sig_pending, 0, sizeof(ctx->sig_pending));
+        memset(ctx->sig_pending_code, 0, sizeof(ctx->sig_pending_code));
+        ctx->sig_rt_count = 0U;
         ctx->gpr[MIPS32_REG_V0] = 0U;
         ctx->gpr[MIPS32_REG_A3] = 0U;
         return 0;
@@ -368,8 +405,11 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
     }
 
     /* Tear down the old image: unmaps every guest page (stack included),
-     * clears brk/mmap cursors and the region table (rt32/vm.c). */
+     * clears brk/mmap cursors and the region table (rt32/vm.c).
+     * Close O_CLOEXEC descriptors BEFORE rt32_elf_load creates new
+     * FD_CLOEXEC file-backing duplicates in g_vm_backing[]. */
     rt32_vm_reset_for_exec(ctx);
+    close_cloexec_fds(fd);
     if (mips32_dbt_invalidate_range != NULL) {
         /* Drop stale translations: the new image reuses the same VAs. */
         mips32_dbt_invalidate_range(ctx, MIPS32_LOW_GUARD_SIZE,
@@ -423,7 +463,6 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
         /* L4a hook: guest handler table back to SIG_DFL. */
         mips32_signals_reset_for_exec(ctx);
     }
-    close_cloexec_fds();
 
     /* AT_EXECFN/stack builder reads ctx->exec_path: hand it the new path. */
     path_len = strlen(path) + 1U;
@@ -469,13 +508,14 @@ static int32_t proc_wait_common(mips32_ctx_t *ctx, uint32_t sp,
     if (!ok) {
         return proc_ret(ctx, -EFAULT);
     }
+    rt32_vm_sync_ctx(ctx);
     if (status_va != 0U &&
-        !proc_range_ok(ctx, status_va, 4U, (uint32_t)PROT_WRITE)) {
+        !mips32_range_ok(ctx, status_va, 4U, (uint32_t)PROT_WRITE)) {
         return proc_ret(ctx, -EFAULT);
     }
     if (rusage_va != 0U &&
-        !proc_range_ok(ctx, rusage_va, PROC_RUSAGE_SIZE,
-                       (uint32_t)PROT_WRITE)) {
+        !mips32_range_ok(ctx, rusage_va, PROC_RUSAGE_SIZE,
+                         (uint32_t)PROT_WRITE)) {
         return proc_ret(ctx, -EFAULT);
     }
     errno = 0;
@@ -489,7 +529,12 @@ static int32_t proc_wait_common(mips32_ctx_t *ctx, uint32_t sp,
         }
     }
     if (rusage_va != 0U) {
-        memset(mips32_guest_ptr(ctx, rusage_va), 0, PROC_RUSAGE_SIZE);
+        uint8_t zero_rusage[PROC_RUSAGE_SIZE];
+
+        memset(zero_rusage, 0, sizeof(zero_rusage));
+        if (proc_copy_to(ctx, rusage_va, zero_rusage, sizeof(zero_rusage)) != 0) {
+            return proc_ret(ctx, -EFAULT);
+        }
     }
     return proc_ret(ctx, (int32_t)got);
 }
@@ -517,35 +562,10 @@ int32_t mips_proc_waitpid(mips32_ctx_t *ctx, uint32_t sp)
  * cmdline joins the guest argv, stat synthesizes the 52-field kernel
  * layout, auxv replays the stack auxv (BE-swapped for mips guests).
  *
- * WIRING (coordinator, RC5 integration): the syscall layer that owns
- * open/openat/readlink (src/os/syscalls.c, src/os/syscalls_meta.c) does
- * not call here yet.  Wire two hooks, declarations into
- * src/os/syscalls_priv.h:
- *
- *   int  mips_proc_classify(const char *path);
- *   int  mips_proc_open(mips32_ctx_t *ctx, int kind, int flags);
- *   long mips_proc_readlink(mips32_ctx_t *ctx, int kind,
- *                           char *buf, unsigned long bufsz);
- *
- *   - in sc_openat, after the guest path is fetched: kind =
- *     mips_proc_classify(path); when kind != MIPS_PROC_NONE, return
- *     mips_sc_ret(ctx, mips_proc_open(ctx, kind, host_flags) < 0 ?
- *     -errno : fd).
- *   - in mips_sc_readlinkat, same classify; when kind != MIPS_PROC_NONE,
- *     copy out mips_proc_readlink(ctx, kind, host_buf, bufsiz) bytes
- *     (negative errno on error).
- *
  * Only exact absolute /proc/self/<node> and /proc/<pid>/<node> (own pid)
  * names intercept; every other path falls through to the host untouched.
  * Unit-tested by tests/run_p5.sh (host-native probe, no guest needed).
  */
-
-#define MIPS_PROC_NONE    0
-#define MIPS_PROC_EXE     1
-#define MIPS_PROC_MAPS    2
-#define MIPS_PROC_CMDLINE 3
-#define MIPS_PROC_STAT    4
-#define MIPS_PROC_AUXV    5
 
 static int proc_node_kind(const char *node)
 {

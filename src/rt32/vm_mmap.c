@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -58,6 +59,117 @@ static int pread_full(int fd, uint8_t *dst, size_t rem, off_t cur_off)
         cur_off += (off_t)n;
     }
     return 0;
+}
+
+static void vm_host_temp_prot(uint32_t start, uint32_t end, int prot)
+{
+    if (g_vm_root_ctx == NULL || start >= end) {
+        return;
+    }
+#ifdef __APPLE__
+    uint32_t h_s = start & ~0x3FFFU;
+    uint32_t h_e = (end + 0x3FFFU) & ~0x3FFFU;
+    (void)mprotect(mips32_guest_ptr(g_vm_root_ctx, h_s), (size_t)(h_e - h_s), prot);
+#else
+    (void)mprotect(mips32_guest_ptr(g_vm_root_ctx, start), (size_t)(end - start), prot);
+#endif
+}
+
+static int vm_writeback_darw_locked(size_t idx, uint32_t start, uint32_t end)
+{
+    struct stat st;
+    const mips32_region_t *r = &g_vm_regions[idx];
+    vm_backing_t back = g_vm_backing[idx];
+    if (back.darw_sync == 0U || back.fd < 0 || g_vm_root_ctx == NULL || start >= end) {
+        return 0;
+    }
+    uint64_t foff = back.file_off + (uint64_t)(start - r->start);
+    uint64_t span = (uint64_t)(end - start);
+    if ((r->prot & (uint32_t)PROT_READ) == 0U) {
+        vm_host_temp_prot(start, end, PROT_READ | PROT_WRITE);
+    }
+    const uint8_t *base_src = (const uint8_t *)mips32_guest_ptr(g_vm_root_ctx, start);
+    for (size_t j = 0U; j < g_vm_region_count; j++) {
+        const mips32_region_t *rj = &g_vm_regions[j];
+        const vm_backing_t *bj = &g_vm_backing[j];
+        if (j == idx || bj->fd < 0 || (rj->flags & 0x01U) == 0U ||
+            bj->dev != back.dev || bj->ino != back.ino) {
+            continue;
+        }
+        uint64_t j_foff = bj->file_off;
+        uint64_t j_fend = j_foff + (uint64_t)(rj->end - rj->start);
+        uint64_t ov_s = (foff > j_foff) ? foff : j_foff;
+        uint64_t ov_e = (foff + span < j_fend) ? (foff + span) : j_fend;
+        if (ov_s < ov_e) {
+            uint32_t d_va = rj->start + (uint32_t)(ov_s - j_foff);
+            uint32_t d_end = d_va + (uint32_t)(ov_e - ov_s);
+            if ((rj->prot & (uint32_t)PROT_WRITE) == 0U) {
+                vm_host_temp_prot(d_va, d_end, PROT_READ | PROT_WRITE);
+            }
+            memcpy(mips32_guest_ptr(g_vm_root_ctx, d_va),
+                   base_src + (size_t)(ov_s - foff), (size_t)(ov_e - ov_s));
+            if ((rj->prot & (uint32_t)PROT_WRITE) == 0U) {
+                vm_host_temp_prot(d_va, d_end, mips32_host_prot(g_vm_root_ctx, rj->prot));
+            }
+        }
+    }
+    int rc = 0;
+    if (fstat(back.fd, &st) == 0 && (uint64_t)st.st_size > foff) {
+        uint64_t avail = (uint64_t)st.st_size - foff;
+        size_t   rem   = (size_t)((span < avail) ? span : avail);
+        const uint8_t *src = base_src;
+        off_t cur_off = (off_t)foff;
+        while (rem > 0U) {
+            ssize_t n = pwrite(back.fd, src, rem, cur_off);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                rc = -errno;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            src += (size_t)n;
+            rem -= (size_t)n;
+            cur_off += (off_t)n;
+        }
+    }
+    if ((r->prot & (uint32_t)PROT_READ) == 0U) {
+        vm_host_temp_prot(start, end, mips32_host_prot(g_vm_root_ctx, r->prot));
+    }
+    return rc;
+}
+
+int vm_flush_darw_range_locked(uint32_t start, uint32_t end)
+{
+    int rc = 0;
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+        const vm_backing_t    *b = &g_vm_backing[i];
+        if (r->end <= start || r->start >= end || b->darw_sync == 0U || b->fd < 0) {
+            continue;
+        }
+        uint32_t s = (r->start > start) ? r->start : start;
+        uint32_t e = (r->end < end) ? r->end : end;
+        int wrc = vm_writeback_darw_locked(i, s, e);
+        if (wrc != 0 && rc == 0) {
+            rc = wrc;
+        }
+    }
+    return rc;
+}
+
+void vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino)
+{
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+        const vm_backing_t    *b = &g_vm_backing[i];
+        if (b->darw_sync != 0U && b->fd >= 0 && b->dev == dev && b->ino == ino) {
+            (void)vm_writeback_darw_locked(i, r->start, r->end);
+        }
+    }
 }
 
 static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
@@ -114,84 +226,95 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
         }
     }
 
-    int     host_prot   = mips32_host_prot(ctx, prot);
-    void   *host_target = mips32_guest_ptr(ctx, target_va);
-    off_t   host_off    = (off_t)pgoffset * (off_t)MIPS32_PAGE_SIZE;
-    uint8_t darw_sync   = 0U;
+    uint32_t target_end = (uint32_t)((uint64_t)target_va + aligned_len);
+    if (vm_can_unmap_regions_locked(target_va, target_end, 1U) != 0) {
+        return (uint32_t)(-ENOMEM);
+    }
+
+    off_t        host_off = (off_t)pgoffset * (off_t)MIPS32_PAGE_SIZE;
+    vm_backing_t back     = { -1, 0U, 0U, 0U, 0U };
+    if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
+        struct stat st;
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fstat(fd, &st) != 0) {
+            return (uint32_t)(-errno);
+        }
+        if ((fl & O_ACCMODE) == O_WRONLY ||
+            ((flags & 0x01U) != 0U && (prot & (uint32_t)PROT_WRITE) != 0U &&
+             (fl & O_ACCMODE) != O_RDWR)) {
+            return (uint32_t)(-EACCES);
+        }
+        int bfd = dup_backing ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : fd;
+        if (bfd < 0) {
+            return (uint32_t)(-errno);
+        }
+        back.fd       = bfd;
+        back.file_off = (uint64_t)host_off;
+        back.dev      = (uint64_t)st.st_dev;
+        back.ino      = (uint64_t)st.st_ino;
+        if ((flags & 0x01U) != 0U) {
+            vm_flush_darw_inode_locked(back.dev, back.ino);
+        }
+    }
+    (void)vm_flush_darw_range_locked(target_va, target_end);
+
+    int   host_prot   = mips32_host_prot(ctx, prot);
+    void *host_target = mips32_guest_ptr(ctx, target_va);
 #ifdef __APPLE__
     uint32_t h_start = target_va & ~0x3FFFU;
-    uint32_t h_end   = ((uint32_t)((uint64_t)target_va + aligned_len) + 0x3FFFU) & ~0x3FFFU;
+    uint32_t h_end   = (target_end + 0x3FFFU) & ~0x3FFFU;
     if ((target_va & 0x3FFFU) == 0U && (aligned_len & 0x3FFFULL) == 0ULL &&
         ((host_flags & MAP_ANONYMOUS) != 0 || (host_off & 0x3FFF) == 0)) {
         void *res = mmap(host_target, (size_t)aligned_len, host_prot,
                          host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
                          (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
         if (res == MAP_FAILED) {
-            return (uint32_t)(-errno);
+            int err = errno;
+            if (dup_backing && back.fd >= 0) {
+                (void)close(back.fd);
+            }
+            return (uint32_t)(-err);
         }
     } else {
-        if ((host_flags & MAP_ANONYMOUS) == 0) {
-            int fl = fcntl(fd, F_GETFL);
-            if (fl < 0) {
-                return (uint32_t)(-errno);
-            }
-            if ((fl & O_ACCMODE) == O_WRONLY ||
-                ((flags & 0x01U) != 0U && (prot & (uint32_t)PROT_WRITE) != 0U &&
-                 (fl & O_ACCMODE) != O_RDWR)) {
-                return (uint32_t)(-EACCES);
-            }
-        }
         if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
                      PROT_READ | PROT_WRITE) != 0) {
-            return (uint32_t)(-errno);
+            int err = errno;
+            if (dup_backing && back.fd >= 0) {
+                (void)close(back.fd);
+            }
+            return (uint32_t)(-err);
         }
         memset(host_target, 0, (size_t)aligned_len);
         if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-            int prc = pread_full(fd, (uint8_t *)host_target, (size_t)aligned_len, host_off);
+            int prc = ((flags & 0x01U) == 0U && ctx->vm_regime == MIPS32_VM_REGIME_A2)
+                ? mips32_file_populate_private(ctx, target_va, (uint32_t)aligned_len,
+                                               fd, (uint64_t)host_off)
+                : pread_full(fd, (uint8_t *)host_target, (size_t)aligned_len, host_off);
             if (prc != 0) {
+                if (dup_backing && back.fd >= 0) {
+                    (void)close(back.fd);
+                }
                 return (uint32_t)prc;
             }
             if ((flags & 0x01U) != 0U) {
-                darw_sync = 1U;
+                back.darw_sync = 1U;
             }
         }
     }
 #else
-    (void)darw_sync;
     void *res = mmap(host_target, (size_t)aligned_len, host_prot,
                      host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
                      (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
     if (res == MAP_FAILED) {
-        return (uint32_t)(-errno);
+        int err = errno;
+        if (dup_backing && back.fd >= 0) {
+            (void)close(back.fd);
+        }
+        return (uint32_t)(-err);
     }
 #endif
 
-    vm_backing_t back = { -1, 0U, 0U };
-    if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-        int bfd = dup_backing ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : fd;
-        if (bfd < 0) {
-            return (uint32_t)(-errno);
-        }
-        back.fd        = bfd;
-        back.file_off  = (uint64_t)host_off;
-        back.darw_sync = darw_sync;
-    }
-
-    if ((flags & 0x01U) == 0U && (host_flags & MAP_ANONYMOUS) == 0 &&
-        fd >= 0 && ctx->vm_regime == MIPS32_VM_REGIME_A2) {
-        /* Provider A: mirror private file bytes into the A2 arena. */
-        int prc = mips32_file_populate_private(ctx, target_va,
-                                               (uint32_t)aligned_len, fd,
-                                               (uint64_t)host_off);
-        if (prc != 0) {
-            if (dup_backing && back.fd >= 0) {
-                (void)close(back.fd);
-            }
-            return (uint32_t)prc;
-        }
-    }
-
-    if (vm_record_region_backed_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
+    if (vm_record_region_backed_locked(target_va, target_end,
                                        prot & 0x7U, flags, rname ? rname : "[mmap]", back) != 0) {
         if (dup_backing && back.fd >= 0) {
             (void)close(back.fd);
@@ -199,7 +322,7 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
         return (uint32_t)(-ENOMEM);
     }
     if (update_cursor) {
-        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
+        g_vm_mmap_cursor = target_end;
     }
     return target_va;
 }
@@ -302,13 +425,17 @@ static int vm_munmap_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
     }
 
     uint32_t start = mips32_page_down(addr);
+    uint32_t end   = (uint32_t)((uint64_t)start + aligned_len);
+    if (vm_can_unmap_regions_locked(start, end, 0U) != 0) {
+        return -ENOMEM;
+    }
+    (void)vm_flush_darw_range_locked(start, end);
     /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
     int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
     if (rc != 0) {
         return rc;
     }
 
-    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
     vm_unmap_regions_locked(start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
@@ -362,7 +489,7 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     uint32_t     prot       = 0x3U;
     uint32_t     orig_flags = 0x22U;
     char         orig_name[64];
-    vm_backing_t orig_back  = { -1, 0U, 0U };
+    vm_backing_t orig_back  = { -1, 0U, 0U, 0U, 0U };
     orig_name[0] = '\0';
     if (!vm_check_mapped_range_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned),
                                       &prot, &orig_flags, orig_name, sizeof(orig_name),
@@ -509,7 +636,7 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         if (prot != 0x3U) {
             (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
         }
-        vm_backing_t new_back = { orig_back.fd, orig_back.file_off, 0U };
+        vm_backing_t new_back = { orig_back.fd, orig_back.file_off, orig_back.dev, orig_back.ino, 0U };
         (void)vm_record_region_backed_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
                                              prot, keep_flags, region_name, new_back);
     }
@@ -522,5 +649,54 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         vm_invalidate_all(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
     }
     return new_va;
+}
+
+int rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (!ctx || len == 0U) {
+        return 0;
+    }
+    uint64_t end64 = (uint64_t)addr + vm_page_align_up((uint64_t)len);
+    if (end64 > (uint64_t)MIPS32_TASK_SIZE_TOP) {
+        return -ENOMEM;
+    }
+    vm_lock_acquire();
+    int rc = vm_flush_darw_range_locked(addr, (uint32_t)end64);
+    vm_lock_release();
+    return rc;
+}
+
+void rt32_vm_sync_shared_fd(int fd)
+{
+#ifdef __APPLE__
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        return;
+    }
+    vm_lock_acquire();
+    if (g_vm_root_ctx != NULL) {
+        for (size_t i = 0U; i < g_vm_region_count; i++) {
+            const mips32_region_t *r = &g_vm_regions[i];
+            const vm_backing_t    *b = &g_vm_backing[i];
+            if (b->darw_sync == 0U || b->fd < 0 ||
+                b->dev != (uint64_t)st.st_dev || b->ino != (uint64_t)st.st_ino) {
+                continue;
+            }
+            if ((r->prot & (uint32_t)PROT_WRITE) == 0U) {
+                vm_host_temp_prot(r->start, r->end, PROT_READ | PROT_WRITE);
+            }
+            uint8_t *dst = (uint8_t *)mips32_guest_ptr(g_vm_root_ctx, r->start);
+            size_t   len = (size_t)(r->end - r->start);
+            memset(dst, 0, len);
+            (void)pread(b->fd, dst, len, (off_t)b->file_off);
+            if ((r->prot & (uint32_t)PROT_WRITE) == 0U) {
+                vm_host_temp_prot(r->start, r->end, mips32_host_prot(g_vm_root_ctx, r->prot));
+            }
+        }
+    }
+    vm_lock_release();
+#else
+    (void)fd;
+#endif
 }
 

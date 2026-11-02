@@ -59,9 +59,12 @@ static int fault_signo_at(mips32_ctx_t *ctx, uint32_t addr, int signo)
 static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
 {
     uint32_t word = 0u;
+    unsigned pre_depth = ctx->sig_depth;
+    uint32_t pre_pc = ctx->pc;
 
     if (mips_fetch(ctx, pc, &word) != 0) {
-        if (ctx->exit_reason == MIPS32_EXIT_NONE) {
+        if (ctx->exit_reason == MIPS32_EXIT_NONE &&
+            ctx->sig_depth == pre_depth && ctx->pc == pre_pc) {
             mips_fault(ctx, pc);
         }
         return MIPS_FAULT;
@@ -107,7 +110,9 @@ static int exec_syscall(mips32_ctx_t *ctx)
     uint32_t before = ctx->pc;
 
     ctx->llbit = 0;
+    ctx->sc_pc_advanced = 0U;
     (void)mips_syscall(ctx);
+    ctx->sc_pc_advanced = 0U;
     if (ctx->exit_reason != MIPS32_EXIT_NONE) {
         return 1;
     }
@@ -791,6 +796,10 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 
         if (fetch_decode(ctx, pc + 4u, &s) != 0) {
             ctx->in_delay_slot = 0;
+            if (ctx->exit_reason != MIPS32_EXIT_NONE) {
+                ctx->pc = pc;
+                ctx->next_pc = pc + 4u;
+            }
             return MIPS_FAULT;
         }
         if (interp_is_control(&s)) {
@@ -803,6 +812,9 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
             ctx->next_pc = ctx->pc + 4u;
         } else if (rc == 2) {
             rc = 0;
+        } else if (rc == MIPS_FAULT && ctx->exit_reason != MIPS32_EXIT_NONE) {
+            ctx->pc = pc;
+            ctx->next_pc = pc + 4u;
         }
         return rc;
     }

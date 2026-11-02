@@ -317,8 +317,8 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
                                                    : ctx->gpr[MIPS32_REG_SP];
     /* Child resumes past the syscall with a 0 return (caller advances the
      * parent the same way: syscall insns are non-control insns). */
-    t->ctx.pc      = ctx->pc + 4U;
-    t->ctx.next_pc = ctx->pc + 8U;
+    t->ctx.pc      = (ctx->sc_pc_advanced != 0U) ? ctx->pc : (ctx->pc + 4U);
+    t->ctx.next_pc = t->ctx.pc + 4U;
     t->ctx.gpr[MIPS32_REG_V0] = 0U;
     t->ctx.gpr[MIPS32_REG_A3] = 0U;
     t->ctx.llbit               = 0U;
@@ -335,6 +335,8 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     memset(t->ctx.sig_pending_code, 0, sizeof(t->ctx.sig_pending_code));
     memset(t->ctx.sig_frame_sp, 0, sizeof(t->ctx.sig_frame_sp));
     t->ctx.sig_depth = 0U;
+    t->ctx.sig_rt_count = 0U;
+    t->ctx.sc_pc_advanced = 0U;
     t->ctx.clear_child_tid =
         ((flags & MIPS_CLONE_CHILD_CLEARTID) != 0U) ? ctid : 0U;
     if ((flags & MIPS_CLONE_SETTLS) != 0U) {

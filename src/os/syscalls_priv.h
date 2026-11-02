@@ -18,6 +18,7 @@
 
 #include "os/syscall_nr.h"
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -81,6 +82,7 @@
 
 /* Guest helpers (defined in syscalls.c; never fault, -EFAULT style). */
 int32_t  mips_sc_ret(mips32_ctx_t *ctx, int32_t raw);
+void     mips_sc_advance_pc_once(mips32_ctx_t *ctx);
 uint32_t mips_sc_arg(mips32_ctx_t *ctx, uint32_t sp, unsigned i, int *ok);
 int      mips_sc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                           uint32_t need);
@@ -94,6 +96,119 @@ void     mips_sc_st32(uint8_t *p, uint32_t v, int be);
 void     mips_sc_st64(uint8_t *p, uint64_t v, int be);
 int      mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va,
                            char *host_buf);
+#define MIPS_PROC_NONE    0
+#define MIPS_PROC_EXE     1
+#define MIPS_PROC_MAPS    2
+#define MIPS_PROC_CMDLINE 3
+#define MIPS_PROC_STAT    4
+#define MIPS_PROC_AUXV    5
+
+int      mips_proc_classify(const char *path);
+int      mips_proc_open(mips32_ctx_t *ctx, int kind, int flags);
+long     mips_proc_readlink(mips32_ctx_t *ctx, int kind, char *buf,
+                            unsigned long bufsz);
+
+static inline uint64_t mips_sc_ld64(const uint8_t *p, int be)
+{
+    uint32_t hi = mips_sc_ld32(be ? p : (p + 4), be);
+    uint32_t lo = mips_sc_ld32(be ? (p + 4) : p, be);
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+/* Authoritative host -> MIPS O32 errno translation (arch/mips/include/uapi/asm/errno.h). */
+static inline int32_t mips_errno_from_host(int host_errno)
+{
+    switch (host_errno) {
+    case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+        return 11;
+    case ENOMSG:          return 35;
+    case EIDRM:           return 36;
+    case EDEADLK:         return 45;
+    case ENOLCK:          return 46;
+#ifdef ENOSTR
+    case ENOSTR:          return 60;
+#endif
+#ifdef ENODATA
+    case ENODATA:         return 61;
+#endif
+#ifdef ETIME
+    case ETIME:           return 62;
+#endif
+#ifdef ENOSR
+    case ENOSR:           return 63;
+#endif
+#ifdef ENOLINK
+    case ENOLINK:         return 67;
+#endif
+#ifdef EPROTO
+    case EPROTO:          return 71;
+#endif
+#ifdef EMULTIHOP
+    case EMULTIHOP:       return 74;
+#endif
+    case EBADMSG:         return 77;
+    case EOVERFLOW:       return 79;
+    case EILSEQ:          return 88;
+    case ENOSYS:          return 89;
+    case ELOOP:           return 90;
+    case ENOTEMPTY:       return 93;
+#ifdef EUSERS
+    case EUSERS:          return 94;
+#endif
+    case ENOTSOCK:        return 95;
+    case EDESTADDRREQ:    return 96;
+    case EMSGSIZE:        return 97;
+    case EPROTOTYPE:      return 98;
+    case ENOPROTOOPT:     return 99;
+    case EPROTONOSUPPORT: return 120;
+#ifdef ESOCKTNOSUPPORT
+    case ESOCKTNOSUPPORT: return 121;
+#endif
+    case EOPNOTSUPP:      return 122;
+#ifdef EPFNOSUPPORT
+    case EPFNOSUPPORT:    return 123;
+#endif
+    case EAFNOSUPPORT:    return 124;
+    case EADDRINUSE:      return 125;
+    case EADDRNOTAVAIL:   return 126;
+    case ENETDOWN:        return 127;
+    case ENETUNREACH:     return 128;
+    case ENETRESET:       return 129;
+    case ECONNABORTED:    return 130;
+    case ECONNRESET:      return 131;
+    case ENOBUFS:         return 132;
+    case EISCONN:         return 133;
+    case ENOTCONN:        return 134;
+#ifdef ESHUTDOWN
+    case ESHUTDOWN:       return 143;
+#endif
+#ifdef ETOOMANYREFS
+    case ETOOMANYREFS:    return 144;
+#endif
+    case ETIMEDOUT:       return 145;
+    case ECONNREFUSED:    return 146;
+#ifdef EHOSTDOWN
+    case EHOSTDOWN:       return 147;
+#endif
+    case EHOSTUNREACH:    return 148;
+    case EALREADY:        return 149;
+    case EINPROGRESS:     return 150;
+    case ESTALE:          return 151;
+    case ECANCELED:       return 158;
+#ifdef EOWNERDEAD
+    case EOWNERDEAD:      return 165;
+#endif
+#ifdef ENOTRECOVERABLE
+    case ENOTRECOVERABLE: return 166;
+#endif
+    case EDQUOT:          return 1133;
+    default:
+        return (int32_t)host_errno;
+    }
+}
 /* Truncate payload (defined in src/vm/vm_file.c; wired here). */
 int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp,
                                 uint32_t nr);

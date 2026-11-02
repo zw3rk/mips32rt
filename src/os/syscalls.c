@@ -78,25 +78,27 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp);
 
 /* ---- Small self-contained guest helpers (no faults, -EFAULT style) ---- */
 
-static int32_t xerrno(int host_errno)
-{
-    if (host_errno == ENOSYS) {
-        return 89; /* MIPS ENOSYS (asm/errno.h), not asm-generic 38 */
-    }
-    return (int32_t)host_errno;
-}
-
 /* Record the $a3 convention in the guest regs; return raw host value. */
 int32_t mips_sc_ret(mips32_ctx_t *ctx, int32_t raw)
 {
     if (raw < 0) {
-        ctx->gpr[MIPS32_REG_V0] = (uint32_t)xerrno(-raw);
+        ctx->gpr[MIPS32_REG_V0] = (uint32_t)mips_errno_from_host(-raw);
         ctx->gpr[MIPS32_REG_A3] = 1U;
     } else {
         ctx->gpr[MIPS32_REG_V0] = (uint32_t)raw;
         ctx->gpr[MIPS32_REG_A3] = 0U;
     }
     return raw;
+}
+
+void mips_sc_advance_pc_once(mips32_ctx_t *ctx)
+{
+    if (ctx != NULL && ctx->sc_pc_advanced == 0U) {
+        ctx->pc += 4U;
+        ctx->next_pc = ctx->pc + 4U;
+        ctx->in_delay_slot = 0U;
+        ctx->sc_pc_advanced = 1U;
+    }
 }
 
 /* True when [va, va+len) is fully covered by recorded regions with need. */
@@ -360,6 +362,13 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
     }
     if (mips_sc_flags_to_host(mips_flags, &host_flags) != 0) {
         return mips_sc_ret(ctx, -EINVAL);
+    }
+    {
+        int pkind = mips_proc_classify(path);
+        if (pkind != 0) {
+            fd = mips_proc_open(ctx, pkind, host_flags);
+            return mips_sc_ret(ctx, (int32_t)fd);
+        }
     }
     /* Wave C2: absolute library loads resolve under --sysroot first
      * (PT_INTERP + DT_NEEDED/RPATH); fall back to the raw host path. */
@@ -662,6 +671,9 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
     free(vec);
     if (n < 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
+    }
+    if (is_write && n > 0) {
+        rt32_vm_sync_shared_fd((int)fd);
     }
     if (n > (ssize_t)0x7FFFFFFFL) {
         n = (ssize_t)0x7FFFFFFFL;

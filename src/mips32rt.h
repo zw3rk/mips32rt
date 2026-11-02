@@ -200,13 +200,18 @@ typedef struct mips32_ctx {
     uint64_t ll_epoch_snap;
 
     /* Authoritative VMA mirror generation (M32-9) + per-thread signal
-     * mask, pending signals, and nested signal-frame stack (M32-8, M32-12). */
+     * mask, pending signals, RT FIFO queue, and nested frame stack. */
     uint64_t vm_gen;
     uint32_t sig_blocked[4];
     uint32_t sig_pending[4];
     int32_t  sig_pending_code[129];
     uint32_t sig_frame_sp[8];
     unsigned sig_depth;
+#define MIPS32_RT_SIG_QUEUE_CAP 64U
+    uint8_t  sig_rt_signo[MIPS32_RT_SIG_QUEUE_CAP];
+    int32_t  sig_rt_code[MIPS32_RT_SIG_QUEUE_CAP];
+    unsigned sig_rt_count;
+    uint8_t  sc_pc_advanced;
 } mips32_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */

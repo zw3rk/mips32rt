@@ -34,7 +34,7 @@ U3_BACKEND_SRC := src/os/backend_linux.c
 endif
 U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_darwin.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRC)
 SRCS := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) $(U3_OS_SRCS) $(wildcard src/dbt/*.c) $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c) src/rt32/safe_syscall_a64.S src/dbt/trampoline_a64.S
-HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
+HDRS := src/mips32rt.h include/a32host.h $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) $(wildcard src/os/*.h) $(wildcard src/dbt/*.h) $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR    := $(BUILD_DIR)/obj
 OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) $(OBJ_DIR)/rt32/safe_syscall_a64.o $(OBJ_DIR)/dbt/trampoline_a64.o

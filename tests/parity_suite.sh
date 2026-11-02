@@ -350,10 +350,12 @@ if [ -n "$need_build" ]; then
             fi
         done
     elif have_docker; then
+        BUILD_IMG="debian:bookworm-slim"
+        docker image inspect mips32rt-tool:latest >/dev/null 2>&1 && BUILD_IMG="mips32rt-tool:latest"
         {
             echo "set -eu"
             echo "export DEBIAN_FRONTEND=noninteractive"
-            echo "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-user gcc-mipsel-linux-gnu gcc-mips-linux-gnu g++-mipsel-linux-gnu g++-mips-linux-gnu libc6-dev-mipsel-cross libc6-dev-mips-cross binutils-mipsel-linux-gnu binutils-mips-linux-gnu >/dev/null 2>&1"
+            echo "command -v mipsel-linux-gnu-gcc >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-user gcc-mipsel-linux-gnu gcc-mips-linux-gnu g++-mipsel-linux-gnu g++-mips-linux-gnu libc6-dev-mipsel-cross libc6-dev-mips-cross binutils-mipsel-linux-gnu binutils-mips-linux-gnu >/dev/null 2>&1)"
             for _g in $need_build; do
                 _spec="$(guest_spec "$_g")"
                 _rel="${_spec%%|*}"; _rest="${_spec#*|}"
@@ -384,7 +386,7 @@ if [ -n "$need_build" ]; then
         if timeout --kill-after=30s 500s docker run --rm \
                 --name "$DOCKER_NAME" --memory 2g --cpus 2 \
                 --platform linux/arm64 -v "$ROOT:/w" $ZMOUNT -w /w \
-                debian:bookworm-slim \
+                "$BUILD_IMG" \
                 bash /w/_build/parity/.build-inner.sh \
                 >"$OUT/docker-build.log" 2>&1; then
             for _g in $need_build; do
@@ -451,13 +453,15 @@ for _g in $GUESTS; do
 done
 
 if [ "$ORACLE_MODE" = "docker" ] && [ -n "$need_oracle" ]; then
+    ORACLE_IMG="debian:trixie-slim"
+    docker image inspect mips64rt-parity-env:trixie >/dev/null 2>&1 && ORACLE_IMG="mips64rt-parity-env:trixie"
     {
         echo "set -eu"
         echo "export DEBIAN_FRONTEND=noninteractive"
         echo "export P5_MARKER=p5-lane-l5b"
-        echo "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-user >/dev/null 2>&1"
+        echo "command -v qemu-mipsel >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-user >/dev/null 2>&1)"
         echo "cd /w/_build/parity"
-        for _g in $GUESTS; do
+        for _g in $need_oracle; do
             case "$_g" in
                 p5-*) echo "{ timeout --kill-after=10s 90s $(qemu_of "$_g") -L /w/tests/sysroot ./$_g ./$(p5_helper_of "$_g") >/w/_build/parity/oracle-$_g.txt 2>&1; echo \"\$?\" >/w/_build/parity/oracle-$_g.code; } || true" ;;
                 *) echo "{ timeout --kill-after=10s 90s $(qemu_of "$_g") /w/_build/parity/$_g >/w/_build/parity/oracle-$_g.txt 2>&1; echo \"\$?\" >/w/_build/parity/oracle-$_g.code; } || true" ;;
@@ -468,7 +472,7 @@ if [ "$ORACLE_MODE" = "docker" ] && [ -n "$need_oracle" ]; then
     if ! timeout --kill-after=30s 500s docker run --rm \
             --name "$DOCKER_NAME" --memory 2g --cpus 2 \
             --platform linux/arm64 -v "$ROOT:/w" -w /w \
-            debian:bookworm-slim \
+            "$ORACLE_IMG" \
             bash /w/_build/parity/.oracle-inner.sh \
             >"$OUT/docker-oracle.log" 2>&1; then
         echo "note: oracle container failed, see $OUT/docker-oracle.log"
