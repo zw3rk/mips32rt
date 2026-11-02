@@ -666,6 +666,9 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
                           mips32_guest_ptr(ctx, base);
         vec[i].iov_len  = (size_t)len;
     }
+    if (is_write) {
+        rt32_vm_flush_shared_fd((int)fd);
+    }
     n = is_write ? writev((int)fd, vec, (int)count)
                  : readv((int)fd, vec, (int)count);
     free(vec);

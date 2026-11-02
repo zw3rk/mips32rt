@@ -150,6 +150,9 @@ static inline int32_t mips_errno_from_host(int host_errno)
     case EMULTIHOP:       return 74;
 #endif
     case EBADMSG:         return 77;
+#ifdef ENAMETOOLONG
+    case ENAMETOOLONG:    return 78;
+#endif
     case EOVERFLOW:       return 79;
     case EILSEQ:          return 88;
     case ENOSYS:          return 89;
@@ -168,6 +171,9 @@ static inline int32_t mips_errno_from_host(int host_errno)
     case ESOCKTNOSUPPORT: return 121;
 #endif
     case EOPNOTSUPP:      return 122;
+#if defined(ENOTSUP) && (!defined(EOPNOTSUPP) || ENOTSUP != EOPNOTSUPP)
+    case ENOTSUP:         return 122;
+#endif
 #ifdef EPFNOSUPPORT
     case EPFNOSUPPORT:    return 123;
 #endif

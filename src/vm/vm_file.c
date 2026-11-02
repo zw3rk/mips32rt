@@ -77,6 +77,7 @@ int mips32_file_populate_private(mips32_ctx_t *ctx, uint32_t gva,
 
 static int mips32_file_truncate_at(int fd, uint64_t len)
 {
+    rt32_vm_flush_shared_fd(fd);
     if (ftruncate(fd, (off_t)len) != 0) {
         return -errno;
     }

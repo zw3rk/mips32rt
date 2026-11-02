@@ -666,6 +666,21 @@ int rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
     return rc;
 }
 
+void rt32_vm_flush_shared_fd(int fd)
+{
+#ifdef __APPLE__
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        return;
+    }
+    vm_lock_acquire();
+    vm_flush_darw_inode_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+    vm_lock_release();
+#else
+    (void)fd;
+#endif
+}
+
 void rt32_vm_sync_shared_fd(int fd)
 {
 #ifdef __APPLE__

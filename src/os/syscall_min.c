@@ -176,6 +176,7 @@ static int32_t sc_write(mips32_ctx_t *ctx, uint32_t sp)
         return sc_ret(ctx, -EFAULT);
     }
     host_buf = (const uint8_t *)mips32_guest_ptr(ctx, buf);
+    rt32_vm_flush_shared_fd((int)fd);
     n        = write((int)fd, host_buf, (size_t)count);
     if (n < 0) {
         return sc_ret(ctx, -(int32_t)errno);

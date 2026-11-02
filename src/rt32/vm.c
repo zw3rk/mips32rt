@@ -762,7 +762,7 @@ void rt32_vm_sync_ctx(mips32_ctx_t *ctx)
         return;
     }
     gen = atomic_load_explicit(&g_vm_gen, memory_order_acquire);
-    if (gen == 0U || (ctx->vm_gen == gen && ctx->brk_base == 0U)) {
+    if (gen == 0U || ctx->vm_gen == gen) {
         return;
     }
     vm_lock_acquire();
