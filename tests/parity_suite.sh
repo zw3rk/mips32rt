@@ -431,7 +431,15 @@ elif have_docker; then
     ORACLE_MODE="docker"
 fi
 
-if [ "$ORACLE_MODE" = "docker" ]; then
+need_oracle=""
+for _g in $GUESTS; do
+    if [ ! -f "$OUT/oracle-$_g.txt" ] || [ ! -f "$OUT/oracle-$_g.code" ] || \
+            [ "$OUT/$_g" -nt "$OUT/oracle-$_g.txt" ]; then
+        need_oracle="$need_oracle $_g"
+    fi
+done
+
+if [ "$ORACLE_MODE" = "docker" ] && [ -n "$need_oracle" ]; then
     {
         echo "set -eu"
         echo "export DEBIAN_FRONTEND=noninteractive"
@@ -558,6 +566,44 @@ if [ "$RT_MODE" = "none" ]; then
         done
     done
 else
+    if [ "$RT_MODE" = "docker" ]; then
+        {
+            echo "set -u"
+            echo "export P5_MARKER=p5-lane-l5b"
+            echo "export RT_SYSROOT=$SYSROOT_INNER"
+            for _g in $GUESTS; do
+                [ -x "$OUT/$_g" ] || continue
+                for _eng in interp dbt; do
+                    case "$_g" in
+                        p5-*)
+                            echo "(cd /w/_build/parity && timeout --kill-after=10s 90s /w/_build/mips32rt --$_eng --sysroot $SYSROOT_INNER ./$_g ./$(p5_helper_of "$_g") >/w/_build/parity/rt-$_eng-$_g.txt 2>&1); echo \"\$?\" >/w/_build/parity/rt-$_eng-$_g.code"
+                            ;;
+                        *)
+                            echo "timeout --kill-after=10s 90s /w/_build/mips32rt --$_eng -- /w/_build/parity/$_g >/w/_build/parity/rt-$_eng-$_g.txt 2>&1; echo \"\$?\" >/w/_build/parity/rt-$_eng-$_g.code"
+                            ;;
+                    esac
+                done
+                case "$_g" in
+                    p5-*)
+                        echo "(cd /w/_build/parity && sh /w/tests/difftest/run_difftest.sh ./$_g interp dbt ./$(p5_helper_of "$_g") >/w/_build/parity/rt-difftest-$_g.txt 2>&1); echo \"\$?\" >/w/_build/parity/rt-difftest-$_g.code"
+                        ;;
+                    *)
+                        echo "sh /w/tests/difftest/run_difftest.sh /w/_build/parity/$_g interp dbt >/w/_build/parity/rt-difftest-$_g.txt 2>&1; echo \"\$?\" >/w/_build/parity/rt-difftest-$_g.code"
+                        ;;
+                esac
+            done
+        } >"$OUT/.rt-batch.sh"
+        trap docker_cleanup EXIT INT TERM
+        timeout --kill-after=30s 500s docker run --rm \
+            --name "$DOCKER_NAME" --memory 2g --cpus 2 \
+            --platform linux/arm64 -v "$ROOT:/w" -w /w \
+            debian:bookworm-slim \
+            bash /w/_build/parity/.rt-batch.sh \
+            >"$OUT/docker-rt-batch.log" 2>&1 || true
+        trap - EXIT INT TERM
+        docker_cleanup
+        rm -f "$OUT/.rt-batch.sh"
+    fi
     for _g in $GUESTS; do
         _case="$(case_of "$_g")"
         _golden="$(golden_of "$_g")"
@@ -570,17 +616,17 @@ else
         fi
         for _eng in interp dbt; do
             _rc=0
-            rt_run "$OUT/$_g" "$OUT/rt-$_eng-$_g.txt" "--$_eng" || _rc=$?
+            if [ "$RT_MODE" = "docker" ]; then
+                _rc="$(cat "$OUT/rt-$_eng-$_g.code" 2>/dev/null || echo 127)"
+            else
+                rt_run "$OUT/$_g" "$OUT/rt-$_eng-$_g.txt" "--$_eng" || _rc=$?
+            fi
             golden_row "$(abi_of "$_g")" "$HOST/$RT_MODE" "$_case" \
                 "$_eng" "$ROOT/$_golden" "$OUT/rt-$_eng-$_g.txt" "$_rc"
         done
     done
 
     # ---- difftest (interp vs dbt, 0 divergences) -------------------------
-    # The committed tests/difftest/run_difftest.sh (trace + REGS
-    # lockstep) natively on Linux CI, else in the base bookworm
-    # container. p5 runs with RT_SYSROOT, CWD=$OUT, and the relative
-    # helper argv so outputs match the golden discipline.
     for _g in $GUESTS; do
         _case="$(case_of "$_g")"
         if [ ! -x "$OUT/$_g" ]; then
@@ -611,41 +657,7 @@ else
                 esac
                 ;;
             docker)
-                case "$_g" in
-                    p5-*)
-                        trap docker_cleanup EXIT INT TERM
-                        if ! timeout --kill-after=30s 500s docker run \
-                                --rm --name "$DOCKER_NAME" --memory 2g \
-                                --cpus 2 --platform linux/arm64 \
-                                -v "$ROOT:/w" -w /w/_build/parity \
-                                -e P5_MARKER=p5-lane-l5b \
-                                -e RT_SYSROOT="$SYSROOT_INNER" \
-                                debian:bookworm-slim \
-                                sh /w/tests/difftest/run_difftest.sh \
-                                    "./$_g" interp dbt \
-                                    "./$(p5_helper_of "$_g")" \
-                                    >"$_dout" 2>&1; then
-                            _drc=$?
-                        fi
-                        trap - EXIT INT TERM
-                        docker_cleanup
-                        ;;
-                    *)
-                        trap docker_cleanup EXIT INT TERM
-                        if ! timeout --kill-after=30s 500s docker run \
-                                --rm --name "$DOCKER_NAME" --memory 2g \
-                                --cpus 2 --platform linux/arm64 \
-                                -v "$ROOT:/w" -w /w \
-                                debian:bookworm-slim \
-                                sh tests/difftest/run_difftest.sh \
-                                    "/w/_build/parity/$_g" interp dbt \
-                                    >"$_dout" 2>&1; then
-                            _drc=$?
-                        fi
-                        trap - EXIT INT TERM
-                        docker_cleanup
-                        ;;
-                esac
+                _drc="$(cat "$OUT/rt-difftest-$_g.code" 2>/dev/null || echo 127)"
                 ;;
         esac
         if [ "$_drc" -eq 0 ] && grep -q "0 divergences" "$_dout"; then
