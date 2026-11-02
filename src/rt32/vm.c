@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -28,12 +29,14 @@
 #endif
 
 _Atomic uint32_t g_vm_lock = 0U;
+static _Atomic uint64_t    g_vm_gen = 0U;
 static mips32_ctx_t       *g_vm_root_ctx = NULL;
-static uint32_t         g_vm_brk_base = 0U;
-static uint32_t         g_vm_brk_curr = 0U;
-uint32_t         g_vm_mmap_cursor = RT32_MMAP_BASE_32;
+static uint32_t            g_vm_brk_base = 0U;
+static uint32_t            g_vm_brk_curr = 0U;
+uint32_t                   g_vm_mmap_cursor = RT32_MMAP_BASE_32;
 static mips32_region_t     g_vm_regions[MIPS32_MAX_REGIONS];
-static size_t           g_vm_region_count = 0U;
+static vm_backing_t        g_vm_backing[MIPS32_MAX_REGIONS];
+static size_t              g_vm_region_count = 0U;
 
 void vm_lock_acquire(void)
 {
@@ -116,13 +119,59 @@ void vm_copy_state_to_ctx(mips32_ctx_t *dst)
     if (count > 0U) {
         memcpy(dst->regions, g_vm_regions, count * sizeof(mips32_region_t));
     }
+    dst->vm_gen = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
 }
 
 void vm_sync_to_ctx(mips32_ctx_t *ctx)
 {
+    (void)atomic_fetch_add_explicit(&g_vm_gen, 1U, memory_order_release);
     vm_copy_state_to_ctx(ctx);
     if (g_vm_root_ctx != NULL && g_vm_root_ctx != ctx) {
         vm_copy_state_to_ctx(g_vm_root_ctx);
+    }
+}
+
+static void vm_maybe_close_fd_locked(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        if (g_vm_backing[i].fd == fd) {
+            return;
+        }
+    }
+    (void)close(fd);
+}
+
+static void vm_writeback_darw_locked(uint32_t start, uint32_t end, vm_backing_t back)
+{
+    struct stat st;
+    if (back.darw_sync == 0U || back.fd < 0 || g_vm_root_ctx == NULL || start >= end) {
+        return;
+    }
+    if (fstat(back.fd, &st) != 0 || (uint64_t)st.st_size <= back.file_off) {
+        return;
+    }
+    uint64_t avail = (uint64_t)st.st_size - back.file_off;
+    uint64_t span  = (uint64_t)(end - start);
+    size_t   rem   = (size_t)((span < avail) ? span : avail);
+    const uint8_t *src = (const uint8_t *)mips32_guest_ptr(g_vm_root_ctx, start);
+    off_t cur_off = (off_t)back.file_off;
+    while (rem > 0U) {
+        ssize_t n = pwrite(back.fd, src, rem, cur_off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        src += (size_t)n;
+        rem -= (size_t)n;
+        cur_off += (off_t)n;
     }
 }
 
@@ -131,15 +180,21 @@ void vm_remove_region_at(size_t idx)
     if (idx >= g_vm_region_count) {
         return;
     }
+    mips32_region_t old_r = g_vm_regions[idx];
+    vm_backing_t    old_b = g_vm_backing[idx];
+    vm_writeback_darw_locked(old_r.start, old_r.end, old_b);
     if (idx + 1U < g_vm_region_count) {
         memmove(&g_vm_regions[idx], &g_vm_regions[idx + 1U],
                 (g_vm_region_count - idx - 1U) * sizeof(mips32_region_t));
+        memmove(&g_vm_backing[idx], &g_vm_backing[idx + 1U],
+                (g_vm_region_count - idx - 1U) * sizeof(vm_backing_t));
     }
     g_vm_region_count--;
+    vm_maybe_close_fd_locked(old_b.fd);
 }
 
-int vm_insert_region_raw(uint32_t start, uint32_t end,
-                                uint32_t prot, uint32_t flags, const char *name)
+int vm_insert_region_backed(uint32_t start, uint32_t end, uint32_t prot,
+                            uint32_t flags, const char *name, vm_backing_t back)
 {
     if (start >= end || g_vm_region_count >= MIPS32_MAX_REGIONS) {
         return -1;
@@ -151,6 +206,8 @@ int vm_insert_region_raw(uint32_t start, uint32_t end,
     if (pos < g_vm_region_count) {
         memmove(&g_vm_regions[pos + 1U], &g_vm_regions[pos],
                 (g_vm_region_count - pos) * sizeof(mips32_region_t));
+        memmove(&g_vm_backing[pos + 1U], &g_vm_backing[pos],
+                (g_vm_region_count - pos) * sizeof(vm_backing_t));
     }
     g_vm_region_count++;
     mips32_region_t *r = &g_vm_regions[pos];
@@ -163,7 +220,15 @@ int vm_insert_region_raw(uint32_t start, uint32_t end,
     } else {
         r->name[0] = '\0';
     }
+    g_vm_backing[pos] = back;
     return 0;
+}
+
+int vm_insert_region_raw(uint32_t start, uint32_t end,
+                         uint32_t prot, uint32_t flags, const char *name)
+{
+    vm_backing_t none = { -1, 0U, 0U };
+    return vm_insert_region_backed(start, end, prot, flags, name, none);
 }
 
 void vm_coalesce_regions_locked(void)
@@ -175,13 +240,20 @@ void vm_coalesce_regions_locked(void)
     for (size_t src = 1U; src < g_vm_region_count; src++) {
         mips32_region_t *prev = &g_vm_regions[dst];
         const mips32_region_t *curr = &g_vm_regions[src];
+        const vm_backing_t *pb = &g_vm_backing[dst];
+        const vm_backing_t *cb = &g_vm_backing[src];
+        bool back_match = (pb->fd == cb->fd && pb->darw_sync == cb->darw_sync &&
+                           (pb->fd < 0 ||
+                            pb->file_off + (uint64_t)(prev->end - prev->start) == cb->file_off));
         if (prev->end == curr->start && prev->prot == curr->prot &&
-            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0) {
+            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0 &&
+            back_match) {
             prev->end = curr->end;
         } else {
             dst++;
             if (dst != src) {
                 g_vm_regions[dst] = *curr;
+                g_vm_backing[dst] = *cb;
             }
         }
     }
@@ -210,9 +282,19 @@ void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
                     continue;
                 }
             }
-            mips32_region_t orig = *r;
-            if (vm_insert_region_raw(unmap_end, orig.end,
-                                     orig.prot, orig.flags, orig.name) == 0) {
+            mips32_region_t orig   = *r;
+            vm_backing_t    orig_b = g_vm_backing[i];
+            vm_writeback_darw_locked(unmap_start, unmap_end,
+                (vm_backing_t){ orig_b.fd,
+                    orig_b.file_off + (uint64_t)(unmap_start - orig.start),
+                    orig_b.darw_sync });
+            vm_backing_t tail_b = {
+                orig_b.fd,
+                orig_b.file_off + (uint64_t)(unmap_end - orig.start),
+                orig_b.darw_sync
+            };
+            if (vm_insert_region_backed(unmap_end, orig.end,
+                                        orig.prot, orig.flags, orig.name, tail_b) == 0) {
                 g_vm_regions[i].end = unmap_start;
                 i += 2U;
             } else {
@@ -221,16 +303,25 @@ void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             continue;
         }
         if (r->start < unmap_start) {
+            vm_backing_t b = g_vm_backing[i];
+            vm_writeback_darw_locked(unmap_start, r->end,
+                (vm_backing_t){ b.fd, b.file_off + (uint64_t)(unmap_start - r->start), b.darw_sync });
             r->end = unmap_start;
         } else {
+            vm_backing_t *b = &g_vm_backing[i];
+            vm_writeback_darw_locked(r->start, unmap_end, *b);
+            if (b->fd >= 0) {
+                b->file_off += (uint64_t)(unmap_end - r->start);
+            }
             r->start = unmap_end;
         }
         i++;
     }
 }
 
-int vm_record_region_locked(uint32_t start, uint32_t end,
-                                   uint32_t prot, uint32_t flags, const char *name)
+int vm_record_region_backed_locked(uint32_t start, uint32_t end,
+                                   uint32_t prot, uint32_t flags, const char *name,
+                                   vm_backing_t back)
 {
     if (start >= end) {
         return -1;
@@ -243,13 +334,38 @@ int vm_record_region_locked(uint32_t start, uint32_t end,
     }
     uint32_t clean_flags = flags & ~(RT32_MAP_FIXED | RT32_MAP_FIXED_NOREPLACE);
     vm_unmap_regions_locked(start, end);
-    int rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+    int rc = vm_insert_region_backed(start, end, prot, clean_flags, name_copy, back);
     if (rc < 0) {
         vm_coalesce_regions_locked();
-        rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+        rc = vm_insert_region_backed(start, end, prot, clean_flags, name_copy, back);
     }
     vm_coalesce_regions_locked();
     return rc;
+}
+
+int vm_record_region_locked(uint32_t start, uint32_t end,
+                            uint32_t prot, uint32_t flags, const char *name)
+{
+    vm_backing_t none = { -1, 0U, 0U };
+    return vm_record_region_backed_locked(start, end, prot, flags, name, none);
+}
+
+int vm_can_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
+{
+    vm_coalesce_regions_locked();
+    size_t extra = 0U;
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+        if (r->end <= mp_start || r->start >= mp_end || r->prot == prot) {
+            continue;
+        }
+        if (r->start < mp_start && r->end > mp_end) {
+            extra += 2U;
+        } else if (r->start < mp_start || r->end > mp_end) {
+            extra += 1U;
+        }
+    }
+    return (g_vm_region_count + extra <= MIPS32_MAX_REGIONS) ? 0 : -ENOMEM;
 }
 
 void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
@@ -266,34 +382,27 @@ void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t pro
             i++;
             continue;
         }
-        mips32_region_t orig = *r;
+        mips32_region_t orig   = *r;
+        vm_backing_t    orig_b = g_vm_backing[i];
         if (orig.start < mp_start && orig.end > mp_end) {
-            if (g_vm_region_count + 2U <= MIPS32_MAX_REGIONS) {
-                r->end = mp_start;
-                (void)vm_insert_region_raw(mp_start, mp_end, prot, orig.flags, orig.name);
-                (void)vm_insert_region_raw(mp_end, orig.end, orig.prot, orig.flags, orig.name);
-                i += 3U;
-            } else {
-                r->prot = prot;
-                i++;
-            }
+            vm_backing_t mid_b  = { orig_b.fd, orig_b.file_off + (uint64_t)(mp_start - orig.start), orig_b.darw_sync };
+            vm_backing_t tail_b = { orig_b.fd, orig_b.file_off + (uint64_t)(mp_end - orig.start), orig_b.darw_sync };
+            r->end = mp_start;
+            (void)vm_insert_region_backed(mp_start, mp_end, prot, orig.flags, orig.name, mid_b);
+            (void)vm_insert_region_backed(mp_end, orig.end, orig.prot, orig.flags, orig.name, tail_b);
+            i += 3U;
         } else if (orig.start < mp_start) {
-            if (vm_insert_region_raw(mp_start, orig.end, prot, orig.flags, orig.name) == 0) {
-                g_vm_regions[i].end = mp_start;
-                i += 2U;
-            } else {
-                r->prot = prot;
-                i++;
-            }
+            vm_backing_t tail_b = { orig_b.fd, orig_b.file_off + (uint64_t)(mp_start - orig.start), orig_b.darw_sync };
+            g_vm_regions[i].end = mp_start;
+            (void)vm_insert_region_backed(mp_start, orig.end, prot, orig.flags, orig.name, tail_b);
+            i += 2U;
         } else {
             r->start = mp_end;
-            if (vm_insert_region_raw(orig.start, mp_end, prot, orig.flags, orig.name) == 0) {
-                i += 2U;
-            } else {
-                r->start = orig.start;
-                r->prot  = prot;
-                i++;
+            if (orig_b.fd >= 0) {
+                g_vm_backing[i].file_off = orig_b.file_off + (uint64_t)(mp_end - orig.start);
             }
+            (void)vm_insert_region_backed(orig.start, mp_end, prot, orig.flags, orig.name, orig_b);
+            i += 2U;
         }
     }
     vm_coalesce_regions_locked();
@@ -310,8 +419,9 @@ bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
 }
 
 bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
-                                         uint32_t *out_prot, uint32_t *out_flags,
-                                         char *out_name, size_t name_sz)
+                                  uint32_t *out_prot, uint32_t *out_flags,
+                                  char *out_name, size_t name_sz,
+                                  vm_backing_t *out_back)
 {
     if (start >= end) {
         return false;
@@ -320,6 +430,11 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
     bool     first = true;
     uint32_t first_prot  = 0U;
     uint32_t first_flags = 0U;
+    if (out_back != NULL) {
+        out_back->fd        = -1;
+        out_back->file_off  = 0U;
+        out_back->darw_sync = 0U;
+    }
     for (size_t i = 0U; i < g_vm_region_count; i++) {
         const mips32_region_t *r = &g_vm_regions[i];
         if (r->end <= cur) {
@@ -339,6 +454,11 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
             }
             if (out_name && name_sz > 0U) {
                 snprintf(out_name, name_sz, "%s", r->name);
+            }
+            if (out_back != NULL) {
+                out_back->fd        = g_vm_backing[i].fd;
+                out_back->file_off  = g_vm_backing[i].file_off + (uint64_t)(start - r->start);
+                out_back->darw_sync = g_vm_backing[i].darw_sync;
             }
             first = false;
         } else if ((out_prot != NULL && r->prot != first_prot) ||
@@ -503,8 +623,15 @@ int rt32_vm_init(mips32_ctx_t *ctx, uint64_t requested_window)
     g_vm_brk_curr     = 0U;
     g_vm_mmap_cursor  = RT32_MMAP_BASE_32;
     g_vm_region_count = 0U;
+    for (size_t i = 0U; i < MIPS32_MAX_REGIONS; i++) {
+        g_vm_backing[i].fd        = -1;
+        g_vm_backing[i].file_off  = 0U;
+        g_vm_backing[i].darw_sync = 0U;
+    }
+    atomic_store_explicit(&g_vm_gen, 1U, memory_order_release);
     ctx->mmap_cursor  = RT32_MMAP_BASE_32;
     ctx->region_count = 0U;
+    ctx->vm_gen       = 1U;
     vm_lock_release();
     return 0;
 }
@@ -533,20 +660,23 @@ int rt32_vm_record_region(mips32_ctx_t *ctx, uint32_t start, uint32_t end,
 void rt32_vm_reset_for_exec(mips32_ctx_t *ctx)
 {
     vm_lock_acquire();
-    g_vm_region_count = 0U;
-    g_vm_brk_base  = 0U;
-    g_vm_brk_curr  = 0U;
+    while (g_vm_region_count > 0U) {
+        vm_remove_region_at(g_vm_region_count - 1U);
+    }
+    g_vm_brk_base    = 0U;
+    g_vm_brk_curr    = 0U;
     g_vm_mmap_cursor = RT32_MMAP_BASE_32;
+    (void)atomic_fetch_add_explicit(&g_vm_gen, 1U, memory_order_release);
+    if (ctx != NULL) {
+        (void)vm_reserve_prot_none(ctx, MIPS32_LOW_GUARD_SIZE,
+            (uint32_t)(RT32_WINDOW_SIZE - (uint64_t)MIPS32_LOW_GUARD_SIZE));
+        ctx->brk_base     = 0U;
+        ctx->brk_curr     = 0U;
+        ctx->mmap_cursor  = RT32_MMAP_BASE_32;
+        ctx->region_count = 0U;
+        ctx->vm_gen       = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
+    }
     vm_lock_release();
-
-    (void)munmap((void *)(uintptr_t)MIPS32_LOW_GUARD_SIZE,
-                 (size_t)(RT32_WINDOW_SIZE - (uint64_t)MIPS32_LOW_GUARD_SIZE));
-
-    /* Mirror the cleared state into the caller's ctx. */
-    ctx->brk_base    = 0U;
-    ctx->brk_curr    = 0U;
-    ctx->mmap_cursor = RT32_MMAP_BASE_32;
-    ctx->region_count = 0U;
 }
 
 uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
@@ -632,11 +762,91 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
 
 void rt32_vm_sync_ctx(mips32_ctx_t *ctx)
 {
+    uint64_t gen;
+
     if (!ctx) {
+        return;
+    }
+    gen = atomic_load_explicit(&g_vm_gen, memory_order_acquire);
+    if (gen == 0U) {
+        return;
+    }
+    if (ctx->vm_gen == gen &&
+        (ctx->brk_base == 0U || g_vm_brk_base == ctx->brk_base)) {
         return;
     }
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
-    vm_sync_to_ctx(ctx);
+    vm_copy_state_to_ctx(ctx);
     vm_lock_release();
+}
+
+int rt32_vm_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va, uint32_t len)
+{
+    if (!ctx || (!dst && len > 0U)) {
+        return -EFAULT;
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    vm_lock_acquire();
+    if (atomic_load_explicit(&g_vm_gen, memory_order_relaxed) != 0U) {
+        vm_sync_from_ctx((mips32_ctx_t *)(uintptr_t)ctx);
+        vm_copy_state_to_ctx((mips32_ctx_t *)(uintptr_t)ctx);
+    }
+    if (!mips32_range_ok(ctx, va, len, (uint32_t)PROT_READ)) {
+        vm_lock_release();
+        return -EFAULT;
+    }
+    memcpy(dst, mips32_guest_ptr(ctx, va), (size_t)len);
+    vm_lock_release();
+    return 0;
+}
+
+int rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len)
+{
+    if (!ctx || (!src && len > 0U)) {
+        return -EFAULT;
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    vm_lock_acquire();
+    if (atomic_load_explicit(&g_vm_gen, memory_order_relaxed) != 0U) {
+        vm_sync_from_ctx(ctx);
+        vm_copy_state_to_ctx(ctx);
+    }
+    if (!mips32_range_ok(ctx, va, len, (uint32_t)PROT_WRITE)) {
+        vm_lock_release();
+        return -EFAULT;
+    }
+    memcpy(mips32_guest_ptr(ctx, va), src, (size_t)len);
+    vm_lock_release();
+    return 0;
+}
+
+int rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (!ctx || len == 0U) {
+        return 0;
+    }
+    uint64_t end64 = (uint64_t)addr + vm_page_align_up((uint64_t)len);
+    if (end64 > (uint64_t)MIPS32_TASK_SIZE_TOP) {
+        return -ENOMEM;
+    }
+    uint32_t end = (uint32_t)end64;
+    vm_lock_acquire();
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+        const vm_backing_t    *b = &g_vm_backing[i];
+        if (r->end <= addr || r->start >= end || b->darw_sync == 0U || b->fd < 0) {
+            continue;
+        }
+        uint32_t s = (r->start > addr) ? r->start : addr;
+        uint32_t e = (r->end < end) ? r->end : end;
+        vm_backing_t sub = { b->fd, b->file_off + (uint64_t)(s - r->start), b->darw_sync };
+        vm_writeback_darw_locked(s, e, sub);
+    }
+    vm_lock_release();
+    return 0;
 }

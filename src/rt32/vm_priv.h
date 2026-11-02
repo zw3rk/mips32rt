@@ -44,19 +44,34 @@ void vm_sync_from_ctx(mips32_ctx_t *ctx);
 void vm_sync_brk_to_ctx(mips32_ctx_t *ctx);
 void vm_sync_to_ctx(mips32_ctx_t *ctx);
 
+/* Per-region file-backing metadata (M32-3, M32-4). */
+typedef struct {
+    int      fd;        /* retained dup'd fd for file mappings, or -1 */
+    uint64_t file_off;  /* byte offset in fd at region->start */
+    uint8_t  darw_sync; /* 1 when Darwin sub-16KiB MAP_SHARED needs writeback */
+} vm_backing_t;
+
 /* Locked VMA-table primitives (defined in vm.c; caller holds the lock). */
 void vm_remove_region_at(size_t idx);
 int  vm_insert_region_raw(uint32_t start, uint32_t end, uint32_t prot,
                           uint32_t flags, const char *name);
+int  vm_insert_region_backed(uint32_t start, uint32_t end, uint32_t prot,
+                             uint32_t flags, const char *name,
+                             vm_backing_t back);
 void vm_coalesce_regions_locked(void);
 void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
 int  vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,
                              uint32_t flags, const char *name);
+int  vm_record_region_backed_locked(uint32_t start, uint32_t end, uint32_t prot,
+                                    uint32_t flags, const char *name,
+                                    vm_backing_t back);
+int  vm_can_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot);
 void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot);
 bool vm_range_overlaps_locked(uint32_t start, uint32_t end);
 bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                   uint32_t *out_prot, uint32_t *out_flags,
-                                  char *out_name, size_t name_sz);
+                                  char *out_name, size_t name_sz,
+                                  vm_backing_t *out_back);
 int  vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va);
 
 #endif /* RT32_VM_PRIV_H */

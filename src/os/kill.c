@@ -35,12 +35,12 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_priv.h"
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 #if defined(__linux__)
-#include <signal.h>
 #include <sys/syscall.h>
 extern long syscall(long __n, ...);
 #endif
@@ -53,29 +53,84 @@ extern long syscall(long __n, ...);
 #define KILL_SI_USER (-1)
 #define KILL_SI_TKILL (-6)
 
-/* MIPS signal numbers that can never be caught or ignored. */
-#define KILL_SIGKILL 9
-#define KILL_SIGSTOP 23
+/* MIPS signal numbers (arch/mips/include/uapi/asm/signal.h). */
+#define KILL_SIGKILL   9
+#define KILL_SIGBUS    10
+#define KILL_SIGSYS    12
+#define KILL_SIGUSR1   16
+#define KILL_SIGUSR2   17
+#define KILL_SIGCHLD   18
+#define KILL_SIGPWR    19
+#define KILL_SIGWINCH  20
+#define KILL_SIGURG    21
+#define KILL_SIGPOLL   22
+#define KILL_SIGSTOP   23
+#define KILL_SIGTSTP   24
+#define KILL_SIGCONT   25
+#define KILL_SIGTTIN   26
+#define KILL_SIGTTOU   27
+#define KILL_SIGVTALRM 28
+#define KILL_SIGPROF   29
+#define KILL_SIGXCPU   30
+#define KILL_SIGXFSZ   31
 
-/* Shared host/guest numbers (mips_trap documents the same set): only
- * these may be forwarded to the host for the death path. Anything else
- * exits 128+signo without a host raise (MIPS numbering differs from
- * the host's for e.g. USR1/USR2/ALRM). */
-static int kill_shared_death(int signo)
+/* Signals whose Linux default disposition on MIPS is Ignore. */
+int mips_signal_default_ignore(int signo)
 {
-    return signo == 4 || signo == 5 || signo == 8 || signo == 10 ||
-        signo == 11;
+    return signo == KILL_SIGCHLD || signo == KILL_SIGWINCH ||
+           signo == KILL_SIGURG  || signo == KILL_SIGCONT;
 }
 
-/* Die by signo without returning (default-disposition kill target). */
-static void kill_die(int signo)
+/* Signals whose Linux default disposition on MIPS is Stop. */
+int mips_signal_default_stop(int signo)
+{
+    return signo == KILL_SIGSTOP || signo == KILL_SIGTSTP ||
+           signo == KILL_SIGTTIN || signo == KILL_SIGTTOU;
+}
+
+static int mips_to_host_fatal_sig(int signo)
+{
+    switch (signo) {
+    case 1:  return SIGHUP;
+    case 2:  return SIGINT;
+    case 3:  return SIGQUIT;
+    case 4:  return SIGILL;
+    case 5:  return SIGTRAP;
+    case 6:  return SIGABRT;
+    case 8:  return SIGFPE;
+    case 9:  return SIGKILL;
+    case KILL_SIGBUS:    return SIGBUS;
+    case 11: return SIGSEGV;
+    case KILL_SIGSYS:    return SIGSYS;
+    case 13: return SIGPIPE;
+    case 14: return SIGALRM;
+    case 15: return SIGTERM;
+    case KILL_SIGUSR1:   return SIGUSR1;
+    case KILL_SIGUSR2:   return SIGUSR2;
+#ifdef SIGPWR
+    case KILL_SIGPWR:    return SIGPWR;
+#endif
+#ifdef SIGPOLL
+    case KILL_SIGPOLL:   return SIGPOLL;
+#endif
+    case KILL_SIGVTALRM: return SIGVTALRM;
+    case KILL_SIGPROF:   return SIGPROF;
+    case KILL_SIGXCPU:   return SIGXCPU;
+    case KILL_SIGXFSZ:   return SIGXFSZ;
+    default: return 0;
+    }
+}
+
+/* Die by signo without returning (default-disposition kill/trap target). */
+void mips_signal_default_die(int signo)
 {
 #if defined(__linux__)
-    if (kill_shared_death(signo)) {
-        (void)raise(signo);
+    int host_sig = mips_to_host_fatal_sig(signo);
+    if (host_sig > 0) {
+        (void)raise(host_sig);
     }
 #else
-    (void)kill_shared_death(signo);
+    (void)mips_to_host_fatal_sig;
 #endif
     _Exit(128 + (signo & 0x7F));
 }
@@ -144,15 +199,30 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
          * queue exists, so report ESRCH rather than lose the signal. */
         return mips_sc_ret(ctx, -3); /* ESRCH */
     }
-    if (signo == KILL_SIGKILL || signo == KILL_SIGSTOP) {
-        kill_die(signo);
+    if (signo == KILL_SIGKILL) {
+        mips_signal_default_die(signo);
         return mips_sc_ret(ctx, 0); /* unreachable */
+    }
+    if (signo == KILL_SIGSTOP) {
+        (void)kill(getpid(), SIGSTOP);
+        return mips_sc_ret(ctx, 0);
     }
     if (mips_signal_is_ignored(signo)) {
         return mips_sc_ret(ctx, 0);
     }
+    if (!mips_signal_has_handler(signo) && mips_signal_default_ignore(signo)) {
+        return mips_sc_ret(ctx, 0);
+    }
+    if (mips_signal_is_blocked(ctx, signo)) {
+        mips_signal_pend(ctx, signo, si_code);
+        return mips_sc_ret(ctx, 0);
+    }
     if (!mips_signal_has_handler(signo)) {
-        kill_die(signo);
+        if (mips_signal_default_stop(signo)) {
+            (void)kill(getpid(), SIGSTOP);
+            return mips_sc_ret(ctx, 0);
+        }
+        mips_signal_default_die(signo);
         return mips_sc_ret(ctx, 0); /* unreachable */
     }
     /* Resume-after semantics: the frame snapshots the post-syscall
@@ -176,7 +246,7 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
      * handler, so the completed $v0/$a3 above are what sigreturn
      * restores. Both engines resume at the moved pc. */
     if (mips_raise_guest_code(ctx, signo, si_code, 0U) != 0) {
-        kill_die(signo);
+        mips_signal_default_die(signo);
         return mips_sc_ret(ctx, 0); /* unreachable */
     }
     return 0;

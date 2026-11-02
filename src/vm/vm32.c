@@ -160,6 +160,7 @@ int mips32_vm_tlb_miss(mips32_ctx_t *ctx, uint32_t gva, int is_write,
     }
     page = (gva >> 12) & 0xFFFu;
     page_base = gva & ~0xFFFu;
+    rt32_vm_sync_ctx(ctx);
     covered = 0;
     for (i = 0u; i < ctx->region_count; i++) {
         const mips32_region_t *r = &ctx->regions[i];

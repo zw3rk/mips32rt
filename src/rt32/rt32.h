@@ -52,6 +52,9 @@ int      rt32_vm_munmap(mips32_ctx_t *ctx, uint32_t addr, uint32_t len);
 uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                         uint32_t new_len, uint32_t flags, uint32_t new_addr);
 void     rt32_vm_sync_ctx(mips32_ctx_t *ctx);
+int      rt32_vm_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va, uint32_t len);
+int      rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len);
+int      rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len);
 
 /* ELF32 loader & initial stack (elf32.c, stack32.c) */
 typedef struct rt32_elf_info {
@@ -70,6 +73,7 @@ typedef struct rt32_elf_info {
 } rt32_elf_info_t;
 
 int rt32_open_guest_ro(const mips32_ctx_t *ctx, const char *guest_path);
+int rt32_elf_validate(const mips32_ctx_t *ctx, int exec_fd);
 int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path,
                   rt32_elf_info_t *out_info);
 int rt32_stack_setup(mips32_ctx_t *ctx, const rt32_elf_info_t *elf_info,

@@ -773,16 +773,8 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
         interp_set_reg(ctx, link_rd, pc + 8u);
     }
     if (likely && !taken) {
-        /* The annulled slot is not executed, but its word is still
-         * fetched: like qemu (translate-time fetch) and real hardware
-         * (sequential IF fetch), a fault there reports branch_pc = pc. */
-        mips_dec_t s;
-        ctx->in_delay_slot = 1;
-        ctx->pc = pc + 4u;
-        if (fetch_decode(ctx, pc + 4u, &s) != 0) {
-            return MIPS_FAULT;
-        }
-        (void)s;
+        /* SPEC 2.2: on a not-taken Branch Likely, the delay-slot
+         * instruction is nullified without fetching or executing it. */
         ctx->in_delay_slot = 0;
         ctx->pc = pc + 8u;
         ctx->next_pc = pc + 12u;
@@ -798,18 +790,18 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
         int rc;
 
         if (fetch_decode(ctx, pc + 4u, &s) != 0) {
+            ctx->in_delay_slot = 0;
             return MIPS_FAULT;
         }
         if (interp_is_control(&s)) {
             return exec_branch(ctx, pc + 4u, &s);
         }
         rc = exec_simple(ctx, pc + 4u, &s);
+        ctx->in_delay_slot = 0;
         if (rc == 0) {
-            ctx->in_delay_slot = 0;
             ctx->pc = taken ? target : pc + 8u;
             ctx->next_pc = ctx->pc + 4u;
         } else if (rc == 2) {
-            ctx->in_delay_slot = 0;
             rc = 0;
         }
         return rc;

@@ -285,8 +285,12 @@ need_build=""
 for _g in $GUESTS; do
     _spec="$(guest_spec "$_g")"
     _rel="${_spec%%|*}"
+    _rel2="${_rel%.c}_part2.c"
     _fresh=1
     if [ ! -x "$OUT/$_g" ] || [ "$UP/$_rel" -nt "$OUT/$_g" ]; then
+        _fresh=0
+    fi
+    if [ -f "$UP/$_rel2" ] && [ "$UP/$_rel2" -nt "$OUT/$_g" ]; then
         _fresh=0
     fi
     case "$_g" in
@@ -306,13 +310,16 @@ for _g in $GUESTS; do
 done
 
 build_one_native() { # <guest>: compile with the native cross toolchain.
-    local _g="$1" _spec _rel _rest _flags _cc _libs _h
+    local _g="$1" _spec _rel _rest _flags _cc _libs _h _extra_src=""
     _spec="$(guest_spec "$_g")"
     _rel="${_spec%%|*}"; _rest="${_spec#*|}"
     _flags="${_rest%%|*}"; _rest="${_rest#*|}"
     _cc="${_rest%%|*}"; _libs="${_rest##*|}"
+    if [ -f "$UP/${_rel%.c}_part2.c" ]; then
+        _extra_src="$UP/${_rel%.c}_part2.c"
+    fi
     # shellcheck disable=SC2086
-    if ! $_cc $_flags -o "$OUT/$_g" "$UP/$_rel" $_libs \
+    if ! $_cc $_flags -o "$OUT/$_g" "$UP/$_rel" $_extra_src $_libs \
             >"$OUT/build-$_g.log" 2>&1; then
         return 1
     fi
@@ -352,8 +359,12 @@ if [ -n "$need_build" ]; then
                 _rel="${_spec%%|*}"; _rest="${_spec#*|}"
                 _flags="${_rest%%|*}"; _rest="${_rest#*|}"
                 _cc="${_rest%%|*}"; _libs="${_rest##*|}"
+                _extra_src=""
+                if [ -f "$UP/${_rel%.c}_part2.c" ]; then
+                    _extra_src="/z/${_rel%.c}_part2.c"
+                fi
                 # shellcheck disable=SC2086
-                echo "{ $_cc $_flags -o /w/_build/parity/$_g /z/$_rel $_libs; } || true"
+                echo "{ $_cc $_flags -o /w/_build/parity/$_g /z/$_rel $_extra_src $_libs; } || true"
                 case "$_g" in
                     p5-*)
                         _h="$(p5_helper_of "$_g")"
@@ -364,7 +375,7 @@ if [ -n "$need_build" ]; then
             # Live 2008-NaN probe (expected to fail on legacy-NaN-only
             # sysroots; the log feeds the p3-2008nan row below).
             echo "rm -f /w/_build/parity/.docker-2008-fresh"
-            echo "mipsel-linux-gnu-gcc -march=mips32r2 -mnan=2008 -static -O1 -std=c11 -o /tmp/p3-le2008 /z/mips32rt/tests/test_p3_fpu.c >/w/_build/parity/le2008-build.log 2>&1 && echo LE2008-UNEXPECTED-OK >>/w/_build/parity/le2008-build.log || true"
+            echo "mipsel-linux-gnu-gcc -march=mips32r2 -mnan=2008 -static -O1 -std=c11 -o /tmp/p3-le2008 /z/mips32rt/tests/test_p3_fpu.c /z/mips32rt/tests/test_p3_fpu_part2.c >/w/_build/parity/le2008-build.log 2>&1 && echo LE2008-UNEXPECTED-OK >>/w/_build/parity/le2008-build.log || true"
             echo "touch /w/_build/parity/.docker-2008-fresh"
         } >"$OUT/.build-inner.sh"
         rm -f "$OUT/.docker-2008-fresh"
@@ -692,7 +703,7 @@ if command -v mipsel-linux-gnu-gcc >/dev/null 2>&1; then
     _t0="$(parity_now_ms)"
     if mipsel-linux-gnu-gcc -march=mips32r2 -mnan=2008 -static -O1 \
             -std=c11 -o "$OUT/p3-le2008" tests/test_p3_fpu.c \
-            >"$OUT/le2008-build.log" 2>&1; then
+            tests/test_p3_fpu_part2.c >"$OUT/le2008-build.log" 2>&1; then
         parity_row "mipsel" "$HOST" "p3-2008nan" "host" "FAIL" "0" \
             "2008 build unexpectedly succeeded (sysroot changed?)"
     elif grep -q "stubs-o32_hard_2008" "$OUT/le2008-build.log"; then

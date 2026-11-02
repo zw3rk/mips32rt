@@ -74,13 +74,13 @@ test -x /w/_build/mips32rt || { echo "P6 FAIL: no translator binary"; exit 1; }
 
 echo "=== P6 build static guests (LE+BE) ==="
 mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -std=c11 -Wall -Wextra \
-    -o /tmp/p1-le /w/tests/test_p1_isa.c
+    -o /tmp/p1-le /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
 mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -std=c11 -Wall -Wextra \
-    -o /tmp/p1-be /w/tests/test_p1_isa.c
+    -o /tmp/p1-be /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
 mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -std=c11 -Wall -Wextra \
-    -o /tmp/p3-le /w/tests/test_p3_fpu.c -lm
+    -o /tmp/p3-le /w/tests/test_p3_fpu.c /w/tests/test_p3_fpu_part2.c -lm
 mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -std=c11 -Wall -Wextra \
-    -o /tmp/p3-be /w/tests/test_p3_fpu.c -lm
+    -o /tmp/p3-be /w/tests/test_p3_fpu.c /w/tests/test_p3_fpu_part2.c -lm
 mipsel-linux-gnu-gcc -march=mips32r2 -static -pthread -O1 -std=c11 -Wall -Wextra \
     -o /tmp/p4-le /w/tests/test_p4_threads_signals.c
 mips-linux-gnu-gcc -march=mips32r2 -EB -static -pthread -O1 -std=c11 -Wall -Wextra \

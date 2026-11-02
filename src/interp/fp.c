@@ -4,23 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Software IEEE-754 S/D arithmetic in pure integer math: the host FP
- * environment is never touched (no float/double/fenv), so results are
- * bit-exact and host-independent.  NaN/ABS semantics follow
- * experiments/E03/FINDINGS.md (qemu-mipsel 7.2 ground truth), selected
- * by ctx->nan2008: Legacy quiet bit = fraction MSB clear, 2008 quiet
- * bit = fraction MSB set; sNaN arithmetic input raises Invalid
- * (Cause.V + Flags.V, trap via mips_trap SIGFPE when Enable.V is set,
- * else the operand quieted in-mode with payload preserved).
- *
- * Deliberate E03-over-SPEC point: SPEC 2.2 calls ABS/NEG arithmetic
- * that signals Invalid on sNaN, but qemu 7.2 never signals for
- * ABS.S/ABS.D (both NaN patterns, trap enabled, either NaN mode), so
- * ABS/NEG/MOV are non-arithmetic sign-bit ops that never raise,
- * matching the RC3 oracle.  MFHC1/MTHC1 are FR-agnostic flat high-half
- * moves (qemu emulates them silently in FR=1 too); D/L-format register
- * operands must still be even in FR=0.  All FP state lives in
- * ctx->fpr/ctx->fcsr.
+ * Software IEEE-754 S/D arithmetic in pure integer math (no host float/fenv).
+ * NaN/ABS semantics follow experiments/E03/FINDINGS.md (selected by
+ * ctx->nan2008: Legacy quiet bit = MSB clear, 2008 = MSB set; sNaN raises
+ * Invalid / SIGFPE when Enable.V is set, else quiets with payload kept).
+ * ABS/NEG/MOV are non-arithmetic sign-bit ops; MFHC1/MTHC1 are FR-agnostic.
  */
 
 #include <stdint.h>
@@ -822,29 +810,37 @@ static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     int slot_ctrl, rc;
 
     if (((d->rt >> 1) & 1) != 0 && !taken) {
+        ctx->in_delay_slot = 0;
         ctx->pc = pc + 8u;
         ctx->next_pc = pc + 12u;
         return 2;
     }
+    ctx->in_delay_slot = 1;
+    ctx->pc = pc + 4u;
+    ctx->next_pc = pc + 8u;
     if (mips_fetch(ctx, pc + 4u, &w) != 0) {
         if (ctx->exit_reason == MIPS32_EXIT_NONE)
             mips_fault(ctx, pc + 4u);
+        ctx->in_delay_slot = 0;
+        if (ctx->exit_reason != MIPS32_EXIT_NONE) {
+            ctx->pc = pc;
+            ctx->next_pc = pc + 4u;
+        }
         return MIPS_FAULT;
     }
     mips_decode(w, &sl);
     slot_ctrl = interp_is_control(&sl);
-    ctx->in_delay_slot = 1;
-    ctx->pc = pc + 4u;
-    ctx->next_pc = pc + 8u;
     rc = interp_step(ctx);
+    ctx->in_delay_slot = 0;
     if (rc == MIPS_FAULT) {
-        ctx->pc = pc;
-        ctx->next_pc = pc + 4u;
+        if (ctx->exit_reason != MIPS32_EXIT_NONE) {
+            ctx->pc = pc;
+            ctx->next_pc = pc + 4u;
+        }
         return MIPS_FAULT;
     }
     if (rc == 1)
         return 1;
-    ctx->in_delay_slot = 0;
     if (slot_ctrl)
         return 2;
     ctx->pc = taken ? target : pc + 8u;

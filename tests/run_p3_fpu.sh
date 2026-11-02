@@ -32,7 +32,7 @@ docker exec "$NAME" sh -c '
     qemu-mipsel --version | head -1
     echo "--- build LE ---"
     mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -std=c11 -Wall -Wextra \
-        -o /tmp/p3-le /w/tests/test_p3_fpu.c -lm
+        -o /tmp/p3-le /w/tests/test_p3_fpu.c /w/tests/test_p3_fpu_part2.c -lm
     mipsel-linux-gnu-readelf -h /tmp/p3-le | grep -E "Class|Machine|Data"
     echo "--- run LE under qemu-mipsel ---"
     timeout --kill-after=30s 60s qemu-mipsel /tmp/p3-le || rc=$?
@@ -49,7 +49,7 @@ docker exec "$NAME" sh -c '
     qemu-mips --version | head -1
     echo "--- build BE ---"
     mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -std=c11 -Wall -Wextra \
-        -o /tmp/p3-be /w/tests/test_p3_fpu.c -lm
+        -o /tmp/p3-be /w/tests/test_p3_fpu.c /w/tests/test_p3_fpu_part2.c -lm
     mips-linux-gnu-readelf -h /tmp/p3-be | grep -E "Class|Machine|Data"
     echo "--- run BE under qemu-mips ---"
     timeout --kill-after=30s 60s qemu-mips /tmp/p3-be || rc=$?
@@ -65,7 +65,7 @@ docker exec "$NAME" sh -c '
     set -eu
     echo "--- build LE -mnan=2008 (expected to fail: legacy-only sysroot) ---"
     mipsel-linux-gnu-gcc -march=mips32r2 -mnan=2008 -static -O1 -std=c11 \
-        -Wall -Wextra -o /tmp/p3-le2008 /w/tests/test_p3_fpu.c -lm
+        -Wall -Wextra -o /tmp/p3-le2008 /w/tests/test_p3_fpu.c /w/tests/test_p3_fpu_part2.c -lm
     echo "--- run LE-2008 under qemu-mipsel ---"
     timeout --kill-after=30s 60s qemu-mipsel /tmp/p3-le2008 || rc=$?
     echo "LE2008-EXIT=${rc:-0}"

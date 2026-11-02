@@ -91,36 +91,7 @@ static int32_t proc_ret(mips32_ctx_t *ctx, int32_t raw)
 static int proc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                          uint32_t need)
 {
-    uint64_t end64;
-    uint32_t cur;
-    size_t   i;
-
-    if (len == 0U) {
-        return 1;
-    }
-    end64 = (uint64_t)va + (uint64_t)len;
-    if (end64 > 0x100000000ULL) {
-        return 0;
-    }
-    cur = va;
-    for (i = 0; i < ctx->region_count; i++) {
-        const mips32_region_t *r = &ctx->regions[i];
-
-        if (r->start > cur) {
-            return 0; /* sorted gap: nothing later can cover cur */
-        }
-        if (r->end <= cur) {
-            continue;
-        }
-        if ((r->prot & need) != need) {
-            return 0;
-        }
-        cur = r->end;
-        if ((uint64_t)cur >= end64) {
-            return 1;
-        }
-    }
-    return 0;
+    return mips32_range_ok(ctx, va, len, need);
 }
 
 /*
@@ -381,12 +352,19 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
         proc_free_strvec(envp_copy, envc_copy);
         return proc_ret(ctx, -EINVAL);
     }
-    /* Pre-open first: a missing file fails here with the old image intact. */
+    /* Pre-open and validate first: a missing or non-ELF file fails here
+     * with the old image intact. */
     fd = rt32_open_guest_ro(ctx, path);
     if (fd < 0) {
         proc_free_strvec(argv_copy, argc_copy);
         proc_free_strvec(envp_copy, envc_copy);
         return proc_ret(ctx, -ENOENT);
+    }
+    if (rt32_elf_validate(ctx, fd) != 0) {
+        (void)close(fd);
+        proc_free_strvec(argv_copy, argc_copy);
+        proc_free_strvec(envp_copy, envc_copy);
+        return proc_ret(ctx, -ENOEXEC);
     }
 
     /* Tear down the old image: unmaps every guest page (stack included),
@@ -402,14 +380,14 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
     if (rc != 0) {
         proc_free_strvec(argv_copy, argc_copy);
         proc_free_strvec(envp_copy, envc_copy);
-        return proc_ret(ctx, -ENOEXEC);
+        _Exit(127);
     }
     rc = rt32_stack_setup(ctx, &info, argc_copy, argv_copy,
                           (envc_copy > 0) ? envp_copy : NULL, &new_sp);
     proc_free_strvec(argv_copy, argc_copy);
     proc_free_strvec(envp_copy, envc_copy);
     if (rc != 0) {
-        return proc_ret(ctx, -ENOMEM);
+        _Exit(127);
     }
 
     /* Mirror the fresh regions into the ctx copy (as run_guest does). */
@@ -635,6 +613,7 @@ int mips_proc_maps_text(mips32_ctx_t *ctx, char *buf, unsigned long cap)
     if (ctx == NULL || buf == NULL || cap == 0UL) {
         return -EFAULT;
     }
+    rt32_vm_sync_ctx(ctx);
     for (i = 0; i < ctx->region_count; i++) {
         const mips32_region_t *r = &ctx->regions[i];
         char line[160];

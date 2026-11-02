@@ -16,6 +16,7 @@
 #include "vm/vm32.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,8 +40,29 @@ static void vm_invalidate_all(mips32_ctx_t *ctx, uint32_t start,
     mips32_vm_invalidate_range(ctx, start, end);
 }
 
-static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
-                                uint32_t flags, int fd, uint32_t pgoffset)
+static int pread_full(int fd, uint8_t *dst, size_t rem, off_t cur_off)
+{
+    while (rem > 0U) {
+        ssize_t n = pread(fd, dst, rem, cur_off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -errno;
+        }
+        if (n == 0) {
+            break;
+        }
+        dst += (size_t)n;
+        rem -= (size_t)n;
+        cur_off += (off_t)n;
+    }
+    return 0;
+}
+
+static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
+                                    uint32_t flags, int fd, uint32_t pgoffset, bool dup_backing,
+                                    const char *rname)
 {
     if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
@@ -60,6 +82,8 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
     }
     if (flags & RT32_MAP_ANONYMOUS) {
         host_flags |= MAP_ANONYMOUS;
+    } else if (fd < 0) {
+        return (uint32_t)(-EBADF);
     }
 
     uint32_t target_va     = 0U;
@@ -90,9 +114,10 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
         }
     }
 
-    int   host_prot   = mips32_host_prot(ctx, prot);
-    void *host_target = mips32_guest_ptr(ctx, target_va);
-    off_t host_off    = (off_t)pgoffset * (off_t)MIPS32_PAGE_SIZE;
+    int     host_prot   = mips32_host_prot(ctx, prot);
+    void   *host_target = mips32_guest_ptr(ctx, target_va);
+    off_t   host_off    = (off_t)pgoffset * (off_t)MIPS32_PAGE_SIZE;
+    uint8_t darw_sync   = 0U;
 #ifdef __APPLE__
     uint32_t h_start = target_va & ~0x3FFFU;
     uint32_t h_end   = ((uint32_t)((uint64_t)target_va + aligned_len) + 0x3FFFU) & ~0x3FFFU;
@@ -105,27 +130,34 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
             return (uint32_t)(-errno);
         }
     } else {
+        if ((host_flags & MAP_ANONYMOUS) == 0) {
+            int fl = fcntl(fd, F_GETFL);
+            if (fl < 0) {
+                return (uint32_t)(-errno);
+            }
+            if ((fl & O_ACCMODE) == O_WRONLY ||
+                ((flags & 0x01U) != 0U && (prot & (uint32_t)PROT_WRITE) != 0U &&
+                 (fl & O_ACCMODE) != O_RDWR)) {
+                return (uint32_t)(-EACCES);
+            }
+        }
         if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
                      PROT_READ | PROT_WRITE) != 0) {
             return (uint32_t)(-errno);
         }
         memset(host_target, 0, (size_t)aligned_len);
         if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-            uint8_t *dst = (uint8_t *)host_target;
-            size_t rem = (size_t)aligned_len;
-            off_t cur_off = host_off;
-            while (rem > 0U) {
-                ssize_t n = pread(fd, dst, rem, cur_off);
-                if (n <= 0) {
-                    break;
-                }
-                dst += (size_t)n;
-                rem -= (size_t)n;
-                cur_off += (off_t)n;
+            int prc = pread_full(fd, (uint8_t *)host_target, (size_t)aligned_len, host_off);
+            if (prc != 0) {
+                return (uint32_t)prc;
+            }
+            if ((flags & 0x01U) != 0U) {
+                darw_sync = 1U;
             }
         }
     }
 #else
+    (void)darw_sync;
     void *res = mmap(host_target, (size_t)aligned_len, host_prot,
                      host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
                      (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
@@ -134,19 +166,48 @@ static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, 
     }
 #endif
 
-    if (update_cursor) {
-        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
+    vm_backing_t back = { -1, 0U, 0U };
+    if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
+        int bfd = dup_backing ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : fd;
+        if (bfd < 0) {
+            return (uint32_t)(-errno);
+        }
+        back.fd        = bfd;
+        back.file_off  = (uint64_t)host_off;
+        back.darw_sync = darw_sync;
     }
-    (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
-                                  prot & 0x7U, flags, "[mmap]");
+
     if ((flags & 0x01U) == 0U && (host_flags & MAP_ANONYMOUS) == 0 &&
         fd >= 0 && ctx->vm_regime == MIPS32_VM_REGIME_A2) {
         /* Provider A: mirror private file bytes into the A2 arena. */
-        (void)mips32_file_populate_private(ctx, target_va,
-                                           (uint32_t)aligned_len, fd,
-                                           (uint64_t)host_off);
+        int prc = mips32_file_populate_private(ctx, target_va,
+                                               (uint32_t)aligned_len, fd,
+                                               (uint64_t)host_off);
+        if (prc != 0) {
+            if (dup_backing && back.fd >= 0) {
+                (void)close(back.fd);
+            }
+            return (uint32_t)prc;
+        }
+    }
+
+    if (vm_record_region_backed_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
+                                       prot & 0x7U, flags, rname ? rname : "[mmap]", back) != 0) {
+        if (dup_backing && back.fd >= 0) {
+            (void)close(back.fd);
+        }
+        return (uint32_t)(-ENOMEM);
+    }
+    if (update_cursor) {
+        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
     }
     return target_va;
+}
+
+static uint32_t vm_mmap2_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
+                                uint32_t flags, int fd, uint32_t pgoffset)
+{
+    return vm_mmap2_ext_locked(ctx, addr, len, prot, flags, fd, pgoffset, true, "[mmap]");
 }
 
 uint32_t rt32_vm_mmap2(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
@@ -186,7 +247,8 @@ static int vm_mprotect_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, ui
     if (addr < MIPS32_LOW_GUARD_SIZE ||
         aligned_len == 0ULL ||
         end64 > (uint64_t)MIPS32_TASK_SIZE_TOP ||
-        !vm_check_mapped_range_locked(addr, (uint32_t)end64, NULL, NULL, NULL, 0U)) {
+        !vm_check_mapped_range_locked(addr, (uint32_t)end64, NULL, NULL, NULL, 0U, NULL) ||
+        vm_can_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U) != 0) {
         return -ENOMEM;
     }
 
@@ -297,18 +359,20 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
 
-    uint32_t prot       = 0x3U;
-    uint32_t orig_flags = 0x22U;
-    char     orig_name[64];
+    uint32_t     prot       = 0x3U;
+    uint32_t     orig_flags = 0x22U;
+    char         orig_name[64];
+    vm_backing_t orig_back  = { -1, 0U, 0U };
     orig_name[0] = '\0';
     if (!vm_check_mapped_range_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned),
-                                      &prot, &orig_flags, orig_name, sizeof(orig_name))) {
+                                      &prot, &orig_flags, orig_name, sizeof(orig_name),
+                                      &orig_back)) {
         vm_sync_to_ctx(ctx);
         vm_lock_release();
         return (uint32_t)(-EFAULT);
     }
     uint32_t    keep_flags  = orig_flags & 0x23U;
-    uint32_t    map_flags   = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | RT32_MAP_ANONYMOUS;
+    uint32_t    anon_flags  = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | RT32_MAP_ANONYMOUS;
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
 
     if ((flags & RT32_MREMAP_FIXED) == 0U) {
@@ -334,11 +398,15 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         uint64_t new_end = (uint64_t)old_addr + new_aligned;
         if (new_end <= (uint64_t)MIPS32_TASK_SIZE_TOP &&
             !vm_range_overlaps_locked(old_end, (uint32_t)new_end)) {
-            uint32_t ext = vm_mmap2_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned),
-                                           prot, map_flags | RT32_MAP_FIXED, -1, 0U);
+            uint32_t ext_flags = (orig_back.fd >= 0) ? keep_flags : anon_flags;
+            uint32_t ext_pgoff = (orig_back.fd >= 0)
+                ? (uint32_t)((orig_back.file_off + old_aligned) / (uint64_t)MIPS32_PAGE_SIZE)
+                : 0U;
+            uint32_t ext = vm_mmap2_ext_locked(ctx, old_end,
+                                               (uint32_t)(new_aligned - old_aligned),
+                                               prot, ext_flags | RT32_MAP_FIXED,
+                                               orig_back.fd, ext_pgoff, false, region_name);
             if (ext <= 0xFFFFF000U) {
-                (void)vm_record_region_locked(old_end, (uint32_t)new_end,
-                                              prot, keep_flags, region_name);
                 uint32_t ext_end = (uint32_t)new_end;
                 if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
                     ext_end <= RT32_MMAP_TOP_32) {
@@ -370,26 +438,81 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
 
     bool     is_fixed = (flags & RT32_MREMAP_FIXED) != 0U;
-    uint32_t rw_prot  = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
-    uint32_t new_va   = vm_mmap2_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
-                                        rw_prot, map_flags | (is_fixed ? RT32_MAP_FIXED : 0U),
-                                        -1, 0U);
-    if (new_va > 0xFFFFF000U) {
-        vm_sync_to_ctx(ctx);
-        vm_lock_release();
-        return new_va;
+    uint32_t new_va   = 0U;
+    if (orig_back.fd >= 0 && (keep_flags & 0x01U) != 0U) {
+        /* File-backed MAP_SHARED move: map the backing fd directly at new_va. */
+        uint32_t map_prot = (orig_back.darw_sync != 0U)
+            ? ((prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE))
+            : prot;
+        uint32_t pgoff = (uint32_t)(orig_back.file_off / (uint64_t)MIPS32_PAGE_SIZE);
+        new_va = vm_mmap2_ext_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
+                                     map_prot, keep_flags | (is_fixed ? RT32_MAP_FIXED : 0U),
+                                     orig_back.fd, pgoff, false, region_name);
+        if (new_va > 0xFFFFF000U) {
+            vm_sync_to_ctx(ctx);
+            vm_lock_release();
+            return new_va;
+        }
+        if (orig_back.darw_sync != 0U) {
+            size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+            memcpy(mips32_guest_ptr(ctx, new_va), mips32_guest_ptr(ctx, old_addr), copy_bytes);
+            if (prot != map_prot) {
+                (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+            }
+        }
+    } else {
+        uint32_t rw_prot = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
+        new_va = vm_mmap2_ext_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
+                                     rw_prot, anon_flags | (is_fixed ? RT32_MAP_FIXED : 0U),
+                                     -1, 0U, false, region_name);
+        if (new_va > 0xFFFFF000U) {
+            vm_sync_to_ctx(ctx);
+            vm_lock_release();
+            return new_va;
+        }
+#ifdef __linux__
+        if (orig_back.fd < 0 && (keep_flags & 0x01U) != 0U) {
+            /* Anonymous MAP_SHARED move on Linux: preserve shared pages via host mremap. */
+            void *mres = mremap(mips32_guest_ptr(ctx, old_addr), (size_t)old_aligned,
+                                (size_t)new_aligned, MREMAP_MAYMOVE | MREMAP_FIXED,
+                                mips32_guest_ptr(ctx, new_va));
+            if (mres != MAP_FAILED) {
+                if (prot != rw_prot) {
+                    (void)mprotect(mips32_guest_ptr(ctx, new_va), (size_t)new_aligned,
+                                   mips32_host_prot(ctx, prot));
+                }
+                (void)vm_record_region_backed_locked(new_va,
+                    (uint32_t)((uint64_t)new_va + new_aligned),
+                    prot, keep_flags, region_name, orig_back);
+                (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+                vm_sync_to_ctx(ctx);
+                vm_lock_release();
+                vm_invalidate_all(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
+                if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {
+                    vm_invalidate_all(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
+                }
+                return new_va;
+            }
+        }
+#endif
+        if ((prot & 0x1U) == 0U) {
+            (void)mprotect(mips32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+        }
+        size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+        memcpy(mips32_guest_ptr(ctx, new_va), mips32_guest_ptr(ctx, old_addr), copy_bytes);
+        if (orig_back.fd >= 0 && new_aligned > old_aligned) {
+            (void)pread_full(orig_back.fd,
+                             (uint8_t *)mips32_guest_ptr(ctx, new_va) + old_aligned,
+                             (size_t)(new_aligned - old_aligned),
+                             (off_t)(orig_back.file_off + old_aligned));
+        }
+        if (prot != 0x3U) {
+            (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+        }
+        vm_backing_t new_back = { orig_back.fd, orig_back.file_off, 0U };
+        (void)vm_record_region_backed_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
+                                             prot, keep_flags, region_name, new_back);
     }
-
-    if ((prot & 0x1U) == 0U) {
-        (void)mprotect(mips32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
-    }
-    size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
-    memcpy(mips32_guest_ptr(ctx, new_va), mips32_guest_ptr(ctx, old_addr), copy_bytes);
-    if (prot != 0x3U) {
-        (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
-    }
-    (void)vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
-                                  prot, keep_flags, region_name);
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
     vm_sync_to_ctx(ctx);
     vm_lock_release();

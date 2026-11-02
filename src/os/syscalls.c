@@ -52,6 +52,7 @@
 
 #include "os/syscall_nr.h"
 #include "os/syscalls_priv.h"
+#include "rt32/rt32.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -102,59 +103,19 @@ int32_t mips_sc_ret(mips32_ctx_t *ctx, int32_t raw)
 int mips_sc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                      uint32_t need)
 {
-    uint64_t end64;
-    uint32_t cur;
-    size_t   i;
-
-    if (len == 0U) {
-        return 1;
-    }
-    end64 = (uint64_t)va + (uint64_t)len;
-    if (end64 > 0x100000000ULL) {
-        return 0;
-    }
-    cur = va;
-    for (i = 0; i < ctx->region_count; i++) {
-        const mips32_region_t *r = &ctx->regions[i];
-        if (r->start > cur) {
-            return 0; /* sorted gap: nothing later can cover cur */
-        }
-        if (r->end <= cur) {
-            continue;
-        }
-        if ((r->prot & need) != need) {
-            return 0;
-        }
-        cur = r->end;
-        if ((uint64_t)cur >= end64) {
-            return 1;
-        }
-    }
-    return 0;
+    return mips32_range_ok(ctx, va, len, need);
 }
 
 int mips_sc_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va,
                       uint32_t len)
 {
-    if (!mips_sc_range_ok(ctx, va, len, (uint32_t)PROT_READ)) {
-        return -EFAULT;
-    }
-    if (len > 0U) {
-        memcpy(dst, mips32_guest_ptr(ctx, va), (size_t)len);
-    }
-    return 0;
+    return rt32_vm_copy_from(ctx, dst, va, len);
 }
 
 int mips_sc_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src,
                     uint32_t len)
 {
-    if (!mips_sc_range_ok(ctx, va, len, (uint32_t)PROT_WRITE)) {
-        return -EFAULT;
-    }
-    if (len > 0U) {
-        memcpy(mips32_guest_ptr(ctx, va), src, (size_t)len);
-    }
-    return 0;
+    return rt32_vm_copy_to(ctx, va, src, len);
 }
 
 uint32_t mips_sc_ld32(const uint8_t *p, int be);

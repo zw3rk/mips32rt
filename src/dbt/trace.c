@@ -135,6 +135,12 @@ void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b)
     case MIPS32_EXIT_UNDEF:
         trace_range(ctx, start, replay_bound(ctx, start, end, 0));
         return;
+    case MIPS32_EXIT_BRANCH:
+        if (ctx->exit_info == 1U && end >= start + 4U) {
+            trace_range(ctx, start, end - 4U);
+            return;
+        }
+        break;
     default:
         break;
     }

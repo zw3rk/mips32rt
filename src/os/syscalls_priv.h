@@ -133,9 +133,15 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp);
  * attribute correctly), getpid elsewhere. Harness-only; never affects
  * guest execution. */
 long mips_trace_tid(void);
-/* Explicit-code frame build + SIG_IGN query (defined in signals.c). */
-int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
-    uint32_t fault_addr);
-int mips_signal_is_ignored(int signo);
+/* Explicit-code frame build + signal disposition/mask/pending helpers. */
+int  mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
+                           uint32_t fault_addr);
+int  mips_signal_is_ignored(int signo);
+int  mips_signal_default_ignore(int signo);
+int  mips_signal_default_stop(int signo);
+void mips_signal_default_die(int signo);
+int  mips_signal_is_blocked(const mips32_ctx_t *ctx, int signo);
+void mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code);
+void mips_signal_deliver_pending(mips32_ctx_t *ctx);
 
 #endif /* MIPS32_SYSCALLS_PRIV_H */

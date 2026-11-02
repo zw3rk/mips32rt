@@ -27,7 +27,7 @@ docker exec "$NAME" sh -c '
     qemu-mipsel --version | head -1
     echo "--- build LE ---"
     mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -std=c11 -Wall -Wextra \
-        -o /tmp/p1-le /w/tests/test_p1_isa.c
+        -o /tmp/p1-le /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
     mipsel-linux-gnu-readelf -h /tmp/p1-le | grep -E "Class|Machine|Data"
     echo "--- run LE under qemu-mipsel ---"
     timeout --kill-after=30s 60s qemu-mipsel /tmp/p1-le
@@ -44,7 +44,7 @@ docker exec "$NAME" sh -c '
     qemu-mips --version | head -1
     echo "--- build BE ---"
     mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -std=c11 -Wall -Wextra \
-        -o /tmp/p1-be /w/tests/test_p1_isa.c
+        -o /tmp/p1-be /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
     mips-linux-gnu-readelf -h /tmp/p1-be | grep -E "Class|Machine|Data"
     echo "--- run BE under qemu-mips ---"
     timeout --kill-after=30s 60s qemu-mips /tmp/p1-be

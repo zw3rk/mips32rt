@@ -198,6 +198,15 @@ typedef struct mips32_ctx {
     /* Wave U3-R3: full 64-bit LL epoch snapshot. Appended at the very
      * end so every pinned offset above is unchanged. */
     uint64_t ll_epoch_snap;
+
+    /* Authoritative VMA mirror generation (M32-9) + per-thread signal
+     * mask, pending signals, and nested signal-frame stack (M32-8, M32-12). */
+    uint64_t vm_gen;
+    uint32_t sig_blocked[4];
+    uint32_t sig_pending[4];
+    int32_t  sig_pending_code[129];
+    uint32_t sig_frame_sp[8];
+    unsigned sig_depth;
 } mips32_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */
@@ -269,6 +278,53 @@ static inline uint32_t mips32_page_down(uint32_t x)
 static inline uint32_t mips32_page_up(uint32_t x)
 {
     return (x + (MIPS32_PAGE_SIZE - 1U)) & ~(MIPS32_PAGE_SIZE - 1U);
+}
+
+void rt32_vm_sync_ctx(mips32_ctx_t *ctx);
+
+/* True when [va, va+len) is covered by recorded regions with (prot & need) == need. */
+static inline int mips32_range_ok(const mips32_ctx_t *ctx, uint32_t va,
+                                  uint32_t len, uint32_t need)
+{
+    uint64_t end64;
+    uint32_t cur;
+    size_t   i;
+
+    if (ctx == NULL) {
+        return 0;
+    }
+    if (len == 0U) {
+        return 1;
+    }
+    end64 = (uint64_t)va + (uint64_t)len;
+    if (end64 > 0x100000000ULL) {
+        return 0;
+    }
+    rt32_vm_sync_ctx((mips32_ctx_t *)(uintptr_t)ctx);
+    cur = va;
+    for (i = 0U; i < ctx->region_count; i++) {
+        const mips32_region_t *r = &ctx->regions[i];
+        if (r->start > cur) {
+            return 0;
+        }
+        if (r->end <= cur) {
+            continue;
+        }
+        if ((r->prot & need) != need) {
+            return 0;
+        }
+        cur = r->end;
+        if ((uint64_t)cur >= end64) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline int mips32_range_mapped(const mips32_ctx_t *ctx, uint32_t va,
+                                      uint32_t len)
+{
+    return mips32_range_ok(ctx, va, len, 0U);
 }
 
 /*

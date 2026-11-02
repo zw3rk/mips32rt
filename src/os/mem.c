@@ -192,32 +192,7 @@ int guest_mem_init(mips32_ctx_t *ctx)
 static int range_covered(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                          uint32_t need)
 {
-    uint64_t end64;
-    uint32_t cur;
-    size_t   i;
-
-    if (ctx == NULL || len == 0U) {
-        return ctx != NULL && len == 0U;
-    }
-    end64 = (uint64_t)va + (uint64_t)len;
-    if (end64 > 0x100000000ULL) {
-        return 0;
-    }
-    cur = va;
-    for (i = 0; i < ctx->region_count; i++) {
-        const mips32_region_t *r = &ctx->regions[i];
-        if (r->start > cur || r->end <= cur) {
-            continue;
-        }
-        if ((r->prot & need) != need) {
-            return 0;
-        }
-        cur = r->end;
-        if ((uint64_t)cur >= end64) {
-            return 1;
-        }
-    }
-    return (uint64_t)cur >= end64;
+    return mips32_range_ok(ctx, va, len, need);
 }
 
 /* Lane L4a queries (src/os/signals.c): true when signo has a real

@@ -256,6 +256,13 @@ int rt32_open_guest_ro(const mips32_ctx_t *ctx, const char *guest_path)
     return open(guest_path, O_RDONLY | O_CLOEXEC);
 }
 
+int rt32_elf_validate(const mips32_ctx_t *ctx, int exec_fd)
+{
+    (void)ctx;
+    (void)exec_fd;
+    return -1;
+}
+
 int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path,
                   rt32_elf_info_t *out_info)
 {

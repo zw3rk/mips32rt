@@ -818,10 +818,7 @@ static int fp_move_op(a64_buf_t *b, const mips_dec_t *d, int be)
     } else {
         fp_store_w(b, v, off, be);
     }
-    /* MTC1/MTHC1 write raw integer bits: the fresh value is untested,
-     * so clear the lane's NaN tracking.  Cache entries are dropped by
-     * fp_store_w (same-reg plus the pair double); the write-through
-     * ctx stays exact for every other lane. */
+    /* MTC1/MTHC1 write raw integer bits: clear the lane's NaN tracking. */
     if (d->rs == FP_RS_MTC1 || d->rs == FP_RS_MTHC1) {
         b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
     }

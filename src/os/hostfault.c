@@ -104,8 +104,9 @@ static void hf_handler(int signo, siginfo_t *si, void *uc)
     /* The faulting instruction must live in emitted code; the data
      * address in si_addr is unrelated to the pool range. */
     pc = hf_fault_pc(uc);
-    if (pc == NULL || pc < hf_pool ||
-        (uintptr_t)pc >= (uintptr_t)hf_pool + hf_pool_len) {
+    if (pc == NULL || hf_pool == NULL ||
+        (uintptr_t)pc < (uintptr_t)hf_pool ||
+        (uintptr_t)pc - (uintptr_t)hf_pool >= hf_pool_len) {
         hf_chain(signo, si);
         return;
     }

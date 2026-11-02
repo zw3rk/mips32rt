@@ -39,8 +39,8 @@ docker exec "$NAME" sh -c \
 
 docker exec "$NAME" sh -c '
     set -eu
-    mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -o /tmp/p1-le /w/tests/test_p1_isa.c
-    mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -o /tmp/p1-be /w/tests/test_p1_isa.c
+    mipsel-linux-gnu-gcc -march=mips32r2 -static -O1 -o /tmp/p1-le /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
+    mips-linux-gnu-gcc -march=mips32r2 -EB -static -O1 -o /tmp/p1-be /w/tests/test_p1_isa.c /w/tests/test_p1_isa_part2.c
     # NB: the "|| xxx=$?" guards are load-bearing: without them set -eu
     # would abort before the EXIT trailer is recorded on a guest failure.
     timeout --kill-after=30s 120s /w/_build/mips32rt --interp -- /tmp/p1-le > /tmp/rc1-le.txt 2>&1 || le_rc=$?

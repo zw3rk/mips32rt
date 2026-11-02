@@ -331,6 +331,10 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
      * inherited list is an RC4 follow-up; see header comment). */
     t->ctx.robust_list_head = 0U;
     t->ctx.robust_list_len  = 0U;
+    memset(t->ctx.sig_pending, 0, sizeof(t->ctx.sig_pending));
+    memset(t->ctx.sig_pending_code, 0, sizeof(t->ctx.sig_pending_code));
+    memset(t->ctx.sig_frame_sp, 0, sizeof(t->ctx.sig_frame_sp));
+    t->ctx.sig_depth = 0U;
     t->ctx.clear_child_tid =
         ((flags & MIPS_CLONE_CHILD_CLEARTID) != 0U) ? ctid : 0U;
     if ((flags & MIPS_CLONE_SETTLS) != 0U) {

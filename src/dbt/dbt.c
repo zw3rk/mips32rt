@@ -28,6 +28,7 @@
 #define _DARWIN_C_SOURCE 1
 #endif
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -81,8 +82,6 @@ typedef struct dbt_cache {
     dbt_ibtc_entry_t *ibtc;
     dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
     unsigned    ras_top;
-    dbt_smc_entry_t smc[DBT_SMC_TABLE_SIZE];
-    unsigned    smc_used_count; /* Wave P4: live SMC slots */
     uint8_t    *pool;
     size_t      pool_used;
     uint32_t    last_pc;
@@ -93,9 +92,21 @@ typedef struct dbt_cache {
     uint32_t    smc_memo_page; /* H3: last page resolved by dbt_smc_version */
     uint32_t    smc_memo_version;
     int         smc_memo_valid;
+    uint64_t    local_flush_epoch;
+    uint64_t    local_ver_epoch;
 } dbt_cache_t;
 
 static void dbt_ras_push(uint32_t pc);
+
+/* Process-wide shared SMC page-version table and epochs (M32-5, M32-6):
+ * any thread performing SMC / cacheflush / mprotect / munmap / SYNCI
+ * updates the shared table or bumps g_smc_flush_epoch, and every thread's
+ * local dbt_cache validates against the shared state. */
+static _Atomic uint32_t g_smc_lock = 0U;
+static dbt_smc_entry_t  g_smc_table[DBT_SMC_TABLE_SIZE];
+static _Atomic uint32_t g_smc_used_count = 0U;
+static _Atomic uint64_t g_smc_flush_epoch = 1U;
+static _Atomic uint64_t g_smc_ver_epoch = 1U;
 
 /* RC4 threads: one cache per host thread.  A shared cache would race
  * concurrent compiles (bump allocator, block/ibtc/ras tables, SMC
@@ -109,27 +120,14 @@ static __thread dbt_cache_t *dbt_cache;
 static int dbt_is_control(const mips_dec_t *d)
 {
     switch (d->op) {
-    case DBT_OP_J:
-    case DBT_OP_JAL:
-    case DBT_OP_BEQ:
-    case DBT_OP_BNE:
-    case DBT_OP_BLEZ:
-    case DBT_OP_BGTZ:
-    case DBT_OP_BEQL:
-    case DBT_OP_BNEL:
-    case DBT_OP_BLEZL:
-    case DBT_OP_BGTZL:
+    case DBT_OP_J:    case DBT_OP_JAL:
+    case DBT_OP_BEQ:  case DBT_OP_BNE:  case DBT_OP_BLEZ:  case DBT_OP_BGTZ:
+    case DBT_OP_BEQL: case DBT_OP_BNEL: case DBT_OP_BLEZL: case DBT_OP_BGTZL:
         return 1;
     case DBT_OP_REGIMM:
         switch (d->rt) {
-        case 0x00U:
-        case 0x01U:
-        case 0x02U:
-        case 0x03U:
-        case 0x10U:
-        case 0x11U:
-        case 0x12U:
-        case 0x13U:
+        case 0x00U: case 0x01U: case 0x02U: case 0x03U:
+        case 0x10U: case 0x11U: case 0x12U: case 0x13U:
             return 1;
         default:
             return 0;
@@ -138,25 +136,6 @@ static int dbt_is_control(const mips_dec_t *d)
         return d->rs == DBT_COP1_BC;
     case DBT_OP_SPECIAL:
         return d->funct == 0x08U || d->funct == 0x09U;
-    default:
-        return 0;
-    }
-}
-
-/* True for likely branches (delay slot annulled when not taken, SPEC 2.2). */
-__attribute__((unused)) static int dbt_is_likely(const mips_dec_t *d)
-{
-    switch (d->op) {
-    case DBT_OP_BEQL:
-    case DBT_OP_BNEL:
-    case DBT_OP_BLEZL:
-    case DBT_OP_BGTZL:
-        return 1;
-    case DBT_OP_REGIMM:
-        return d->rt == 0x02U || d->rt == 0x03U || d->rt == 0x12U ||
-            d->rt == 0x13U;
-    case DBT_OP_COP1:
-        return d->rs == DBT_COP1_BC && (d->rt & 0x02U) != 0U;
     default:
         return 0;
     }
@@ -236,37 +215,55 @@ static int dbt_pool_ensure(mips32_ctx_t *ctx)
     return dbt_cache->pool == MAP_FAILED ? -1 : 0;
 }
 
-/* Drop every cached translation (pool exhaustion or explicit SMC flush).
- * Wave P5: also disables the trampoline inline IBTC fast path. */
-static void dbt_flush_all(mips32_ctx_t *ctx)
+/* Flush the calling thread's local translation cache and sync its flush epoch. */
+static void dbt_flush_local(mips32_ctx_t *ctx)
 {
     size_t i;
 
     if (ctx != NULL) {
         ctx->ibtc_ptr = 0U;
     }
-
+    if (dbt_cache == NULL) {
+        return;
+    }
     for (i = 0; i < DBT_MAX_BLOCKS; i++) {
         dbt_cache->blocks[i].code = NULL;
         dbt_cache->blocks[i].code_len = 0;
         dbt_cache->block_link[i] = 0;
     }
-    for (i = 0; i < MIPS32_IBTC_SIZE; i++) {
-        dbt_cache->ibtc[i].code = NULL;
+    if (dbt_cache->ibtc != NULL) {
+        for (i = 0; i < MIPS32_IBTC_SIZE; i++) {
+            dbt_cache->ibtc[i].code = NULL;
+        }
     }
     for (i = 0; i < MIPS32_RAS_SIZE; i++) {
         dbt_cache->ras[i].code = NULL;
     }
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        dbt_cache->smc[i].used = 0U;
-    }
     dbt_cache->block_count = 0;
     dbt_cache->ras_top = 0;
-    dbt_cache->smc_used_count = 0;
     dbt_cache->pool_used = 0;
     dbt_cache->last_valid = 0;
     dbt_cache->last_bi = 0;
     dbt_cache->smc_memo_valid = 0;
+    dbt_cache->local_flush_epoch =
+        atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire);
+}
+
+/* Drop every cached translation across all threads (explicit global SMC flush). */
+static void dbt_flush_all(mips32_ctx_t *ctx)
+{
+    size_t i;
+
+    mips32_spin_lock(&g_smc_lock);
+    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
+        g_smc_table[i].used = 0U;
+    }
+    atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
+    mips32_spin_unlock(&g_smc_lock);
+
+    dbt_flush_local(ctx);
 }
 
 static int dbt_cache_ensure(mips32_ctx_t *ctx)
@@ -279,6 +276,8 @@ static int dbt_cache_ensure(mips32_ctx_t *ctx)
         if (dbt_cache == NULL) {
             return -1;
         }
+        dbt_cache->local_flush_epoch =
+            atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire);
     }
     if (dbt_cache->ibtc == NULL) {
         dbt_cache->ibtc = (dbt_ibtc_entry_t *)calloc(MIPS32_IBTC_SIZE,
@@ -286,7 +285,10 @@ static int dbt_cache_ensure(mips32_ctx_t *ctx)
         if (dbt_cache->ibtc == NULL) {
             return -1;
         }
-        ctx->ibtc_ptr = (uint64_t)(uintptr_t)dbt_cache->ibtc;
+        if (atomic_load_explicit(&g_smc_used_count, memory_order_acquire) == 0U &&
+            atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire) == 1U) {
+            ctx->ibtc_ptr = (uint64_t)(uintptr_t)dbt_cache->ibtc;
+        }
     }
     if (dbt_pool_ensure(ctx) != 0) {
         return -1;
@@ -298,30 +300,33 @@ uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page)
 {
     size_t i;
     uint32_t v = 1U;
+    uint64_t ver_ep;
 
     (void)ctx;
-    if (dbt_cache == NULL) {
+    if (atomic_load_explicit(&g_smc_used_count, memory_order_acquire) == 0U) {
         return 1U;
     }
-    /* Wave P4: no live SMC slots means no page can have a version;
-     * skip the 1024-slot scan (cross-page loops hit this). */
-    if (dbt_cache->smc_used_count == 0U) {
-        return 1U;
-    }
-    /* H3: hot loops re-query 1-2 pages per dispatch; memoize the last
-     * resolution instead of scanning all 1024 slots every time. */
-    if (dbt_cache->smc_memo_valid != 0 && dbt_cache->smc_memo_page == page) {
+    ver_ep = atomic_load_explicit(&g_smc_ver_epoch, memory_order_acquire);
+    if (dbt_cache != NULL && dbt_cache->smc_memo_valid != 0 &&
+        dbt_cache->smc_memo_page == page &&
+        dbt_cache->local_ver_epoch == ver_ep) {
         return dbt_cache->smc_memo_version;
     }
+    mips32_spin_lock(&g_smc_lock);
+    ver_ep = atomic_load_explicit(&g_smc_ver_epoch, memory_order_relaxed);
     for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (dbt_cache->smc[i].used != 0U && dbt_cache->smc[i].page == page) {
-            v = dbt_cache->smc[i].version;
+        if (g_smc_table[i].used != 0U && g_smc_table[i].page == page) {
+            v = g_smc_table[i].version;
             break;
         }
     }
-    dbt_cache->smc_memo_page = page;
-    dbt_cache->smc_memo_version = v;
-    dbt_cache->smc_memo_valid = 1;
+    mips32_spin_unlock(&g_smc_lock);
+    if (dbt_cache != NULL) {
+        dbt_cache->smc_memo_page = page;
+        dbt_cache->smc_memo_version = v;
+        dbt_cache->local_ver_epoch = ver_ep;
+        dbt_cache->smc_memo_valid = 1;
+    }
     return v;
 }
 
@@ -333,29 +338,46 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
     if (ctx != NULL) {
         ctx->ibtc_ptr = 0U;
     }
-    if (dbt_cache == NULL) {
-        return;
+    if (dbt_cache != NULL) {
+        dbt_cache->smc_memo_valid = 0;
     }
+    mips32_spin_lock(&g_smc_lock);
     for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (dbt_cache->smc[i].used != 0U && dbt_cache->smc[i].page == page) {
-            dbt_cache->smc[i].version += 1U;
-            if (dbt_cache->smc[i].version == 0U) {
-                dbt_cache->smc[i].version = 1U;
+        if (g_smc_table[i].used != 0U && g_smc_table[i].page == page) {
+            g_smc_table[i].version += 1U;
+            if (g_smc_table[i].version == 0U) {
+                g_smc_table[i].version = 1U;
             }
-            dbt_cache->smc_memo_valid = 0;
+            atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U,
+                memory_order_release);
+            mips32_spin_unlock(&g_smc_lock);
             return;
         }
     }
     for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (dbt_cache->smc[i].used == 0U) {
-            dbt_cache->smc[i].page = page;
-            dbt_cache->smc[i].version = 2U;
-            dbt_cache->smc[i].used = 1U;
-            dbt_cache->smc_used_count++;
-            dbt_cache->smc_memo_valid = 0;
+        if (g_smc_table[i].used == 0U) {
+            g_smc_table[i].page = page;
+            g_smc_table[i].version = 2U;
+            g_smc_table[i].used = 1U;
+            atomic_fetch_add_explicit(&g_smc_used_count, 1U,
+                memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U,
+                memory_order_release);
+            mips32_spin_unlock(&g_smc_lock);
             return;
         }
     }
+    /* M32-6: when all DBT_SMC_TABLE_SIZE slots are occupied, flush all
+     * threads' caches and reset the shared SMC table rather than dropping
+     * the invalidation. */
+    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
+        g_smc_table[i].used = 0U;
+    }
+    atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
+    mips32_spin_unlock(&g_smc_lock);
+    dbt_flush_local(ctx);
 }
 
 static void dbt_ibtc_fill(uint32_t pc, void *code, uint32_t smc, size_t bi)
@@ -377,8 +399,8 @@ void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
     uint64_t span;
     uint32_t page;
 
-    if (ctx == NULL || dbt_cache == NULL || end <= start) {
-        if (ctx != NULL && dbt_cache != NULL && end != start) {
+    if (end <= start) {
+        if (end != start) {
             dbt_flush_all(ctx);
         }
         return;
@@ -424,6 +446,15 @@ static void *dbt_lookup_bi(mips32_ctx_t *ctx, uint32_t pc, size_t *bip)
 
     if (ctx == NULL || dbt_cache == NULL || dbt_cache->ibtc == NULL) {
         return NULL;
+    }
+    if (dbt_cache->local_flush_epoch !=
+        atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire)) {
+        dbt_flush_local(ctx);
+        return NULL;
+    }
+    if (atomic_load_explicit(&g_smc_used_count, memory_order_acquire) != 0U ||
+        atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire) > 1U) {
+        ctx->ibtc_ptr = 0U;
     }
     smc = dbt_smc_version(ctx, mips32_page_down(pc));
     /* Single-entry direct-chaining memo: repeated self-loop dispatch. */
@@ -477,16 +508,7 @@ void *dbt_lookup(mips32_ctx_t *ctx, uint32_t pc)
     return dbt_lookup_bi(ctx, pc, NULL);
 }
 
-/* Wave P lane P4 in-trampoline chaining: resolve the next block for
- * ctx->pc through the normal validated lookup (direct memo, RAS, IBTC,
- * pool search, all smc_version-checked).  Returns the block entry, or
- * NULL to exit the chain: uncompiled target (the C dispatch loop
- * compiles it), or chaining disabled under --difftest / --trace where
- * instruction/block lockstep parity requires the C dispatch loop to
- * observe every block boundary.  Each chained block is counted so
- * stats match the non-chained path.  RAS pushes for link blocks are
- * skipped inside chains (RAS is a lookup accelerator only; misses
- * fall through to the IBTC). */
+/* Wave P4 in-trampoline chaining: resolve next block via validated lookup. */
 void *dbt_chain_next(mips32_ctx_t *ctx)
 {
     void *code;
@@ -494,8 +516,11 @@ void *dbt_chain_next(mips32_ctx_t *ctx)
     if (ctx == NULL || ctx->difftest_enabled || ctx->trace_enabled) {
         return NULL;
     }
-    /* Wave P4: the previous link block's return address is its
-     * guest_end; push it so the chained return hits the RAS. */
+    if (dbt_cache != NULL && dbt_cache->local_flush_epoch !=
+        atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire)) {
+        dbt_flush_local(ctx);
+        return NULL;
+    }
     if (dbt_cache != NULL && dbt_cache->last_valid != 0 &&
         dbt_cache->last_bi < dbt_cache->block_count &&
         dbt_cache->block_link[dbt_cache->last_bi] != 0U) {
@@ -552,7 +577,7 @@ static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
         return NULL;
     }
     if (dbt_cache->pool_used + len > DBT_CODE_POOL_SIZE) {
-        dbt_flush_all(ctx);
+        dbt_flush_local(ctx);
     }
     base = (uintptr_t)dbt_cache->pool;
     dst = (void *)(base + dbt_cache->pool_used);
@@ -680,7 +705,7 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
         return 1;
     }
     if (dbt_cache->block_count >= DBT_MAX_BLOCKS) {
-        dbt_flush_all(ctx);
+        dbt_flush_local(ctx);
         code = dbt_publish(ctx, staging, out_len);
         if (code == NULL) {
             return 1;
@@ -701,16 +726,7 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     return 0;
 }
 
-/*
- * Trace replay for --trace/--difftest parity: re-fetch the words in
- * [start, end) and print the same "I <tid> %08x %08x" lines the interpreter
- * prints at fetch time (the interpreter fetches an annulled likely
- * delay slot too, so the slot line is always replayed when mapped).
- * On fault exits the replay stops at the faulting word when it lies
- * inside the block.
- */
-/* Wave C2: trace replay lives in src/dbt/trace.c (file-size discipline);
- * this accessor exposes the block table it replays. */
+/* Wave C2: trace replay lives in src/dbt/trace.c; expose the block table. */
 size_t dbt_trace_table(const dbt_block_t **out)
 {
     if (out != NULL) {
@@ -726,9 +742,6 @@ static int dbt_step_fallback(mips32_ctx_t *ctx)
     ctx->exit_reason = MIPS32_EXIT_NONE;
     ctx->exit_info = 0;
     rc = interp_step(ctx);
-    /* RC4: interp delivered a synchronous fault to a guest handler
-     * (MIPS_FAULT with exit_reason cleared to NONE); resume the DBT
-     * loop at the handler instead of stopping. */
     if (rc == MIPS_FAULT && ctx->exit_reason == MIPS32_EXIT_NONE) {
         return 0;
     }
@@ -745,11 +758,7 @@ int dbt_main(mips32_ctx_t *ctx)
     if (ctx == NULL || dbt_cache_ensure(ctx) != 0) {
         return 1;
     }
-    /* Wave C2 --cache warm reload: validate an existing cache file
-     * (silent best-effort; failure runs the guest cold). */
     mips32_aot_warm(ctx);
-    /* RC4: translate host SIGSEGV/SIGBUS inside emitted code into guest
-     * fault delivery (src/os/hostfault.c). */
     mips_hostfault_install(dbt_cache->pool, DBT_CODE_POOL_SIZE);
     for (;;) {
         uint32_t pc = ctx->pc;
@@ -769,9 +778,6 @@ int dbt_main(mips32_ctx_t *ctx)
             int cr = dbt_compile(ctx, pc);
 
             if (cr == MIPS_FAULT) {
-                /* RC4: the fetch/compile fault may have been delivered
-                 * to a guest handler (exit_reason cleared to NONE);
-                 * resume dispatching at the handler. */
                 if (ctx->exit_reason == MIPS32_EXIT_NONE) {
                     continue;
                 }
@@ -794,24 +800,15 @@ int dbt_main(mips32_ctx_t *ctx)
                 continue;
             }
         }
-        /* H3: the lookup carries the block index; validate it instead
-         * of rescanning the whole cache per dispatch. */
         if (bi < dbt_cache->block_count &&
             dbt_cache->blocks[bi].guest_pc == pc &&
             dbt_cache->blocks[bi].code == code) {
             b = &dbt_cache->blocks[bi];
             have_b = 1;
         }
-        /* RC4: run the block under the host-fault guard, which owns
-         * both the checkpoint frame and the trampoline call (the
-         * frame must stay ancestral to the block).  A converted
-         * fault delivers and reports 1 (resume dispatching at the
-         * handler); a normal return leaves the reason in reason.
-         * Wave P5: arm the trampoline inline IBTC fast path, unless
-         * --difftest/--trace needs block-lockstep parity or any SMC
-         * write has been observed (then the C lookup runs). */
         if (ctx->difftest_enabled || ctx->trace_enabled ||
-            dbt_cache->smc_used_count != 0U) {
+            atomic_load_explicit(&g_smc_used_count, memory_order_acquire) != 0U ||
+            atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire) > 1U) {
             ctx->ibtc_ptr = 0U;
         } else {
             ctx->ibtc_ptr = (uint64_t)(uintptr_t)dbt_cache->ibtc;
@@ -847,23 +844,11 @@ int dbt_main(mips32_ctx_t *ctx)
         case MIPS32_EXIT_UNDEF:
         case MIPS32_EXIT_SINGLE_STEP:
         case MIPS32_EXIT_TRAP:
-            /* RC-U3 TIF_FIXADE: misaligned LH/LHU/LW/SH/SW with
-             * fixade_enabled arrive here (ALIGN exit); interp_step
-             * emulates the access and dispatch resumes. */
             if (dbt_step_fallback(ctx) != 0) {
                 return 1;
             }
             continue;
         case MIPS32_EXIT_FAULT: {
-            /* RC4: inline alignment/mapping exits carry the data address
-             * in exit_info; deliver like the mem layer (AdEL/AdES bus
-             * when misaligned, segv otherwise) and resume.  An
-             * undeliverable fault must die by signal (mips_trap),
-             * matching interp -- never stop quietly with rc 1.
-             * RC-U3 TIF_FIXADE: a misaligned inline exit with FIXADE
-             * set takes the SINGLE_STEP path (interp_step emulates),
-             * so a FAULT exit on a misaligned address can only be a
-             * mapping/permission failure -> SIGSEGV, never SIGBUS. */
             uint32_t info = ctx->exit_info;
             int signo = (ctx->fixade_enabled != 0U ||
                          (info & 3U) == 0U) ? 11 : 10;

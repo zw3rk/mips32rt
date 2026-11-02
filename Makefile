@@ -18,7 +18,7 @@ endif
 # src/main.c calls setenv(3), which musl hides under strict -std=c11 unless a
 # POSIX feature-test macro is visible; expose exactly that (keeps -pedantic
 # and every prescribed warning intact).
-CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
+CFLAGS  ?= -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror=vla -Werror -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 LDFLAGS ?= -static-pie -Wl,-z,max-page-size=4096
 
 # src/main.c plus every vendored rt32 core file (Lane L0a).  Later phases
@@ -41,7 +41,7 @@ OBJS       := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS))) $(OBJ_DIR
 MIPS32RT_BIN := $(BUILD_DIR)/mips32rt
 MIPS32RT_DARWIN_BIN := $(BUILD_DIR)/mips32rt-darwin
 DARWIN_CC     ?= cc
-DARWIN_CFLAGS ?= -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
+DARWIN_CFLAGS ?= -std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -Werror -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 
 help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
@@ -88,7 +88,7 @@ check: test check-line-limits check-abi-invariants ## Run all Phase 0 checks
 
 check-line-limits: ## Fail if any .c/.h/.S source file exceeds 900 lines
 	@fail=0; \
-	for f in $$(find src include -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+	for f in $$(find src include tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \
 		n=$$(wc -l < "$$f"); \
 		if [ "$$n" -gt 900 ]; then echo "LIMIT FAIL: $$f has $$n lines (>900)"; fail=1; fi; \
 	done; \

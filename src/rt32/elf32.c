@@ -599,6 +599,136 @@ static uint32_t interp_pick_base(mips32_ctx_t *ctx, uint64_t span)
     return 0U;
 }
 
+static int validate_elf32_image(int fd, uint32_t default_pie_base,
+                                char *interp_out, size_t interp_cap)
+{
+    elf32_ehdr_t ehdr;
+    elf32_phdr_t phdrs[64];
+    if (interp_out != NULL && interp_cap > 0U) {
+        interp_out[0] = '\0';
+    }
+    if (fd < 0 || pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
+        return -1;
+    }
+    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
+        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F' ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
+        (ehdr.e_ident[EI_DATA] != ELFDATA2LSB &&
+         ehdr.e_ident[EI_DATA] != ELFDATA2MSB)) {
+        return -1;
+    }
+    bool is_be = ehdr.e_ident[EI_DATA] == ELFDATA2MSB;
+    if (is_be) {
+        ehdr.e_type      = swap16(ehdr.e_type);
+        ehdr.e_machine   = swap16(ehdr.e_machine);
+        ehdr.e_entry     = swap32(ehdr.e_entry);
+        ehdr.e_phoff     = swap32(ehdr.e_phoff);
+        ehdr.e_flags     = swap32(ehdr.e_flags);
+        ehdr.e_phentsize = swap16(ehdr.e_phentsize);
+        ehdr.e_phnum     = swap16(ehdr.e_phnum);
+    }
+    if (ehdr.e_machine != EM_MIPS ||
+        (ehdr.e_flags & EF_MIPS_ABI2) != 0U ||
+        ((ehdr.e_flags & EF_MIPS_ABI) != 0U &&
+         (ehdr.e_flags & EF_MIPS_ABI) != E_MIPS_ABI_O32) ||
+        (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) ||
+        ehdr.e_phentsize != sizeof(elf32_phdr_t) ||
+        ehdr.e_phnum == 0U || ehdr.e_phnum > 64U ||
+        ehdr.e_entry == 0U || (ehdr.e_entry & 0x3U) != 0U) {
+        return -1;
+    }
+    size_t phdr_bytes = (size_t)ehdr.e_phnum * sizeof(elf32_phdr_t);
+    if (pread_full(fd, phdrs, phdr_bytes, (off_t)ehdr.e_phoff) != 0) {
+        return -1;
+    }
+    uint32_t min_vaddr = UINT32_MAX;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        if (is_be) {
+            phdrs[i].p_type   = swap32(phdrs[i].p_type);
+            phdrs[i].p_offset = swap32(phdrs[i].p_offset);
+            phdrs[i].p_vaddr  = swap32(phdrs[i].p_vaddr);
+            phdrs[i].p_filesz = swap32(phdrs[i].p_filesz);
+            phdrs[i].p_memsz  = swap32(phdrs[i].p_memsz);
+            phdrs[i].p_flags  = swap32(phdrs[i].p_flags);
+        }
+        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0U &&
+            phdrs[i].p_vaddr < min_vaddr) {
+            min_vaddr = phdrs[i].p_vaddr;
+        } else if (phdrs[i].p_type == PT_INTERP) {
+            if (interp_out == NULL || phdrs[i].p_filesz == 0U ||
+                phdrs[i].p_filesz >= interp_cap ||
+                pread_full(fd, interp_out, phdrs[i].p_filesz,
+                           (off_t)phdrs[i].p_offset) != 0) {
+                return -1;
+            }
+            interp_out[phdrs[i].p_filesz] = '\0';
+            if (interp_out[0] == '\0') {
+                return -1;
+            }
+        }
+    }
+    if (min_vaddr == UINT32_MAX) {
+        return -1;
+    }
+    uint32_t load_bias = (ehdr.e_type == ET_DYN && min_vaddr < 0x10000U)
+                         ? default_pie_base : 0U;
+    uint64_t entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
+    if (entry64 < 0x10000ULL || entry64 >= (uint64_t)MIPS32_TASK_SIZE_TOP) {
+        return -1;
+    }
+    uint32_t entry_pc     = (uint32_t)entry64;
+    uint32_t prev_seg_end = 0U;
+    bool     entry_in_load = false;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        const elf32_phdr_t *ph = &phdrs[i];
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0U) {
+            continue;
+        }
+        uint64_t seg_vaddr64 = (uint64_t)load_bias + (uint64_t)ph->p_vaddr;
+        uint64_t seg_end64   = seg_vaddr64 + (uint64_t)ph->p_memsz;
+        uint32_t page_start  = mips32_page_down((uint32_t)seg_vaddr64);
+        uint64_t map_end64   = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
+        if (ph->p_filesz > ph->p_memsz ||
+            seg_vaddr64 >= (uint64_t)MIPS32_TASK_SIZE_TOP ||
+            seg_end64 > (uint64_t)MIPS32_TASK_SIZE_TOP ||
+            (uint32_t)seg_vaddr64 < prev_seg_end ||
+            page_start < 0x10000U ||
+            map_end64 > (uint64_t)MIPS32_TASK_SIZE_TOP) {
+            return -1;
+        }
+        prev_seg_end = (uint32_t)seg_end64;
+        if ((ph->p_flags & PF_X) != 0U &&
+            entry_pc >= (uint32_t)seg_vaddr64 &&
+            (uint64_t)entry_pc + 1U <= seg_end64) {
+            entry_in_load = true;
+        }
+    }
+    return entry_in_load ? 0 : -1;
+}
+
+int rt32_elf_validate(const mips32_ctx_t *ctx, int exec_fd)
+{
+    char interp_path[256];
+    if (validate_elf32_image(exec_fd, 0x00400000U,
+                             interp_path, sizeof(interp_path)) != 0) {
+        return -1;
+    }
+    if (interp_path[0] != '\0') {
+        int ifd = rt32_open_guest_ro(ctx, interp_path);
+        if (ifd < 0) {
+            return -1;
+        }
+        uint64_t span = 0ULL;
+        int rc = (validate_elf32_image(ifd, 0x3F000000U, NULL, 0U) == 0 &&
+                  interp_measure_span(ifd, &span) == 0) ? 0 : -1;
+        close(ifd);
+        if (rc != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_info_t *out_info)
 {
     if (!ctx || !out_info) {
