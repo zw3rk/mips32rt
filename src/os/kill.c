@@ -53,6 +53,9 @@ extern long syscall(long __n, ...);
 #define KILL_SI_USER (-1)
 #define KILL_SI_TKILL (-6)
 
+/* MIPS EAGAIN (arch/mips/include/uapi/asm/errno.h): sigqueue overflow. */
+#define KILL_EAGAIN 11
+
 /* MIPS signal numbers (arch/mips/include/uapi/asm/signal.h). */
 #define KILL_SIGKILL   9
 #define KILL_SIGBUS    10
@@ -214,7 +217,11 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
         return mips_sc_ret(ctx, 0);
     }
     if (mips_signal_is_blocked(ctx, signo)) {
-        mips_signal_pend(ctx, signo, si_code);
+        /* M32-R3-5: a full real-time queue reports -EAGAIN (Linux
+         * sigqueue overflow) instead of losing the occurrence. */
+        if (mips_signal_pend(ctx, signo, si_code) != 0) {
+            return mips_sc_ret(ctx, -KILL_EAGAIN);
+        }
         return mips_sc_ret(ctx, 0);
     }
     if (!mips_signal_has_handler(signo)) {

@@ -29,11 +29,11 @@
 #endif
 
 _Atomic uint32_t g_vm_lock = 0U;
-static _Atomic uint64_t    g_vm_gen = 0U;
-mips32_ctx_t              *g_vm_root_ctx = NULL;
-static uint32_t            g_vm_brk_base = 0U;
-static uint32_t            g_vm_brk_curr = 0U;
-uint32_t                   g_vm_mmap_cursor = RT32_MMAP_BASE_32;
+_Atomic uint64_t g_vm_gen = 0U;
+mips32_ctx_t    *g_vm_root_ctx = NULL;
+uint32_t         g_vm_brk_base = 0U;
+uint32_t         g_vm_brk_curr = 0U;
+uint32_t         g_vm_mmap_cursor = RT32_MMAP_BASE_32;
 mips32_region_t            g_vm_regions[MIPS32_MAX_REGIONS];
 vm_backing_t               g_vm_backing[MIPS32_MAX_REGIONS];
 size_t                     g_vm_region_count = 0U;
@@ -87,6 +87,8 @@ void vm_invalidate_jit(mips32_ctx_t *ctx, uint32_t start, uint32_t end)
     }
 }
 
+void vm_copy_state_to_ctx(mips32_ctx_t *dst);
+
 void vm_sync_from_ctx(mips32_ctx_t *ctx)
 {
     if (ctx->brk_base != 0U && g_vm_brk_base != ctx->brk_base) {
@@ -95,14 +97,75 @@ void vm_sync_from_ctx(mips32_ctx_t *ctx)
     }
 }
 
+/* M32-R3-1: a brk-only bump used to stamp the latest generation onto
+ * the caller without copying g_vm_regions, so a thread that queried
+ * brk(0) after a peer changed mappings skipped the stale table until
+ * the next VM mutation.  Always publish the full snapshot with the
+ * new generation (same cost as vm_sync_to_ctx; brk is not hot). */
 void vm_sync_brk_to_ctx(mips32_ctx_t *ctx)
 {
     (void)atomic_fetch_add_explicit(&g_vm_gen, 1U, memory_order_release);
-    if (g_vm_brk_base != 0U) {
-        ctx->brk_base = g_vm_brk_base;
-        ctx->brk_curr = g_vm_brk_curr;
+    vm_copy_state_to_ctx(ctx);
+}
+
+/* M32-R3-3: host-page protection union.  On 16 KiB hosts one host page
+ * covers four 4 KiB guest VMAs that may carry different guest
+ * protections.  The host page must grant the union of the overlapping
+ * guest permissions: the restrictive choice faults valid neighbor
+ * stores, while guest-level checks (range_covered) still reject
+ * accesses the guest mapping does not allow.  Caller holds g_vm_lock. */
+int vm_union_host_prot_locked(uint32_t start, uint32_t end)
+{
+    int prot = PROT_NONE;
+
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+
+        if (r->end <= start || r->start >= end) {
+            continue;
+        }
+        prot |= mips32_host_prot(g_vm_root_ctx, r->prot);
     }
-    ctx->vm_gen = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
+    return prot;
+}
+
+/* Restore the host protection of exactly [start, end) from the union
+ * above (16 KiB-rounded on Apple, exact elsewhere).  Use after every
+ * temporary elevation instead of a single VMA's protection. */
+void vm_host_restore_locked(uint32_t start, uint32_t end)
+{
+    uint32_t h_s;
+    uint32_t h_e;
+    int      prot;
+
+    if (g_vm_root_ctx == NULL || start >= end) {
+        return;
+    }
+#ifdef __APPLE__
+    h_s = start & ~0x3FFFU;
+    h_e = (end + 0x3FFFU) & ~0x3FFFU;
+#else
+    h_s = start;
+    h_e = end;
+#endif
+    prot = vm_union_host_prot_locked(h_s, h_e);
+    (void)mprotect(mips32_guest_ptr(g_vm_root_ctx, h_s), (size_t)(h_e - h_s), prot);
+}
+
+/* Coordinated fork (cross-RT Round-3 class): the forking thread owns
+ * no VM-table mutation (syscall dispatch never holds g_vm_lock), so
+ * prepare simply acquires it to quiesce peers; the parent releases,
+ * and the child releases the uncontended lock (no vanished thread can
+ * hold it past prepare).  Lock order is VM outermost, then signal,
+ * DBT/SMC, and LL locks (see src/os/fork.c). */
+void vm_fork_prepare(void)
+{
+    vm_lock_acquire();
+}
+
+void vm_fork_release(void)
+{
+    vm_lock_release();
 }
 
 void vm_copy_state_to_ctx(mips32_ctx_t *dst)
@@ -498,128 +561,7 @@ int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
     return 0;
 }
 
-static int try_reserve_window(uint64_t base)
-{
-    if ((base & (MIPS32_PAGE_SIZE - 1ULL)) != 0ULL || base > UINT64_MAX - RT32_WINDOW_SIZE) {
-        return -1;
-    }
-#ifdef __APPLE__
-    if (base == 0ULL || (base & 0x3FFFULL) != 0ULL) {
-        return -1;
-    }
-    void *res = mmap((void *)(uintptr_t)base, (size_t)RT32_WINDOW_SIZE, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (res == MAP_FAILED) {
-        return -1;
-    }
-    if ((uint64_t)(uintptr_t)res != base) {
-        munmap(res, (size_t)RT32_WINDOW_SIZE);
-        return -1;
-    }
-    return 0;
-#else
-    uint64_t map_start = (base == 0ULL) ? (uint64_t)MIPS32_LOW_GUARD_SIZE : base;
-    uint64_t map_len   = (base == 0ULL) ? (RT32_WINDOW_SIZE - (uint64_t)MIPS32_LOW_GUARD_SIZE)
-                                        : RT32_WINDOW_SIZE;
-
-    void *res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (res == MAP_FAILED && (errno == EINVAL || errno == EOPNOTSUPP)) {
-        res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-    if (res == MAP_FAILED) {
-        return -1;
-    }
-    if ((uint64_t)(uintptr_t)res != map_start) {
-        munmap(res, (size_t)map_len);
-        return -1;
-    }
-    return 0;
-#endif
-}
-
-int rt32_vm_init(mips32_ctx_t *ctx, uint64_t requested_window)
-{
-    if (!ctx) {
-        return -1;
-    }
-
-    uint64_t base = requested_window;
-    bool     has_explicit = (requested_window != UINT64_MAX);
-
-    if (!has_explicit) {
-        const char *env_win = getenv("MIPS32RT_WINDOW");
-        if (env_win && env_win[0] != '\0') {
-            char *endp = NULL;
-            errno = 0;
-            unsigned long long val = strtoull(env_win, &endp, 0);
-            if (strchr(env_win, '-') != NULL || errno == ERANGE || !endp ||
-                endp == env_win || *endp != '\0' || (uint64_t)val == UINT64_MAX) {
-                fprintf(stderr, "mips32rt: invalid MIPS32RT_WINDOW '%s'\n", env_win);
-                return -1;
-            }
-            base = (uint64_t)val;
-            has_explicit = true;
-        }
-    }
-
-    if (has_explicit) {
-        if (try_reserve_window(base) != 0) {
-            fprintf(stderr, "mips32rt: failed to reserve guest window at 0x%llx\n",
-                    (unsigned long long)base);
-            return -1;
-        }
-        ctx->guest_base = base;
-    } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
-               try_reserve_window(ctx->host_info.window_hint) == 0) {
-        ctx->guest_base = ctx->host_info.window_hint;
-    } else {
-        /* Try G = 0 first; if occupied, scan 4 GiB-aligned windows [4G, 64G). */
-        if (try_reserve_window(0ULL) == 0) {
-            ctx->guest_base = 0ULL;
-        } else {
-            bool found = false;
-            for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
-                if (try_reserve_window(cand) == 0) {
-                    ctx->guest_base = cand;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-#ifdef __APPLE__
-                void *any = mmap(NULL, (size_t)RT32_WINDOW_SIZE, PROT_NONE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (any != MAP_FAILED) {
-                    ctx->guest_base = (uint64_t)(uintptr_t)any;
-                    found = true;
-                }
-#endif
-                if (!found) {
-                    fprintf(stderr, "mips32rt: unable to find free 4 GiB guest window\n");
-                    return -1;
-                }
-            }
-        }
-    }
-
-    vm_lock_acquire();
-    g_vm_root_ctx     = ctx;
-    g_vm_brk_base     = 0U;
-    g_vm_brk_curr     = 0U;
-    g_vm_mmap_cursor  = RT32_MMAP_BASE_32;
-    g_vm_region_count = 0U;
-    for (size_t i = 0U; i < MIPS32_MAX_REGIONS; i++) {
-        g_vm_backing[i] = (vm_backing_t){ -1, 0U, 0U, 0U, 0U };
-    }
-    atomic_store_explicit(&g_vm_gen, 1U, memory_order_release);
-    ctx->mmap_cursor  = RT32_MMAP_BASE_32;
-    ctx->region_count = 0U;
-    ctx->vm_gen       = 1U;
-    vm_lock_release();
-    return 0;
-}
+/* Window reservation and rt32_vm_init live in vm_init.c. */
 
 int rt32_vm_record_region(mips32_ctx_t *ctx, uint32_t start, uint32_t end,
                          uint32_t prot, uint32_t flags, const char *name)
@@ -726,6 +668,12 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
 #endif
         (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
+#ifdef __APPLE__
+        /* The elevation above is host-page rounded: restore the union
+         * so a writable neighbor sharing the edge page keeps its host
+         * write bit (M32-R3-3). */
+        vm_host_restore_locked(old_page, new_page);
+#endif
     } else if (new_page < old_page) {
         if (vm_can_unmap_regions_locked(new_page, old_page, 0U) != 0) {
             uint32_t curr = g_vm_brk_curr;
@@ -733,11 +681,18 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
-        uint32_t len = old_page - new_page;
         (void)vm_flush_darw_range_locked(new_page, old_page);
-        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        (void)vm_reserve_prot_none(ctx, new_page, len);
+#ifdef __APPLE__
+        /* Unmap first, then restore the union: a blanket PROT_NONE
+         * over the host-rounded range would disable a live neighbor
+         * sharing the edge page (M32-R3-3). */
         vm_unmap_regions_locked(new_page, old_page);
+        vm_host_restore_locked(new_page, old_page);
+#else
+        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
+        (void)vm_reserve_prot_none(ctx, new_page, old_page - new_page);
+        vm_unmap_regions_locked(new_page, old_page);
+#endif
     }
 
     g_vm_brk_curr = new_brk;
@@ -818,6 +773,10 @@ int rt32_vm_copy_from(const mips32_ctx_t *ctx, void *dst, uint32_t va, uint32_t 
     return 0;
 }
 
+/* M32-R3-4: the commit runs under the LL/SC lock and advances every
+ * affected reservation epoch, so a same-value cross-thread copyout
+ * still fails a later SC.  Lock order is g_vm_lock outer, LL inner
+ * (no path acquires g_vm_lock while holding the LL lock). */
 int rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len)
 {
     if (!ctx || (!src && len > 0U)) {
@@ -834,7 +793,7 @@ int rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t le
         vm_lock_release();
         return -EFAULT;
     }
-    memcpy(mips32_guest_ptr(ctx, va), src, (size_t)len);
+    mips_guest_store_commit(ctx, va, src, len);
     vm_lock_release();
     return 0;
 }

@@ -30,6 +30,10 @@
 
 /* D19 CLONE_VM page-table lock (defined in vm.c). */
 extern _Atomic uint32_t g_vm_lock;
+/* VMA generation + brk state (defined in vm.c; mutated under the lock). */
+extern _Atomic uint64_t g_vm_gen;
+extern uint32_t g_vm_brk_base;
+extern uint32_t g_vm_brk_curr;
 /* Bottom-up mmap cursor (defined in vm.c; mutated under the lock). */
 extern uint32_t g_vm_mmap_cursor;
 void vm_lock_acquire(void);
@@ -42,7 +46,19 @@ void     vm_invalidate_jit(mips32_ctx_t *ctx, uint32_t start, uint32_t end);
 /* ctx <-> authoritative-table mirrors (defined in vm.c). */
 void vm_sync_from_ctx(mips32_ctx_t *ctx);
 void vm_sync_brk_to_ctx(mips32_ctx_t *ctx);
+void vm_copy_state_to_ctx(mips32_ctx_t *dst);
 void vm_sync_to_ctx(mips32_ctx_t *ctx);
+/* Host-page protection union + restore (defined in vm.c). */
+int  vm_union_host_prot_locked(uint32_t start, uint32_t end);
+void vm_host_restore_locked(uint32_t start, uint32_t end);
+/* Coordinated fork stages (defined in vm.c). */
+void vm_fork_prepare(void);
+void vm_fork_release(void);
+/* LL/SC-aware bulk guest store (defined in src/os/mem.c): data write
+ * plus epoch/reservation update under one LL critical section.  Call
+ * with g_vm_lock held (VM outer, LL inner); src must be non-NULL. */
+void mips_guest_store_commit(mips32_ctx_t *ctx, uint32_t va,
+                             const void *src, uint32_t len);
 
 /* Per-region file-backing metadata (M32-3, M32-4, M32-R2-2). */
 typedef struct {
@@ -70,6 +86,8 @@ int  vm_can_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end,
                                  size_t extra_insert);
 int  vm_flush_darw_range_locked(uint32_t start, uint32_t end);
 void vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino);
+/* Temporary host-prot elevation (defined in vm_darw.c). */
+void vm_host_temp_prot(uint32_t start, uint32_t end, int prot);
 void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
 int  vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,
                              uint32_t flags, const char *name);

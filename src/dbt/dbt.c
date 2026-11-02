@@ -249,6 +249,22 @@ static void dbt_flush_local(mips32_ctx_t *ctx)
         atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire);
 }
 
+/* Coordinated fork (cross-RT Round-3 class): the per-host-thread
+ * code caches survive (each thread's __thread cache is CoW-duplicated
+ * into the child, and the surviving thread keeps its own), but the
+ * process-global g_smc_lock must not stay held by a vanished thread.
+ * Prepare acquires it to quiesce peers mid-flush; parent and child
+ * release the uncontended word. */
+void mips32_dbt_fork_prepare(void)
+{
+    mips32_spin_lock(&g_smc_lock);
+}
+
+void mips32_dbt_fork_release(void)
+{
+    mips32_spin_unlock(&g_smc_lock);
+}
+
 /* Drop every cached translation across all threads (explicit global SMC flush). */
 static void dbt_flush_all(mips32_ctx_t *ctx)
 {

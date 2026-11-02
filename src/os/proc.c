@@ -295,47 +295,7 @@ static void close_cloexec_fds(int keep_fd)
     }
 }
 
-/* ---- fork / vfork ---- */
-
-int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp)
-{
-    pid_t pid;
-
-    (void)sp;
-    if (ctx == NULL) {
-        return (int32_t)-EFAULT;
-    }
-    pid = fork();
-    if (pid < 0) {
-        return proc_ret(ctx, -(int32_t)errno);
-    }
-    if (pid == 0) {
-        /* Child: host fork() CoW-duplicated the [G, G+4GiB) window, so
-         * every guest mapping survives; only translator state changes. */
-        ctx->llbit = 0U; /* SPEC 2.2: LL reservation never crosses fork */
-        ctx->is_thread_clone = false;
-        ctx->host_tid = (int)getpid();
-        memset(ctx->sig_pending, 0, sizeof(ctx->sig_pending));
-        memset(ctx->sig_pending_code, 0, sizeof(ctx->sig_pending_code));
-        ctx->sig_rt_count = 0U;
-        ctx->gpr[MIPS32_REG_V0] = 0U;
-        ctx->gpr[MIPS32_REG_A3] = 0U;
-        return 0;
-    }
-    return proc_ret(ctx, (int32_t)pid);
-}
-
-int32_t mips_proc_vfork(mips32_ctx_t *ctx, uint32_t sp)
-{
-    /*
-     * MIPS O32 defines no __NR_vfork (verified absent from unistd_o32.h):
-     * glibc vfork(2) lowers to clone(2), which lane L4b owns.  This entry
-     * point is the documented vfork-as-fork equivalent for any direct
-     * caller: identical to fork (no address-space sharing games, the
-     * window is CoW either way).
-     */
-    return mips_proc_fork(ctx, sp);
-}
+/* fork/vfork live in src/os/fork.c (coordinated fork protocol). */
 
 /* ---- execve ---- */
 

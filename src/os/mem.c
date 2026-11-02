@@ -24,6 +24,7 @@
 #include "mips32rt.h"
 
 #include "rt32/rt32.h"
+#include "rt32/vm_priv.h"
 #include "vm/vm32.h"
 
 #include <stddef.h>
@@ -129,6 +130,26 @@ void mips_ll_unlock(mips32_ctx_t *ctx)
     }
     if (w != NULL) {
         atomic_store_explicit(w, 0u, memory_order_release);
+    }
+}
+
+/* Coordinated fork (cross-RT Round-3 class): the epoch table lives in
+ * a MAP_PRIVATE mapping that fork duplicates by CoW, so the lock word
+ * itself survives; prepare acquires it to quiesce peers holding short
+ * reservation critical sections, and both parent and child release the
+ * uncontended word (the owner slot still names the forking thread's
+ * ctx, which is valid on both sides). */
+void mips_ll_fork_prepare(void)
+{
+    if (g_vm_root_ctx != NULL) {
+        mips_ll_lock(g_vm_root_ctx);
+    }
+}
+
+void mips_ll_fork_release(void)
+{
+    if (g_vm_root_ctx != NULL) {
+        mips_ll_unlock(g_vm_root_ctx);
     }
 }
 
@@ -483,6 +504,20 @@ static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
     memcpy(mips32_guest_ptr(ctx, va), src, len);
     note_store_locked(ctx, va, len);
     mips_ll_unlock(ctx);
+}
+
+/* M32-R3-4: public bulk-store path for syscall copyout and other
+ * in-translator guest writes (declared in rt32/vm_priv.h).  Same
+ * primitive as every interp store, so copyout participates in LL/SC
+ * exclusion and advances reservation epochs.  The caller must hold
+ * g_vm_lock (VM outer, LL inner); src must be non-NULL. */
+void mips_guest_store_commit(mips32_ctx_t *ctx, uint32_t va,
+                             const void *src, uint32_t len)
+{
+    if (ctx == NULL || src == NULL || len == 0U) {
+        return;
+    }
+    mips_store_locked(ctx, va, src, len);
 }
 
 int guest_ld16(mips32_ctx_t *ctx, uint32_t va, uint32_t *out)

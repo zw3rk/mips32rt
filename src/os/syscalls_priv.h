@@ -262,7 +262,9 @@ int  mips_signal_default_ignore(int signo);
 int  mips_signal_default_stop(int signo);
 void mips_signal_default_die(int signo);
 int  mips_signal_is_blocked(const mips32_ctx_t *ctx, int signo);
-void mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code);
+int  mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code);
 void mips_signal_deliver_pending(mips32_ctx_t *ctx);
+/* Pending-queue maintenance (defined in src/os/sigqueue.c). */
+void mips_sig_purge_signo(mips32_ctx_t *ctx, int signo);
 
 #endif /* MIPS32_SYSCALLS_PRIV_H */

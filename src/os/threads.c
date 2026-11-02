@@ -149,6 +149,15 @@ long mips_trace_tid(void)
 /* Live CLONE_VM children; the initial thread is never counted. */
 static _Atomic int mips_live_clones = 0;
 
+/* Coordinated fork (cross-RT Round-3 class): only the forking thread
+ * survives, so every CLONE_VM peer is gone in the child and the live
+ * counter restarts at zero.  Their heap records leak in the child
+ * (unreachable by design: no peer thread remains to reap them). */
+void mips_threads_fork_child(void)
+{
+    atomic_store_explicit(&mips_live_clones, 0, memory_order_relaxed);
+}
+
 /* Write a host-known tid to a guest address (BE-aware, range-checked). */
 static int thread_write_tid(mips32_ctx_t *ctx, uint32_t va, uint32_t tid)
 {
@@ -573,6 +582,11 @@ void mips_thread_exit(mips32_ctx_t *ctx, int status)
 {
     (void)ctx;
     _Exit(status);
+}
+
+/* No clone peers can exist off Linux: nothing to rebuild after fork. */
+void mips_threads_fork_child(void)
+{
 }
 
 #endif

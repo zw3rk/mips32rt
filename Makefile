@@ -83,6 +83,12 @@ test: ## Run the host-native test suites (ABI invariants + decoder self-test)
 	@if [ -f tests/test_decode.c ]; then \
 		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc tests/test_decode.c src/interp/decode.c -o $(BUILD_DIR)/test_decode && ./$(BUILD_DIR)/test_decode; \
 	fi
+	@if [ -f tests/test_errno_map.c ]; then \
+		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc tests/test_errno_map.c -o $(BUILD_DIR)/test_errno_map && ./$(BUILD_DIR)/test_errno_map; \
+	fi
+	@if [ -f tests/test_r3_regress.c ]; then \
+		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 tests/test_r3_regress.c src/rt32/vm.c src/rt32/vm_init.c src/rt32/vm_mmap.c src/rt32/vm_darw.c src/os/mem.c src/os/signals.c src/os/sigqueue.c -o $(BUILD_DIR)/test_r3_regress && ./$(BUILD_DIR)/test_r3_regress; \
+	fi
 
 check: test check-line-limits check-abi-invariants ## Run all Phase 0 checks
 

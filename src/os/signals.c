@@ -60,6 +60,7 @@
 #define L4A_EINVAL 22
 #define L4A_ENOMEM 12
 #define L4A_EPERM  1
+#define L4A_EAGAIN 11
 
 /* ---- sigaltstack(2) (asm-generic values, shared by the MIPS O32 UAPI) ---- */
 #define L4A_SS_ONSTACK  1U
@@ -210,119 +211,6 @@ int mips_signal_is_blocked(const mips32_ctx_t *ctx, int signo)
     return (ctx->sig_blocked[bit / 32U] & (uint32_t)(1U << (bit % 32U))) != 0U;
 }
 
-static void l4a_rt_purge_signo(mips32_ctx_t *ctx, int signo)
-{
-    uint32_t r;
-    uint32_t w = 0U;
-    unsigned bit;
-
-    if (ctx == NULL || !l4a_valid_signo(signo)) {
-        return;
-    }
-    bit = (unsigned)(signo - 1);
-    ctx->sig_pending[bit / 32U] &= ~(uint32_t)(1U << (bit % 32U));
-    for (r = 0U; r < ctx->sig_rt_count && r < MIPS32_RT_SIG_QUEUE_CAP; r++) {
-        if (ctx->sig_rt_signo[r] != (uint8_t)signo) {
-            ctx->sig_rt_signo[w] = ctx->sig_rt_signo[r];
-            ctx->sig_rt_code[w] = ctx->sig_rt_code[r];
-            w++;
-        }
-    }
-    ctx->sig_rt_count = w;
-}
-
-static int l4a_pop_pending(mips32_ctx_t *ctx, unsigned signo, int32_t *out_code)
-{
-    unsigned bit = signo - 1U;
-    uint32_t mask = (uint32_t)(1U << (bit % 32U));
-
-    if ((ctx->sig_pending[bit / 32U] & mask) == 0U ||
-        (ctx->sig_blocked[bit / 32U] & mask) != 0U) {
-        return 0;
-    }
-    if (signo >= 32U) {
-        uint32_t q;
-
-        for (q = 0U; q < ctx->sig_rt_count && q < MIPS32_RT_SIG_QUEUE_CAP; q++) {
-            if (ctx->sig_rt_signo[q] == (uint8_t)signo) {
-                uint32_t k;
-                int more = 0;
-
-                *out_code = ctx->sig_rt_code[q];
-                for (k = q + 1U; k < ctx->sig_rt_count && k < MIPS32_RT_SIG_QUEUE_CAP; k++) {
-                    ctx->sig_rt_signo[k - 1U] = ctx->sig_rt_signo[k];
-                    ctx->sig_rt_code[k - 1U] = ctx->sig_rt_code[k];
-                    if (ctx->sig_rt_signo[k - 1U] == (uint8_t)signo) {
-                        more = 1;
-                    }
-                }
-                for (k = 0U; k < q; k++) {
-                    if (ctx->sig_rt_signo[k] == (uint8_t)signo) {
-                        more = 1;
-                    }
-                }
-                ctx->sig_rt_count--;
-                if (!more) {
-                    ctx->sig_pending[bit / 32U] &= ~mask;
-                }
-                return 1;
-            }
-        }
-    }
-    ctx->sig_pending[bit / 32U] &= ~mask;
-    *out_code = ctx->sig_pending_code[signo];
-    return 1;
-}
-
-void mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code)
-{
-    unsigned bit;
-
-    if (ctx == NULL || !l4a_valid_signo(signo) || l4a_uncatchable(signo)) {
-        return;
-    }
-    bit = (unsigned)(signo - 1);
-    if (signo >= 32 && ctx->sig_rt_count < MIPS32_RT_SIG_QUEUE_CAP) {
-        ctx->sig_rt_signo[ctx->sig_rt_count] = (uint8_t)signo;
-        ctx->sig_rt_code[ctx->sig_rt_count] = si_code;
-        ctx->sig_rt_count++;
-    }
-    ctx->sig_pending[bit / 32U] |= (uint32_t)(1U << (bit % 32U));
-    ctx->sig_pending_code[signo] = si_code;
-}
-
-void mips_signal_deliver_pending(mips32_ctx_t *ctx)
-{
-    unsigned signo;
-
-    if (ctx == NULL) {
-        return;
-    }
-    for (signo = 1U; signo <= L4A_NSIG; signo++) {
-        int32_t code = 0;
-
-        while (l4a_pop_pending(ctx, signo, &code)) {
-            if (mips_signal_is_ignored((int)signo)) {
-                continue;
-            }
-            if (mips_signal_has_handler((int)signo)) {
-                if (mips_raise_guest_code(ctx, (int)signo, code, 0U) != 0) {
-                    mips_signal_default_die((int)signo);
-                }
-                return;
-            }
-            if (mips_signal_default_ignore((int)signo)) {
-                continue;
-            }
-            if (mips_signal_default_stop((int)signo)) {
-                (void)kill(getpid(), SIGSTOP);
-                continue;
-            }
-            mips_signal_default_die((int)signo);
-        }
-    }
-}
-
 /* rt_sigaction(sig, act, oact, sigsetsize): record-only. */
 int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
 {
@@ -333,6 +221,8 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
     uint32_t setsize;
     l4a_action_t cur;
     unsigned w;
+    uint8_t in_snap[L4A_KERN_SIGACTION_SIZE];
+    int have_in = 0;
 
     if (ctx == NULL) {
         return -L4A_EFAULT;
@@ -350,6 +240,15 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
     if (setsize != 16U) {
         return mips_sc_ret(ctx, -L4A_EINVAL);
     }
+    /* Cross-RT Round-3 class: snapshot the input struct before writing
+     * any old output, so aliased/overlapping act/oact pointers apply
+     * the requested action instead of the just-written old state. */
+    if (act_va != 0U) {
+        if (mips_sc_copy_from(ctx, in_snap, act_va, sizeof(in_snap)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
+        }
+        have_in = 1;
+    }
     mips32_spin_lock(&g_sig_lock);
     cur = g_actions[sig];
     mips32_spin_unlock(&g_sig_lock);
@@ -366,18 +265,17 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
             return mips_sc_ret(ctx, -L4A_EFAULT);
         }
     }
-    if (act_va != 0U) {
-        uint8_t ibuf[L4A_KERN_SIGACTION_SIZE];
+    if (have_in == 0) {
+        return mips_sc_ret(ctx, 0);
+    }
+    {
         int be = mips_is_be(ctx);
         l4a_action_t next;
 
-        if (mips_sc_copy_from(ctx, ibuf, act_va, sizeof(ibuf)) != 0) {
-            return mips_sc_ret(ctx, -L4A_EFAULT);
-        }
-        next.flags = buf_get32(ibuf, 0U, be);
-        next.handler = buf_get32(ibuf, 4U, be);
+        next.flags = buf_get32(in_snap, 0U, be);
+        next.handler = buf_get32(in_snap, 4U, be);
         for (w = 0; w < 4U; w++) {
-            next.mask.sig[w] = buf_get32(ibuf, 8U + 4U * w, be);
+            next.mask.sig[w] = buf_get32(in_snap, 8U + 4U * w, be);
         }
         next.restorer = 0U;
         l4a_mask_scrub(&next.mask);
@@ -395,7 +293,7 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
         mips32_spin_unlock(&g_sig_lock);
         if (next.handler == L4A_SIG_IGN ||
             (next.handler == L4A_SIG_DFL && mips_signal_default_ignore((int)sig))) {
-            l4a_rt_purge_signo(ctx, (int)sig);
+            mips_sig_purge_signo(ctx, (int)sig);
         }
     }
     return mips_sc_ret(ctx, 0);
@@ -412,6 +310,8 @@ int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
     uint32_t old_va;
     uint32_t setsize;
     unsigned w;
+    uint8_t in_snap[16];
+    int have_in = 0;
 
     if (ctx == NULL) {
         return -L4A_EFAULT;
@@ -430,6 +330,13 @@ int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
     if (setsize != 16U) {
         return mips_sc_ret(ctx, -L4A_EINVAL);
     }
+    /* Same snapshot-first ordering as rt_sigaction above. */
+    if (set_va != 0U) {
+        if (mips_sc_copy_from(ctx, in_snap, set_va, sizeof(in_snap)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
+        }
+        have_in = 1;
+    }
     be = mips_is_be(ctx);
     if (old_va != 0U) {
         uint8_t obuf[16];
@@ -441,15 +348,11 @@ int32_t mips_l4a_rt_sigprocmask(mips32_ctx_t *ctx, uint32_t sp)
             return mips_sc_ret(ctx, -L4A_EFAULT);
         }
     }
-    if (set_va != 0U) {
-        uint8_t ibuf[16];
+    if (have_in != 0) {
         mips_sigset_t next;
 
-        if (mips_sc_copy_from(ctx, ibuf, set_va, sizeof(ibuf)) != 0) {
-            return mips_sc_ret(ctx, -L4A_EFAULT);
-        }
         for (w = 0; w < 4U; w++) {
-            next.sig[w] = buf_get32(ibuf, 4U * w, be);
+            next.sig[w] = buf_get32(in_snap, 4U * w, be);
         }
         l4a_mask_scrub(&next);
         if (how == L4A_SIG_BLOCK) {
@@ -628,11 +531,12 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
     buf_put32(frame, 36U, fault_addr, be);
     branch_pc = ctx->in_delay_slot != 0U ? ctx->pc - 4U : ctx->pc;
     buf_put64(frame, 184U, (uint64_t)branch_pc, be);
+    /* M32-R3-7: the frame keeps the exact interrupted $sp; only the
+     * new handler frame address (newsp) is aligned.  Rounding the saved
+     * register would resume a fault-interrupted sequence with a
+     * different stack pointer after rt_sigreturn. */
     for (i = 0; i < 32U; i++) {
-        uint32_t reg_val = (i == MIPS32_REG_SP)
-            ? (ctx->gpr[i] & (uint32_t)~7U)
-            : ctx->gpr[i];
-        buf_put64(frame, 192U + 8U * i, (uint64_t)reg_val, be);
+        buf_put64(frame, 192U + 8U * i, (uint64_t)ctx->gpr[i], be);
         buf_put64(frame, 448U + 8U * i, ctx->fpr[i], be);
     }
     buf_put32(frame, 704U, 1U, be); /* sc_ownedfp */
@@ -788,6 +692,8 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
     int be;
     uint32_t ss_va;
     uint32_t oss_va;
+    uint8_t in_snap[12];
+    int have_in = 0;
 
     if (ctx == NULL) {
         return -L4A_EFAULT;
@@ -796,6 +702,13 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
     oss_va = mips_sc_arg(ctx, sp, 1, &ok);
     if (!ok) {
         return mips_sc_ret(ctx, -L4A_EFAULT);
+    }
+    /* Same snapshot-first ordering as rt_sigaction above. */
+    if (ss_va != 0U) {
+        if (mips_sc_copy_from(ctx, in_snap, ss_va, sizeof(in_snap)) != 0) {
+            return mips_sc_ret(ctx, -L4A_EFAULT);
+        }
+        have_in = 1;
     }
     be = mips_is_be(ctx);
     if (oss_va != 0U) {
@@ -813,18 +726,14 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
             return mips_sc_ret(ctx, -L4A_EFAULT);
         }
     }
-    if (ss_va != 0U) {
-        uint8_t ibuf[12];
+    if (have_in != 0) {
         uint32_t nsp;
         uint32_t nflags;
         uint32_t nsize;
 
-        if (mips_sc_copy_from(ctx, ibuf, ss_va, sizeof(ibuf)) != 0) {
-            return mips_sc_ret(ctx, -L4A_EFAULT);
-        }
-        nsp = buf_get32(ibuf, 0U, be);
-        nsize = buf_get32(ibuf, 4U, be);
-        nflags = buf_get32(ibuf, 8U, be);
+        nsp = buf_get32(in_snap, 0U, be);
+        nsize = buf_get32(in_snap, 4U, be);
+        nflags = buf_get32(in_snap, 8U, be);
         if (nflags != L4A_SS_DISABLE && nflags != 0U &&
             nflags != L4A_SS_ONSTACK) {
             return mips_sc_ret(ctx, -L4A_EINVAL);
@@ -848,30 +757,42 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
     return mips_sc_ret(ctx, 0);
 }
 
-/* execve: drop every disposition, mask, live frame and altstack
- * (satisfies the weak reference in src/os/proc.c). */
+/* execve (M32-R3-6, satisfies the weak reference in src/os/proc.c):
+ * Linux preserves the blocked mask, pending signals, and ignored
+ * dispositions across exec; only caught handlers reset to default.
+ * Frame bookkeeping is obsolete (old stacks are gone) and the
+ * alternate stack is disabled. */
 void mips32_signals_reset_for_exec(mips32_ctx_t *ctx)
 {
     size_t i;
 
     mips32_spin_lock(&g_sig_lock);
     for (i = 0; i <= L4A_NSIG; i++) {
-        g_actions[i].installed = 0;
-        g_actions[i].handler = L4A_SIG_DFL;
-        g_actions[i].flags = 0U;
-        g_actions[i].restorer = 0U;
-        memset(g_actions[i].mask.sig, 0, sizeof(g_actions[i].mask.sig));
+        if (g_actions[i].installed && g_actions[i].handler != L4A_SIG_IGN) {
+            g_actions[i].installed = 0;
+            g_actions[i].handler = L4A_SIG_DFL;
+            g_actions[i].flags = 0U;
+            g_actions[i].restorer = 0U;
+            memset(g_actions[i].mask.sig, 0, sizeof(g_actions[i].mask.sig));
+        }
     }
     mips32_spin_unlock(&g_sig_lock);
     if (ctx != NULL) {
-        memset(ctx->sig_blocked, 0, sizeof(ctx->sig_blocked));
-        memset(ctx->sig_pending, 0, sizeof(ctx->sig_pending));
-        memset(ctx->sig_pending_code, 0, sizeof(ctx->sig_pending_code));
-        ctx->sig_rt_count = 0U;
         memset(ctx->sig_frame_sp, 0, sizeof(ctx->sig_frame_sp));
         ctx->sig_depth = 0U;
         ctx->sigalt_sp = 0U;
         ctx->sigalt_size = 0U;
         ctx->sigalt_flags = L4A_SS_DISABLE;
     }
+}
+
+/* Coordinated fork stages for g_sig_lock (see src/os/fork.c). */
+void mips_sig_fork_prepare(void)
+{
+    mips32_spin_lock(&g_sig_lock);
+}
+
+void mips_sig_fork_release(void)
+{
+    mips32_spin_unlock(&g_sig_lock);
 }
