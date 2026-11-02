@@ -27,6 +27,10 @@
 /* MIPS EAGAIN (arch/mips/include/uapi/asm/errno.h). */
 #define SQ_EAGAIN 11
 
+/* Queue-sender si_codes (asm-generic/siginfo.h): plain kill(2) is
+ * SI_USER 0 and merges on RT overflow; SI_QUEUE/SI_TKILL observe EAGAIN. */
+#define SQ_SI_USER (0)
+
 static int sq_valid_signo(int signo)
 {
     return signo >= 1 && signo <= (int)SQ_NSIG;
@@ -105,7 +109,10 @@ static int sq_pop_pending(mips32_ctx_t *ctx, unsigned signo, int32_t *out_code)
  * the pending bit (no loss possible); a real-time signal whose queue
  * is full reports -EAGAIN without setting the bit for an event that
  * was never stored, so callers (kill) no longer report success for a
- * discarded occurrence. */
+ * discarded occurrence -- except plain kill(2) (SI_USER), which takes
+ * the Linux __send_signal "silent loss of information" branch: the
+ * pending bit is set (merged) and the call returns 0.  Only queued
+ * senders (SI_QUEUE/rt_sigqueueinfo, SI_TKILL/tkill/tgkill) see EAGAIN. */
 int mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code)
 {
     unsigned bit;
@@ -116,6 +123,10 @@ int mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code)
     bit = (unsigned)(signo - 1);
     if (signo >= 32) {
         if (ctx->sig_rt_count >= MIPS32_RT_SIG_QUEUE_CAP) {
+            if (si_code == SQ_SI_USER) {
+                ctx->sig_pending[bit / 32U] |= (uint32_t)(1U << (bit % 32U));
+                return 0;
+            }
             return -SQ_EAGAIN;
         }
         ctx->sig_rt_signo[ctx->sig_rt_count] = (uint8_t)signo;

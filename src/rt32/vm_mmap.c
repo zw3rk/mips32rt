@@ -287,22 +287,21 @@ static int vm_mprotect_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, ui
     /* M32-R3-3: one mprotect covers whole host pages, so the new
      * protection must already include every surviving neighbor piece:
      * regions fully inside [addr, end) take the new prot, anything
-     * reaching outside keeps its old prot in the union. */
+     * reaching outside keeps its old prot in the union.  The outside
+     * contribution is exactly the union over the two host-rounded
+     * slivers, reused from vm_union_host_prot_locked instead of a
+     * second open-coded scan. */
     {
         uint32_t h_start = addr & ~0x3FFFU;
         uint32_t h_end   = ((uint32_t)end64 + 0x3FFFU) & ~0x3FFFU;
+        uint32_t m_end   = (uint32_t)end64;
         int      h_prot  = mips32_host_prot(ctx, prot);
-        size_t   i;
 
-        for (i = 0U; i < g_vm_region_count; i++) {
-            const mips32_region_t *rr = &g_vm_regions[i];
-
-            if (rr->end <= h_start || rr->start >= h_end) {
-                continue;
-            }
-            if (rr->start < addr || rr->end > (uint32_t)end64) {
-                h_prot |= mips32_host_prot(ctx, rr->prot);
-            }
+        if (h_start < addr) {
+            h_prot |= vm_union_host_prot_locked(h_start, addr);
+        }
+        if (m_end < h_end) {
+            h_prot |= vm_union_host_prot_locked(m_end, h_end);
         }
         if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start), h_prot) != 0) {
             return -errno;

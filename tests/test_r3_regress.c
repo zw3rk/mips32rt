@@ -10,22 +10,32 @@
  *       (M32-R3-3).
  *   T3  syscall copyout advances LL/SC epochs: a same-value copyout
  *       between LL and SC fails the SC (M32-R3-4).
- *   T4  a full real-time queue reports -EAGAIN instead of silently
- *       dropping the occurrence (M32-R3-5).
+ *   T4  a full real-time queue reports -EAGAIN for queued senders
+ *       (SI_QUEUE/SI_TKILL) but merges plain kill SI_USER with 0
+ *       (M32-R3-5).
  *   T5  rt_sigaction/rt_sigprocmask/sigaltstack snapshot guest input
  *       before writing old output: identical in/out pointers apply
  *       the request (cross-RT aliasing class).
  *   T6  signal delivery saves the exact interrupted $sp (M32-R3-7).
  *   T7  execve preserves mask, pending, and ignored dispositions
- *       while resetting caught handlers (M32-R3-6).
+ *       while resetting caught handlers (M32-R3-6), and clears
+ *       flags/restorer/mask on surviving SIG_IGN entries.
+ *   T8  two guest aliases in one 16 KiB host page stay coherent
+ *       across munmap: write via A, munmap A, B still sees the byte
+ *       and the backing file carries it (M32-R3-2 shared-subpage).
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "mips32rt.h"
 
@@ -250,6 +260,50 @@ static mips32_ctx_t tA;
 static mips32_ctx_t tB;
 static mips32_ctx_t fctx;
 
+/* M32-R3-2 shared-subpage probe: two distinct guest aliases in one
+ * 16 KiB host page.  Write through alias A, munmap alias A, then
+ * alias B must still see the byte and the backing file must carry it
+ * after munmap.  Uses MAP_SHARED so the Linux host path relies on
+ * direct shared coherence plus kernel writeback, while the Apple path
+ * exercises the Darwin shadow writeback flush before VMA teardown. */
+static void test_m32_r3_2_shared_subpage(mips32_ctx_t *vc)
+{
+    char tmpl[] = "/tmp/mips32rt-r32-XXXXXX";
+    int fd = mkstemp(tmpl);
+    uint32_t alias_a = 0x41000000U;
+    uint32_t alias_b = 0x41001000U;
+    uint32_t map_a = 0U;
+    uint32_t map_b = 0U;
+    uint8_t *pa = NULL;
+    uint8_t *pb = NULL;
+    uint8_t fbyte = 0U;
+    const uint32_t off = 0x20U;
+    const uint8_t want = 0xA5U;
+
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        return;
+    }
+    CHECK(ftruncate(fd, 0x4000) == 0);
+    map_a = rt32_vm_mmap2(vc, alias_a, 0x1000U,
+        (uint32_t)(PROT_READ | PROT_WRITE), 0x01U | 0x10U, fd, 0U);
+    CHECK(map_a == alias_a);
+    map_b = rt32_vm_mmap2(vc, alias_b, 0x1000U,
+        (uint32_t)(PROT_READ | PROT_WRITE), 0x01U | 0x10U, fd, 0U);
+    CHECK(map_b == alias_b);
+    pa = (uint8_t *)mips32_guest_ptr(vc, alias_a);
+    pb = (uint8_t *)mips32_guest_ptr(vc, alias_b);
+    pa[off] = want;
+    CHECK(rt32_vm_munmap(vc, alias_a, 0x1000U) == 0);
+    pb = (uint8_t *)mips32_guest_ptr(vc, alias_b);
+    CHECK(pb[off] == want);
+    CHECK(pread(fd, &fbyte, 1, (off_t)off) == 1);
+    CHECK(fbyte == want);
+    (void)rt32_vm_munmap(vc, alias_b, 0x1000U);
+    (void)close(fd);
+    (void)unlink(tmpl);
+}
+
 int main(void)
 {
     memset(&tA, 0, sizeof(tA));
@@ -304,7 +358,8 @@ int main(void)
         CHECK(ok == 0);
     }
 
-    /* T4: real-time queue overflow is observable. */
+    /* T4: RT queue overflow: queued senders see -EAGAIN, plain
+     * kill SI_USER (0) merges into the pending bit with 0. */
     {
         mips32_ctx_t q;
         int i;
@@ -317,7 +372,14 @@ int main(void)
         last = mips_signal_pend(&q, 33, -6);
         CHECK(last == -11);
         CHECK(q.sig_rt_count == 64U);
+        last = mips_signal_pend(&q, 33, -1);
+        CHECK(last == -11);
+        CHECK(q.sig_rt_count == 64U);
         CHECK(mips_signal_pend(&q, 5, -1) == 0);
+        /* SI_USER merge on a full RT queue: success, bit set. */
+        CHECK(mips_signal_pend(&q, 33, 0) == 0);
+        CHECK(q.sig_rt_count == 64U);
+        CHECK((q.sig_pending[(33 - 1) / 32U] & (uint32_t)(1U << ((33 - 1) % 32U))) != 0U);
     }
 
     fctx.guest_base = (uint64_t)(uintptr_t)fake_win;
@@ -386,15 +448,20 @@ int main(void)
 
     /* T7: exec preserves mask/pending/ignored, resets caught. */
     {
-        gst_put32(0x6000U, 0U);
+        gst_put32(0x6000U, 0x10000000U);
         gst_put32(0x6004U, 1U);
-        gst_put32(0x6008U, 0U);
+        gst_put32(0x6008U, 0x00000008U);
         gst_put32(0x600CU, 0U);
         gst_put32(0x6010U, 0U);
         gst_put32(0x6014U, 0U);
         set_args(&fctx, 20U, 0x6000U, 0U, 16U);
         CHECK(mips_sc_rt_sigaction(&fctx, 0U) == 0);
+        gst_put32(0x6000U, 0U);
         gst_put32(0x6004U, 0x5678U);
+        gst_put32(0x6008U, 0U);
+        gst_put32(0x600CU, 0U);
+        gst_put32(0x6010U, 0U);
+        gst_put32(0x6014U, 0U);
         set_args(&fctx, 11U, 0x6000U, 0U, 16U);
         CHECK(mips_sc_rt_sigaction(&fctx, 0U) == 0);
         fctx.sig_blocked[0] |= (uint32_t)(1U << 4);
@@ -414,7 +481,18 @@ int main(void)
         CHECK(fctx.sig_depth == 0U);
         CHECK(fctx.sigalt_size == 0U);
         CHECK(fctx.sigalt_flags == 2U);
+        /* Surviving SIG_IGN keeps its handler but drops stale metadata. */
+        set_args(&fctx, 20U, 0U, 0x7000U, 16U);
+        CHECK(mips_sc_rt_sigaction(&fctx, 0U) == 0);
+        CHECK(gst_get32(0x7000U) == 0U);
+        CHECK(gst_get32(0x7008U) == 0U);
+        CHECK(gst_get32(0x700CU) == 0U);
+        CHECK(gst_get32(0x7010U) == 0U);
+        CHECK(gst_get32(0x7014U) == 0U);
     }
+
+    /* T8: shared-subpage coherence across munmap (M32-R3-2). */
+    test_m32_r3_2_shared_subpage(&tA);
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

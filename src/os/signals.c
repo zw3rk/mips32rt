@@ -774,6 +774,14 @@ void mips32_signals_reset_for_exec(mips32_ctx_t *ctx)
             g_actions[i].flags = 0U;
             g_actions[i].restorer = 0U;
             memset(g_actions[i].mask.sig, 0, sizeof(g_actions[i].mask.sig));
+        } else if (g_actions[i].installed && g_actions[i].handler == L4A_SIG_IGN) {
+            /* M32-R3-7: SIG_IGN survives exec, but stale pre-exec
+             * metadata must not persist (Linux flush_signal_handlers
+             * zeroes sa_flags/sa_mask/sa_restorer on ignored entries).
+             * The only observable effect is a later sigaction query. */
+            g_actions[i].flags = 0U;
+            g_actions[i].restorer = 0U;
+            memset(g_actions[i].mask.sig, 0, sizeof(g_actions[i].mask.sig));
         }
     }
     mips32_spin_unlock(&g_sig_lock);
