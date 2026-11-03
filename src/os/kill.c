@@ -192,6 +192,15 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
     if (signo < 0 || signo > 128) {
         return mips_sc_ret(ctx, -22); /* EINVAL */
     }
+    /* M32-R11-3: the tid liveness check runs before the signo-0
+     * early return, so tkill/tgkill on a dead tid report ESRCH even
+     * for the existence probe. Plain kill() always targets the calling
+     * thread, so its behaviour is unchanged. */
+    if (tid != (uint32_t)self_tid) {
+        /* Another live thread of the group: no async cross-thread
+         * queue exists, so report ESRCH rather than lose the signal. */
+        return mips_sc_ret(ctx, -3); /* ESRCH */
+    }
     if (signo == 0) {
         /* Existence check: pid 0 (own group) and self always live. */
         if (pid == 0U || pid == (uint32_t)self_pid) {
@@ -201,11 +210,6 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
     }
     if (pid != 0U && pid != (uint32_t)self_pid) {
         return mips_sc_ret(ctx, -3); /* ESRCH: no foreign-pid support */
-    }
-    if (tid != (uint32_t)self_tid) {
-        /* Another live thread of the group: no async cross-thread
-         * queue exists, so report ESRCH rather than lose the signal. */
-        return mips_sc_ret(ctx, -3); /* ESRCH */
     }
     if (signo == KILL_SIGKILL) {
         mips_signal_default_die(signo);

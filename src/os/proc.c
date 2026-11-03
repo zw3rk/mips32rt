@@ -38,6 +38,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -446,8 +447,40 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
  *
  * MIPS wait options/status encoding matches the host asm-generic values
  * (WNOHANG 1, WUNTRACED 2, WCONTINUED 8; exit << 8, sig low 7 bits,
- * 0x7f stopped), so both pass through untranslated.
+ * 0x7f stopped), so the options pass through untranslated, while the
+ * signal field is mapped host-to-MIPS below (M32-R11-2).
+ *
+ * Host-to-MIPS O32 numbers (arch/mips asm/signal.h), matched on the
+ * host's own SIG* constants; unmapped host signals pass through.
  */
+static int proc_host_to_mips_sig(int host_sig)
+{
+    switch (host_sig) {
+    case SIGHUP: return 1;    case SIGINT: return 2;
+    case SIGQUIT: return 3;   case SIGILL: return 4;
+    case SIGTRAP: return 5;   case SIGABRT: return 6;
+    case SIGBUS: return 10;   case SIGFPE: return 8;
+    case SIGKILL: return 9;   case SIGUSR1: return 16;
+    case SIGSEGV: return 11;  case SIGUSR2: return 17;
+    case SIGPIPE: return 13;  case SIGALRM: return 14;
+    case SIGTERM: return 15;  case SIGCHLD: return 18;
+    case SIGCONT: return 25;  case SIGSTOP: return 23;
+    case SIGTSTP: return 24;  case SIGTTIN: return 26;
+    case SIGTTOU: return 27;  case SIGURG: return 21;
+    case SIGXCPU: return 30;  case SIGXFSZ: return 31;
+    case SIGVTALRM: return 28; case SIGPROF: return 29;
+    case SIGWINCH: return 20; case SIGSYS: return 12;
+#ifdef SIGPWR
+    case SIGPWR: return 19;
+#endif
+#ifdef SIGPOLL
+    case SIGPOLL: return 22;
+#elif defined(SIGIO)
+    case SIGIO: return 22;
+#endif
+    default: return host_sig;
+    }
+}
 static int32_t proc_wait_common(mips32_ctx_t *ctx, uint32_t sp,
                                 int with_rusage)
 {
@@ -484,7 +517,21 @@ static int32_t proc_wait_common(mips32_ctx_t *ctx, uint32_t sp,
         return proc_ret(ctx, -(int32_t)errno);
     }
     if (status_va != 0U) {
-        if (proc_st32(ctx, status_va, (uint32_t)status) != 0) {
+        int guest_status = status;
+
+        /* M32-R11-2: re-encode the signal field in MIPS O32 numbering.
+         * Exit codes, the 0x7f stop flag, continued (0xFFFF), and the
+         * core-dump bit pass through untouched. */
+        if (WIFSIGNALED(status)) {
+            int mips_sig = proc_host_to_mips_sig(WTERMSIG(status));
+
+            guest_status = (status & ~0x7F) | (mips_sig & 0x7F);
+        } else if (WIFSTOPPED(status)) {
+            int mips_sig = proc_host_to_mips_sig(WSTOPSIG(status));
+
+            guest_status = (status & ~0xFF00) | ((mips_sig & 0xFF) << 8);
+        }
+        if (proc_st32(ctx, status_va, (uint32_t)guest_status) != 0) {
             return proc_ret(ctx, -EFAULT);
         }
     }

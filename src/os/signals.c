@@ -295,6 +295,9 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
             (next.handler == L4A_SIG_DFL && mips_signal_default_ignore((int)sig))) {
             mips_sig_purge_signo(ctx, (int)sig);
         }
+        /* M32-R11-4: a new disposition unblocks delivery; run any
+         * already-pending signal before returning to the guest. */
+        mips_signal_deliver_pending(ctx);
     }
     return mips_sc_ret(ctx, 0);
 }
@@ -667,8 +670,9 @@ void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr)
         mips_raise_guest(ctx, signo, addr) == 0) {
         return;
     }
-    (void)raise(signo);
-    _Exit(128 + (signo & 0x7F));
+    /* M32-R11-1: die through the shared MIPS-to-host mapping (raises
+     * the host equivalent, _Exit-only when there is none). */
+    mips_signal_default_die(signo);
 }
 
 /* Explicit-code trap (M32-R7-8/9): carry the architectural cause to the
@@ -680,8 +684,9 @@ void mips_trap_code(mips32_ctx_t *ctx, int signo, int32_t code,
         mips_raise_guest_code(ctx, signo, code, addr) == 0) {
         return;
     }
-    (void)raise(signo);
-    _Exit(128 + (signo & 0x7F));
+    /* M32-R11-1: die through the shared MIPS-to-host mapping (raises
+     * the host equivalent, _Exit-only when there is none). */
+    mips_signal_default_die(signo);
 }
 
 /* True when the live guest sp runs on the alternate stack. */
