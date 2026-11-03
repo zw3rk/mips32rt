@@ -163,7 +163,6 @@ static _Atomic int mips_live_clones = 0;
  * the stack and frees the record. Bonded by mips_reap_lock. */
 static pthread_mutex_t mips_reap_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct mips_thread *mips_reap_head = NULL;
-static __thread struct mips_thread *mips_self = NULL;
 
 static void mips_reap_done(void)
 {
@@ -228,14 +227,27 @@ static void mips_robust_wake(mips32_ctx_t *ctx)
     for (;;) {
         uint8_t nb[4], fb[4];
         uint32_t nxt, fva, val, nval;
+        uint32_t entry_va;
         if (cur == 0U || n >= MIPS_ROBUST_LIST_LIMIT) {
             break;
         }
-        if (mips_sc_copy_from(ctx, nb, cur, 4U) != 0) {
+        entry_va = cur & ~1U;
+        if (entry_va == ctx->robust_list_head) {
+            break;
+        }
+        if (entry_va == 0U) {
+            break;
+        }
+        if (mips_sc_copy_from(ctx, nb, entry_va, 4U) != 0) {
             break;
         }
         nxt = mips_sc_ld32(nb, be);
-        fva = cur + futex_off;
+        if (pending != 0U && entry_va == (pending & ~1U)) {
+            cur = nxt;
+            n++;
+            continue;
+        }
+        fva = entry_va + futex_off;
         if (mips_sc_copy_from(ctx, fb, fva, 4U) == 0) {
             val = mips_sc_ld32(fb, be);
             if ((val & MIPS_FUTEX_TID_MASK) == tid) {
@@ -251,9 +263,27 @@ static void mips_robust_wake(mips32_ctx_t *ctx)
         }
         cur = nxt;
         n++;
-        if (n == MIPS_ROBUST_LIST_LIMIT && pending != 0U) {
-            cur = pending;
-            pending = 0U;
+    }
+    if (pending != 0U) {
+        uint8_t fb[4];
+        uint32_t pva = pending & ~1U;
+        uint32_t fva, val, nval;
+        if (pva != 0U && pva != ctx->robust_list_head) {
+            fva = pva + futex_off;
+            if (mips_sc_copy_from(ctx, fb, fva, 4U) == 0) {
+                val = mips_sc_ld32(fb, be);
+                if ((val & MIPS_FUTEX_TID_MASK) == tid) {
+                    int need_wake = (val & MIPS_FUTEX_WAITERS) != 0U;
+                    nval = val | MIPS_FUTEX_OWNER_DIED;
+                    mips_sc_st32(fb, nval, be);
+                    (void)mips_sc_copy_to(ctx, fva, fb, 4U);
+                    if (need_wake) {
+                        (void)syscall(SYS_futex,
+                            mips32_guest_ptr(ctx, fva), (int)1,
+                            (uint32_t)1, NULL, NULL, (uint32_t)0);
+                    }
+                }
+            }
         }
     }
 }
@@ -349,7 +379,6 @@ static void *mips_host_thread_entry(void *arg)
     struct mips_thread *t = (struct mips_thread *)arg;
     uint32_t self;
 
-    mips_self = t;
     self = (uint32_t)syscall(SYS_gettid);
     atomic_store_explicit(&t->child_tid, (int)self, memory_order_relaxed);
     /* Publish the guest tid before waking the parent: the parent returns
@@ -497,7 +526,9 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
      * mips_host_thread_entry): real per-thread TLS for the child.
      * The parent waits for the child's tid handshake before
      * returning it to the guest. M32-R5-4: live count before startup
-     * with rollback; record joins the reaper list before create. */
+     * with rollback; record joins the reaper list only after the
+     * parent handshake (post-SETTID reads) so a fast exiting child
+     * cannot be reaped while the parent still reads t. */
     {
         pthread_t      th;
         pthread_attr_t at;
@@ -507,11 +538,6 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         atomic_init(&t->child_tid, 0);
         (void)atomic_fetch_add_explicit(&mips_live_clones, 1,
                                         memory_order_relaxed);
-        if (pthread_mutex_lock(&mips_reap_lock) == 0) {
-            t->next = mips_reap_head;
-            mips_reap_head = t;
-            (void)pthread_mutex_unlock(&mips_reap_lock);
-        }
         pr = pthread_attr_init(&at);
         if (pr == 0) {
             pr = pthread_attr_setstack(&at, stack,
@@ -526,21 +552,6 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         }
         (void)pthread_attr_destroy(&at);
         if (pr != 0) {
-            if (pthread_mutex_lock(&mips_reap_lock) == 0) {
-                struct mips_thread *pv = NULL, *cur = mips_reap_head;
-                while (cur != NULL && cur != t) {
-                    pv = cur;
-                    cur = cur->next;
-                }
-                if (cur == t) {
-                    if (pv == NULL) {
-                        mips_reap_head = t->next;
-                    } else {
-                        pv->next = t->next;
-                    }
-                }
-                (void)pthread_mutex_unlock(&mips_reap_lock);
-            }
             (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
                                             memory_order_relaxed);
             (void)munmap(stack, MIPS_THREAD_STACK_SIZE);
@@ -569,7 +580,19 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         thread_write_tid(ctx, ptid, (uint32_t)r) != 0) {
         /* The child already runs; its ctid/clear wake still fires on exit.
          * Report the fault to the parent while keeping the thread alive. */
+        if (pthread_mutex_lock(&mips_reap_lock) == 0) {
+            t->next = mips_reap_head;
+            mips_reap_head = t;
+            (void)pthread_mutex_unlock(&mips_reap_lock);
+        }
         return mips_sc_ret(ctx, -EFAULT);
+    }
+    /* M32-R5-4: publish to the reaper only after the last parent-side
+     * read of t (started/child_tid above, set_ctid/parent_settid here). */
+    if (pthread_mutex_lock(&mips_reap_lock) == 0) {
+        t->next = mips_reap_head;
+        mips_reap_head = t;
+        (void)pthread_mutex_unlock(&mips_reap_lock);
     }
     if (r > (long)0x7FFFFFFFL) {
         r = (long)0x7FFFFFFFL;
@@ -596,6 +619,14 @@ static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
     if ((cmparg & 0x800) != 0) {
         cmparg |= (int32_t)0xFFFFF000;
     }
+    if ((op & 8U) != 0U) {
+        if (oparg < 0 || oparg > 31) {
+            errno = EINVAL;
+            return -1L;
+        }
+        oparg = (int32_t)(1u << (uint32_t)oparg);
+        op &= ~8U;
+    }
     hp = (uint32_t *)(void *)mips32_guest_ptr(ctx, uaddr2);
     h_old = __atomic_load_n(hp, __ATOMIC_SEQ_CST);
     for (;;) {
@@ -619,18 +650,18 @@ static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
     }
     mips_guest_store_commit(ctx, uaddr2, (void *)hp, 4U);
     {
-        int32_t o = (int32_t)g_old, nw = (int32_t)g_new;
-        int mo = 0, mn = 0;
+        int32_t o = (int32_t)g_old;
+        int mo = 0;
         switch (cmp) {
-        case 0U: mo = (o == cmparg); mn = (nw == cmparg); break;
-        case 1U: mo = (o != cmparg); mn = (nw != cmparg); break;
-        case 2U: mo = (o < cmparg); mn = (nw < cmparg); break;
-        case 3U: mo = (o <= cmparg); mn = (nw <= cmparg); break;
-        case 4U: mo = (o > cmparg); mn = (nw > cmparg); break;
-        case 5U: mo = (o >= cmparg); mn = (nw >= cmparg); break;
+        case 0U: mo = (o == cmparg); break;
+        case 1U: mo = (o != cmparg); break;
+        case 2U: mo = (o < cmparg); break;
+        case 3U: mo = (o <= cmparg); break;
+        case 4U: mo = (o > cmparg); break;
+        case 5U: mo = (o >= cmparg); break;
         default: errno = EINVAL; return -1L;
         }
-        if (mo && val != 0U) {
+        if (val != 0U) {
             long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
                 (int)1, val, NULL, NULL, (uint32_t)0);
             if (k > 0) {
@@ -639,7 +670,7 @@ static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
                 return -1L;
             }
         }
-        if (mn && n2 != 0U) {
+        if (mo && n2 != 0U) {
             long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr2),
                 (int)1, n2, NULL, NULL, (uint32_t)0);
             if (k > 0) {
