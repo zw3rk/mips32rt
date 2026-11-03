@@ -748,12 +748,16 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
             v = 0x7FFFFFFFULL;
         return fp_write_s(&s, fd, (uint32_t)v);
     case 32u:
-        if (f == 0u)
-            break;
+        if (f == 0u) {
+            mips_trap(ctx, 4, pc);
+            return MIPS_FAULT;
+        }
         return fp_write_s(&s, fd, (uint32_t)fp_cvt_fmt(&s, 0u, ctx->fpr[fs]));
     case 33u:
-        if (f != 0u)
-            break;
+        if (f != 0u) {
+            mips_trap(ctx, 4, pc);
+            return MIPS_FAULT;
+        }
         return fp_write_d(&s, fd, fp_cvt_fmt(&s, 1u, ctx->fpr[fs]));
     case 36u:
         if (fp_to_int(&s, f, ctx->fpr[fs], 32, -1, 0, &v) != 0)

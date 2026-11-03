@@ -662,51 +662,97 @@ int rt32_vm_msync_shared(const mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
     return rc;
 }
 
-void rt32_vm_flush_shared_fd(int fd)
+int rt32_vm_flush_shared_fd(int fd)
 {
 #ifdef __APPLE__
     struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        return;
+    int rc;
+    if (fd < 0) {
+        return -EBADF;
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
     }
     vm_lock_acquire();
-    (void)vm_flush_darw_inode_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+    rc = vm_flush_darw_inode_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
     vm_lock_release();
+    return rc;
 #else
     (void)fd;
+    return 0;
 #endif
 }
 
-void rt32_vm_sync_shared_fd(int fd)
+int rt32_vm_sync_shared_fd(int fd)
 {
 #ifdef __APPLE__
     struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        return;
+    int rc = 0;
+    if (fd < 0) {
+        return -EBADF;
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
     }
     vm_lock_acquire();
     if (g_vm_root_ctx != NULL) {
         for (size_t i = 0U; i < g_vm_region_count; i++) {
             const mips32_region_t *r = &g_vm_regions[i];
             const vm_backing_t    *b = &g_vm_backing[i];
+            uint8_t *stage = NULL;
+            uint8_t *dst;
+            size_t   len;
             if (b->darw_sync == 0U || b->fd < 0 ||
                 b->dev != (uint64_t)st.st_dev || b->ino != (uint64_t)st.st_ino) {
                 continue;
             }
+            /* M32-R5-7: stage with EINTR/short-read loop; zero only the
+             * verified beyond-EOF tail, never on error. */
+            len = (size_t)(r->end - r->start);
+            stage = (uint8_t *)malloc(len ? len : 1U);
+            if (stage == NULL) {
+                rc = -ENOMEM;
+                break;
+            }
+            memset(stage, 0, len);
+            {
+                size_t off = 0U;
+                off_t cur = (off_t)b->file_off;
+                while (off < len) {
+                    ssize_t got = pread(b->fd, stage + off, len - off, cur);
+                    if (got < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        rc = -errno;
+                        break;
+                    }
+                    if (got == 0) {
+                        break;
+                    }
+                    off += (size_t)got;
+                    cur += (off_t)got;
+                }
+            }
+            if (rc != 0) {
+                free(stage);
+                break;
+            }
             if ((r->prot & (uint32_t)PROT_WRITE) == 0U) {
                 vm_host_temp_prot(r->start, r->end, PROT_READ | PROT_WRITE);
             }
-            uint8_t *dst = (uint8_t *)mips32_guest_ptr(g_vm_root_ctx, r->start);
-            size_t   len = (size_t)(r->end - r->start);
-            memset(dst, 0, len);
-            (void)pread(b->fd, dst, len, (off_t)b->file_off);
+            dst = (uint8_t *)mips32_guest_ptr(g_vm_root_ctx, r->start);
+            memcpy(dst, stage, len);
+            free(stage);
             /* M32-R3-3: union restore, never the single VMA's prot. */
             vm_host_restore_locked(r->start, r->end);
         }
     }
     vm_lock_release();
+    return rc;
 #else
     (void)fd;
+    return 0;
 #endif
 }
 

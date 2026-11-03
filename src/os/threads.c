@@ -117,9 +117,15 @@
 static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status);
 #endif
 
+#define MIPS_FUTEX_OWNER_DIED 0x40000000U
+#define MIPS_FUTEX_WAITERS 0x80000000U
+#define MIPS_FUTEX_TID_MASK 0x3FFFFFFFU
+#define MIPS_ROBUST_LIST_LIMIT 2048U
+
 struct mips_thread {
     mips32_ctx_t ctx;
     void        *host_stack;
+    struct mips_thread *next;
     uint32_t     set_ctid;
     uint32_t     clear_ctid;
     /* M32-R4-8/N-2: PARENT_SETTID address the child must write itself
@@ -151,6 +157,106 @@ long mips_trace_tid(void)
 
 /* Live CLONE_VM children; the initial thread is never counted. */
 static _Atomic int mips_live_clones = 0;
+/* M32-R5-4/R5-10: reaper list of heap records + 2 MiB stacks. Detached
+ * children exit via raw SYS_exit, so no pthread_join exists; the parent
+ * reaps a record once its host tid is gone (tkill ESRCH), then unmaps
+ * the stack and frees the record. Bonded by mips_reap_lock. */
+static pthread_mutex_t mips_reap_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct mips_thread *mips_reap_head = NULL;
+static __thread struct mips_thread *mips_self = NULL;
+
+static void mips_reap_done(void)
+{
+    struct mips_thread *prev = NULL;
+    struct mips_thread *t;
+    if (pthread_mutex_lock(&mips_reap_lock) != 0) {
+        return;
+    }
+    t = mips_reap_head;
+    while (t != NULL) {
+        struct mips_thread *nxt = t->next;
+        int dead = 0;
+        int tid = atomic_load_explicit(&t->child_tid, memory_order_relaxed);
+        if (tid != 0) {
+            long kr = syscall(SYS_tkill, (int)tid, 0);
+            if (kr != 0 && errno == ESRCH) {
+                dead = 1;
+            }
+        }
+        if (dead) {
+            if (prev == NULL) {
+                mips_reap_head = nxt;
+            } else {
+                prev->next = nxt;
+            }
+            (void)munmap(t->host_stack, MIPS_THREAD_STACK_SIZE);
+            free(t);
+        } else {
+            prev = t;
+        }
+        t = nxt;
+    }
+    (void)pthread_mutex_unlock(&mips_reap_lock);
+}
+
+/* M32-R5-5: bounded O32 robust_list wake on thread death. Walks up to
+ * LIMIT entries plus the pending slot with checked BE-aware accesses;
+ * for each futex at entry+futex_off with (val&TID_MASK)==tid, sets
+ * OWNER_DIED and wakes one waiter when WAITERS is set. */
+static void mips_robust_wake(mips32_ctx_t *ctx)
+{
+    uint8_t hb[12];
+    uint32_t head, futex_off, pending, cur;
+    uint32_t tid;
+    unsigned n = 0U;
+    int be;
+    if (ctx == NULL || ctx->robust_list_head == 0U) {
+        return;
+    }
+    be = mips_is_be(ctx);
+    if (mips_sc_copy_from(ctx, hb, ctx->robust_list_head, 12U) != 0) {
+        return;
+    }
+    head = mips_sc_ld32(hb, be);
+    futex_off = mips_sc_ld32(hb + 4, be);
+    pending = mips_sc_ld32(hb + 8, be);
+    tid = ((uint32_t)ctx->host_tid) & MIPS_FUTEX_TID_MASK;
+    if (tid == 0U) {
+        tid = ((uint32_t)syscall(SYS_gettid)) & MIPS_FUTEX_TID_MASK;
+    }
+    cur = head;
+    for (;;) {
+        uint8_t nb[4], fb[4];
+        uint32_t nxt, fva, val, nval;
+        if (cur == 0U || n >= MIPS_ROBUST_LIST_LIMIT) {
+            break;
+        }
+        if (mips_sc_copy_from(ctx, nb, cur, 4U) != 0) {
+            break;
+        }
+        nxt = mips_sc_ld32(nb, be);
+        fva = cur + futex_off;
+        if (mips_sc_copy_from(ctx, fb, fva, 4U) == 0) {
+            val = mips_sc_ld32(fb, be);
+            if ((val & MIPS_FUTEX_TID_MASK) == tid) {
+                int need_wake = (val & MIPS_FUTEX_WAITERS) != 0U;
+                nval = val | MIPS_FUTEX_OWNER_DIED;
+                mips_sc_st32(fb, nval, be);
+                (void)mips_sc_copy_to(ctx, fva, fb, 4U);
+                if (need_wake) {
+                    (void)syscall(SYS_futex, mips32_guest_ptr(ctx, fva),
+                        (int)1, (uint32_t)1, NULL, NULL, (uint32_t)0);
+                }
+            }
+        }
+        cur = nxt;
+        n++;
+        if (n == MIPS_ROBUST_LIST_LIMIT && pending != 0U) {
+            cur = pending;
+            pending = 0U;
+        }
+    }
+}
 
 /* Coordinated fork (cross-RT Round-3 class): only the forking thread
  * survives, so every CLONE_VM peer is gone in the child and the live
@@ -201,11 +307,12 @@ static int mips_thread_main(void *arg)
     return 1; /* unreachable; keeps noreturn-less compilers quiet */
 }
 
-/* Shared thread-teardown tail (CLEARTID 0-write plus FUTEX_WAKE,
- * live-clone accounting, raw SYS_exit): used by the engine-return path
- * and by guest exit().  Does not return. */
+/* Shared thread-teardown tail (robust wake + CLEARTID 0-write plus
+ * FUTEX_WAKE, live-clone accounting, raw SYS_exit): used by the
+ * engine-return path and by guest exit().  Does not return. */
 static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status)
 {
+    mips_robust_wake(ctx);
     if (ctid != 0U) {
         (void)thread_write_tid(ctx, ctid, 0U);
         (void)syscall(SYS_futex, mips32_guest_ptr(ctx, ctid),
@@ -242,6 +349,7 @@ static void *mips_host_thread_entry(void *arg)
     struct mips_thread *t = (struct mips_thread *)arg;
     uint32_t self;
 
+    mips_self = t;
     self = (uint32_t)syscall(SYS_gettid);
     atomic_store_explicit(&t->child_tid, (int)self, memory_order_relaxed);
     /* Publish the guest tid before waking the parent: the parent returns
@@ -317,6 +425,8 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         return mips_sc_ret(ctx, -EFAULT);
     }
 
+    /* M32-R5-4/R5-10: reclaim dead peers before growing. */
+    mips_reap_done();
     t = (struct mips_thread *)calloc(1U, sizeof(*t));
     if (t == NULL) {
         return mips_sc_ret(ctx, -ENOMEM);
@@ -386,7 +496,8 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     /* Detached musl pthread on the mmap'd stack (see
      * mips_host_thread_entry): real per-thread TLS for the child.
      * The parent waits for the child's tid handshake before
-     * returning it to the guest. */
+     * returning it to the guest. M32-R5-4: live count before startup
+     * with rollback; record joins the reaper list before create. */
     {
         pthread_t      th;
         pthread_attr_t at;
@@ -394,6 +505,13 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
 
         atomic_init(&t->started, 0);
         atomic_init(&t->child_tid, 0);
+        (void)atomic_fetch_add_explicit(&mips_live_clones, 1,
+                                        memory_order_relaxed);
+        if (pthread_mutex_lock(&mips_reap_lock) == 0) {
+            t->next = mips_reap_head;
+            mips_reap_head = t;
+            (void)pthread_mutex_unlock(&mips_reap_lock);
+        }
         pr = pthread_attr_init(&at);
         if (pr == 0) {
             pr = pthread_attr_setstack(&at, stack,
@@ -408,6 +526,23 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         }
         (void)pthread_attr_destroy(&at);
         if (pr != 0) {
+            if (pthread_mutex_lock(&mips_reap_lock) == 0) {
+                struct mips_thread *pv = NULL, *cur = mips_reap_head;
+                while (cur != NULL && cur != t) {
+                    pv = cur;
+                    cur = cur->next;
+                }
+                if (cur == t) {
+                    if (pv == NULL) {
+                        mips_reap_head = t->next;
+                    } else {
+                        pv->next = t->next;
+                    }
+                }
+                (void)pthread_mutex_unlock(&mips_reap_lock);
+            }
+            (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
+                                            memory_order_relaxed);
             (void)munmap(stack, MIPS_THREAD_STACK_SIZE);
             free(t);
             return mips_sc_ret(ctx, -(int32_t)pr);
@@ -436,12 +571,85 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
          * Report the fault to the parent while keeping the thread alive. */
         return mips_sc_ret(ctx, -EFAULT);
     }
-    (void)atomic_fetch_add_explicit(&mips_live_clones, 1,
-                                    memory_order_relaxed);
     if (r > (long)0x7FFFFFFFL) {
         r = (long)0x7FFFFFFFL;
     }
     return mips_sc_ret(ctx, (int32_t)r);
+}
+
+/* M32-R5-2: BE WAKE_OP emulated in guest value domain. Decodes the
+ * Linux FUTEX_WAKE_OP val3 (op<<28|cmp<<24|oparg<<12|cmparg, 12-bit
+ * signed immediates), CAS-loops on the host word with bswap so the RMW
+ * is atomic vs host waiters, bumps LL/SC epochs, then wakes. */
+static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
+    uint32_t uaddr2, uint32_t val, uint32_t n2, uint32_t val3)
+{
+    uint32_t op = (val3 >> 28) & 0xFU, cmp = (val3 >> 24) & 0xFU;
+    int32_t oparg = (int32_t)(val3 >> 12 & 0xFFFU);
+    int32_t cmparg = (int32_t)(val3 & 0xFFFU);
+    uint32_t *hp;
+    uint32_t h_old, h_new, g_old, g_new;
+    long w = 0L;
+    if ((oparg & 0x800) != 0) {
+        oparg |= (int32_t)0xFFFFF000;
+    }
+    if ((cmparg & 0x800) != 0) {
+        cmparg |= (int32_t)0xFFFFF000;
+    }
+    hp = (uint32_t *)(void *)mips32_guest_ptr(ctx, uaddr2);
+    h_old = __atomic_load_n(hp, __ATOMIC_SEQ_CST);
+    for (;;) {
+        uint32_t exp;
+        g_old = __builtin_bswap32(h_old);
+        switch (op) {
+        case 0U: g_new = (uint32_t)oparg; break;
+        case 1U: g_new = g_old + (uint32_t)oparg; break;
+        case 2U: g_new = g_old | (uint32_t)oparg; break;
+        case 3U: g_new = g_old & ~(uint32_t)oparg; break;
+        case 4U: g_new = g_old ^ (uint32_t)oparg; break;
+        default: errno = EINVAL; return -1L;
+        }
+        h_new = __builtin_bswap32(g_new);
+        exp = h_old;
+        if (__atomic_compare_exchange_n(hp, &exp, h_new, 0,
+                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            break;
+        }
+        h_old = exp;
+    }
+    mips_guest_store_commit(ctx, uaddr2, (void *)hp, 4U);
+    {
+        int32_t o = (int32_t)g_old, nw = (int32_t)g_new;
+        int mo = 0, mn = 0;
+        switch (cmp) {
+        case 0U: mo = (o == cmparg); mn = (nw == cmparg); break;
+        case 1U: mo = (o != cmparg); mn = (nw != cmparg); break;
+        case 2U: mo = (o < cmparg); mn = (nw < cmparg); break;
+        case 3U: mo = (o <= cmparg); mn = (nw <= cmparg); break;
+        case 4U: mo = (o > cmparg); mn = (nw > cmparg); break;
+        case 5U: mo = (o >= cmparg); mn = (nw >= cmparg); break;
+        default: errno = EINVAL; return -1L;
+        }
+        if (mo && val != 0U) {
+            long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
+                (int)1, val, NULL, NULL, (uint32_t)0);
+            if (k > 0) {
+                w += k;
+            } else if (k < 0 && errno != 0) {
+                return -1L;
+            }
+        }
+        if (mn && n2 != 0U) {
+            long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr2),
+                (int)1, n2, NULL, NULL, (uint32_t)0);
+            if (k > 0) {
+                w += k;
+            } else if (k < 0 && errno != 0) {
+                return (w > 0) ? w : -1L;
+            }
+        }
+    }
+    return w;
 }
 
 /* uaddr usable by the host futex: aligned and guest-readable. */
@@ -523,16 +731,20 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
             }
             top = &to;
         }
+        /* M32-R5-2: BE kernel compares LE words; swap expected val. */
         if (base_op == (int)MIPS_FUTEX_WAIT) {
+            uint32_t hv = be ? __builtin_bswap32(val) : val;
             r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
-                        (uint32_t)val, top, NULL, (uint32_t)0);
+                        hv, top, NULL, (uint32_t)0);
         } else {
+            uint32_t hv;
             val3 = mips_sc_arg(ctx, sp, 5, &ok);
             if (!ok) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
+            hv = be ? __builtin_bswap32(val) : val;
             r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
-                        (uint32_t)val, top, NULL, (uint32_t)val3);
+                        hv, top, NULL, (uint32_t)val3);
         }
         break;
     }
@@ -560,10 +772,15 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
         if (rc != 0) {
             return mips_sc_ret(ctx, rc);
         }
-        /* The relative-timeout slot is unused by both requeue ops. */
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
-                    (uint32_t)val, NULL, mips32_guest_ptr(ctx, uaddr2),
-                    (uint32_t)val3);
+        /* M32-R5-3: 4th arg is nr_requeue count, not a timeout ptr.
+         * M32-R5-2: CMP_REQUEUE compares memory; swap expected val3 on BE. */
+        {
+            const void *nr = (const void *)(uintptr_t)to_va;
+            uint32_t hv3 = (base_op == MIPS_FUTEX_CMP_REQUEUE && be)
+                ? __builtin_bswap32(val3) : val3;
+            r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
+                        (uint32_t)val, nr, mips32_guest_ptr(ctx, uaddr2), hv3);
+        }
         break;
     case MIPS_FUTEX_WAKE_OP:
         uaddr2 = mips_sc_arg(ctx, sp, 4, &ok);
@@ -575,9 +792,15 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
         if (rc != 0) {
             return mips_sc_ret(ctx, rc);
         }
-        r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
-                    (uint32_t)val, NULL, mips32_guest_ptr(ctx, uaddr2),
-                    (uint32_t)val3);
+        /* M32-R5-3: 4th arg is nr_wake2 count. M32-R5-2: BE emulates. */
+        if (be) {
+            r = futex_wake_op_be(ctx, uaddr, uaddr2, val, to_va, val3);
+        } else {
+            const void *nr2 = (const void *)(uintptr_t)to_va;
+            r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
+                        (uint32_t)val, nr2, mips32_guest_ptr(ctx, uaddr2),
+                        (uint32_t)val3);
+        }
         break;
     default:
         return mips_sc_ret(ctx, -ENOSYS);

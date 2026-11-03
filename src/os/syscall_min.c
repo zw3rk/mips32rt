@@ -131,7 +131,7 @@ static void copy_uts_field(uint8_t *dst, const char *src)
 
 static int32_t sc_read(mips32_ctx_t *ctx, uint32_t sp)
 {
-    uint8_t  *host_buf;
+    uint8_t  *tmp = NULL;
     int       ok = 1;
     uint32_t  fd;
     uint32_t  buf;
@@ -144,22 +144,31 @@ static int32_t sc_read(mips32_ctx_t *ctx, uint32_t sp)
     if (!ok) {
         return sc_ret(ctx, -EFAULT);
     }
-    if (count > 0U && !range_ok(ctx, buf, count, (uint32_t)PROT_WRITE)) {
+    if (count == 0U) {
+        return sc_ret(ctx, 0);
+    }
+    if (!range_ok(ctx, buf, count, (uint32_t)PROT_WRITE)) {
         return sc_ret(ctx, -EFAULT);
     }
-    host_buf = (uint8_t *)mips32_guest_ptr(ctx, buf);
-    n        = read((int)fd, host_buf, (size_t)count);
+    /* M32-R5-6: stage into host tmp, then copy_to under LL/SC lock so a
+     * concurrent LL+SC on same-value bytes cannot win mid-read. */
+    tmp = (uint8_t *)malloc((size_t)count);
+    if (tmp == NULL) {
+        return sc_ret(ctx, -ENOMEM);
+    }
+    n = read((int)fd, tmp, (size_t)count);
     if (n < 0) {
-        return sc_ret(ctx, -(int32_t)errno);
+        int e = errno;
+        free(tmp);
+        return sc_ret(ctx, -(int32_t)e);
     }
     if (n > 0) {
-        /* M32-R4-2: the host read wrote guest memory behind the
-         * epoch tracker, so commit the transferred bytes through the
-         * LL/SC-aware store path (self-copy: data is already in
-         * place; only epochs/reservations update). Takes just the LL
-         * lock, never held across the blocking read above. */
-        mips_guest_store_commit(ctx, buf, host_buf, (uint32_t)n);
+        if (rt32_vm_copy_to(ctx, buf, tmp, (uint32_t)n) != 0) {
+            free(tmp);
+            return sc_ret(ctx, -EFAULT);
+        }
     }
+    free(tmp);
     if (n > 0x7FFFFFFFL) {
         n = 0x7FFFFFFFL;
     }
@@ -185,13 +194,21 @@ static int32_t sc_write(mips32_ctx_t *ctx, uint32_t sp)
         return sc_ret(ctx, -EFAULT);
     }
     host_buf = (const uint8_t *)mips32_guest_ptr(ctx, buf);
-    rt32_vm_flush_shared_fd((int)fd);
-    n        = write((int)fd, host_buf, (size_t)count);
+    {
+        int frc = rt32_vm_flush_shared_fd((int)fd);
+        if (frc != 0) {
+            return sc_ret(ctx, frc);
+        }
+    }
+    n = write((int)fd, host_buf, (size_t)count);
     if (n < 0) {
         return sc_ret(ctx, -(int32_t)errno);
     }
     if (n > 0) {
-        rt32_vm_sync_shared_fd((int)fd);
+        int src = rt32_vm_sync_shared_fd((int)fd);
+        if (src != 0) {
+            return sc_ret(ctx, src);
+        }
     }
     if (n > 0x7FFFFFFFL) {
         n = 0x7FFFFFFFL;

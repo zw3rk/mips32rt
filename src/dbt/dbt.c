@@ -49,6 +49,7 @@
 #include "mips32rt.h"
 #include "dbt/aot_emit.h"
 #include "dbt/dbt.h"
+#include "vm/vm32.h"
 
 /* MIPS major opcodes needed for block-boundary classification. */
 #define DBT_OP_SPECIAL 0x00U
@@ -646,6 +647,12 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     }
     if (dbt_cache_ensure(ctx) != 0) {
         return MIPS_FAULT;
+    }
+    /* M32-R5-1: A2 hosts (H > 4096) alias four 4 KiB guest sub-pages
+     * onto one host page; direct [xG,wAddr,uxtw] DBT loads/stores
+     * bypass sub-page guards. Force interp_step (validated A2 path). */
+    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+        return 1;
     }
     /* SPEC 2.2: a block starting at the last word of a page always
      * single-steps (the branch+delay-slot pair spans the page). */

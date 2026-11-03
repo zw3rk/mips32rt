@@ -75,13 +75,26 @@ int mips32_file_populate_private(mips32_ctx_t *ctx, uint32_t gva,
     return 0;
 }
 
+static uint64_t o32_trunc64_len(mips32_ctx_t *ctx, uint32_t a2, uint32_t a3)
+{
+    return mips_is_be(ctx) ? (((uint64_t)a2 << 32) | (uint64_t)a3)
+                           : (((uint64_t)a3 << 32) | (uint64_t)a2);
+}
+
 static int mips32_file_truncate_at(int fd, uint64_t len)
 {
-    rt32_vm_flush_shared_fd(fd);
+    int frc = rt32_vm_flush_shared_fd(fd);
+    int src;
+    if (frc != 0) {
+        return frc;
+    }
     if (ftruncate(fd, (off_t)len) != 0) {
         return -errno;
     }
-    rt32_vm_sync_shared_fd(fd);
+    src = rt32_vm_sync_shared_fd(fd);
+    if (src != 0) {
+        return src;
+    }
     return 0;
 }
 
@@ -116,16 +129,13 @@ int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
             }
             len = (uint64_t)(int64_t)len32;
         } else {
-            /* O32 even-register rule: the 64-bit length starts in a2
-             * (a1 is padding).  BE passes high word first, LE passes
-             * low word first. */
+            /* O32 even-register rule (a2/a3, a1 padding). */
             uint32_t a2 = mips_sc_arg(ctx, sp, 2, &ok);
             uint32_t a3 = mips_sc_arg(ctx, sp, 3, &ok);
             if (!ok) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
-            len = mips_is_be(ctx) ? (((uint64_t)a2 << 32) | (uint64_t)a3)
-                                  : (((uint64_t)a3 << 32) | (uint64_t)a2);
+            len = o32_trunc64_len(ctx, a2, a3);
         }
         rc = mips_sc_read_cstr(ctx, path_va, path);
         if (rc != 0) {
@@ -158,16 +168,13 @@ int32_t mips32_file_sc_truncate(mips32_ctx_t *ctx, uint32_t sp, uint32_t nr)
             }
             len = (uint64_t)(int64_t)len32;
         } else {
-            /* O32 even-register rule: the 64-bit length starts in a2
-             * (a1 is padding).  BE passes high word first, LE passes
-             * low word first. */
+            /* O32 even-register rule (a2/a3, a1 padding). */
             uint32_t a2 = mips_sc_arg(ctx, sp, 2, &ok);
             uint32_t a3 = mips_sc_arg(ctx, sp, 3, &ok);
             if (!ok) {
                 return mips_sc_ret(ctx, -EFAULT);
             }
-            len = mips_is_be(ctx) ? (((uint64_t)a2 << 32) | (uint64_t)a3)
-                                  : (((uint64_t)a3 << 32) | (uint64_t)a2);
+            len = o32_trunc64_len(ctx, a2, a3);
         }
         rc = mips32_file_truncate_at((int)fd, len);
         if (rc != 0) {

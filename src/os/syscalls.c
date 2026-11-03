@@ -4,44 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Handlers for the O32 numbers that Phase 1 (src/os/syscall_min.c) left
- * as -ENOSYS: open/openat, close, lseek/llseek, dup/dup2/dup3,
- * pipe/pipe2, readv/writev, fcntl/fcntl64, ioctl (basic), stat64 family,
- * statx, getdents64, readlink/readlinkat, access, close_range, nanosleep,
- * clock_gettime(-64), getpid family, getrandom, futex (single-threaded),
- * rt_sigaction/rt_sigprocmask/rt_sigreturn/sigaltstack (Phase 4),
- * set/get_robust_list.  Unknown syscalls keep -ENOSYS with $a3=1.
- *
- * Companion file src/os/syscalls_meta.c holds the fcntl/ioctl/stat/time
- * handlers (split only for the 900-line file limit); shared constants
- * and guest helpers live in src/os/syscalls_priv.h.
- *
- * Numbers live in src/os/syscall_nr.h; every value below is cited there
- * against /usr/mipsel-linux-gnu/include/asm/unistd_o32.h
- * (libc6-dev-mipsel-cross 2.36-8cross2, Debian bookworm-slim,
- * linux/arm64).  MIPS constant values (O_*, F_*, FUTEX_*, ioctl) are
- * cited inline against arch/mips/include/uapi/asm/{fcntl,ioctl,ioctls}.h
- * and include/uapi/linux/futex.h.
- *
- * O32 convention (SPEC 2.3, E01): number in $v0, args 1..4 in $a0..$a3,
- * args 5..8 at guest (sp+16)..(sp+28); success $a3=0/$v0=ret, error
- * $a3=1/$v0=positive MIPS errno.  pipe (4042) additionally returns the
- * second fd in $v1.  64-bit pairs align even (E01 section 5).
- *
- * Endianness: every multi-byte guest scalar goes through the xld/xst
- * helpers keyed on mips_is_be, so BE (mips) guests work unchanged.
- * Bulk copies validate recorded regions (PROT_READ/WRITE) and return
- * -EFAULT instead of raising, so unaligned guest buffers cannot trip
- * the aligned-only guest_ld/st32 fault path.
- *
- * Phase 4 notes (lanes L4a/L4b, see src/os/signals.c, src/os/threads.c):
- *  - futex: FUTEX_WAIT/FUTEX_WAKE (+PRIVATE) via the host futex; the
- *    wait is unconditional once *uaddr matches (no thread table yet).
- *  - rt_sigaction / rt_sigprocmask record into the guest-owned 128-bit
- *    tables; rt_sigreturn restores from the live frame (never wrapped);
- *    sigaltstack manages the ctx alternate-stack fields.
- *  - set/get_robust_list: recorded in ctx (fields already exist); the
- *    kernel only wakes robust futexes on thread exit (Phase 4).
+ * O32 static-libc layer: open/close/lseek/dup/pipe/readv/writev,
+ * fcntl/ioctl/stat/time/getdents/readlink/access/nanosleep/ids/getrandom,
+ * futex/signal/robust (Phase 4 in signals/threads.c). $a3 convention;
+ * BE via xld/xst; bulk copies validate regions (-EFAULT, never raise).
+ * Companion: syscalls_meta.c (split for 900-line limit).
  */
 
 #if defined(__linux__)
@@ -622,6 +589,7 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
 {
     struct iovec *vec = NULL;
     uint32_t     *bases = NULL;
+    uint8_t     **tmps = NULL;
     int           ok = 1;
     int           be;
     uint32_t      fd;
@@ -643,18 +611,26 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
         return mips_sc_ret(ctx, 0);
     }
     vec = (struct iovec *)malloc((size_t)count * sizeof(*vec) +
-                                       (size_t)count * sizeof(*bases));
+            (size_t)count * (sizeof(*bases) + sizeof(*tmps)));
     if (vec == NULL) {
         return mips_sc_ret(ctx, -ENOMEM);
     }
     bases = (uint32_t *)(void *)(vec + count);
+    tmps = (uint8_t **)(void *)(bases + count);
+    for (i = 0; i < count; i++) {
+        tmps[i] = NULL;
+    }
     be = mips_is_be(ctx);
     for (i = 0; i < count; i++) {
         uint8_t  ent[8];
         uint32_t base;
         uint32_t len;
+        uint32_t j;
 
         if (mips_sc_copy_from(ctx, ent, iov_va + 8U * i, 8U) != 0) {
+            for (j = 0; j < count; j++) {
+                free(tmps[j]);
+            }
             free(vec);
             return mips_sc_ret(ctx, -EFAULT);
         }
@@ -663,25 +639,46 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
         if (len > 0U &&
             !mips_sc_range_ok(ctx, base, len, (uint32_t)(is_write ? PROT_READ
                                                           : PROT_WRITE))) {
+            for (j = 0; j < count; j++) {
+                free(tmps[j]);
+            }
             free(vec);
             return mips_sc_ret(ctx, -EFAULT);
         }
         bases[i] = base;
-        vec[i].iov_base = (len == 0U) ? NULL :
-                          mips32_guest_ptr(ctx, base);
+        /* M32-R5-6: reads stage into host tmps; writes stay direct. */
+        if (!is_write && len > 0U) {
+            tmps[i] = (uint8_t *)malloc((size_t)len);
+            if (tmps[i] == NULL) {
+                for (j = 0; j < i; j++) {
+                    free(tmps[j]);
+                }
+                free(vec);
+                return mips_sc_ret(ctx, -ENOMEM);
+            }
+            vec[i].iov_base = tmps[i];
+        } else {
+            vec[i].iov_base = (len == 0U) ? NULL :
+                              mips32_guest_ptr(ctx, base);
+        }
         vec[i].iov_len  = (size_t)len;
     }
     if (is_write) {
-        rt32_vm_flush_shared_fd((int)fd);
+        int frc = rt32_vm_flush_shared_fd((int)fd);
+        if (frc != 0) {
+            for (i = 0; i < count; i++) {
+                free(tmps[i]);
+            }
+            free(vec);
+            return mips_sc_ret(ctx, frc);
+        }
     }
     n = is_write ? writev((int)fd, vec, (int)count)
                  : readv((int)fd, vec, (int)count);
     if (!is_write && n > 0) {
-        /* M32-R4-2: host readv wrote guest memory behind the epoch
-         * tracker: commit each transferred slice (iovec order) so
-         * overlapping LL/SC reservations invalidate. Self-copies;
-         * only epochs/reservations update, no I/O reordered. */
+        /* M32-R5-6: commit staged bytes via copy_to under LL/SC lock. */
         uint64_t rem = (uint64_t)n;
+        int cfail = 0;
 
         for (i = 0; i < count && rem > 0U; i++) {
             uint64_t k = (uint64_t)vec[i].iov_len;
@@ -689,20 +686,34 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
             if (k > rem) {
                 k = rem;
             }
-            if (k > 0U) {
-                mips_guest_store_commit(ctx, bases[i],
-                                        mips32_guest_ptr(ctx, bases[i]),
-                                        (uint32_t)k);
+            if (k > 0U && rt32_vm_copy_to(ctx, bases[i], tmps[i],
+                    (uint32_t)k) != 0) {
+                cfail = 1;
+                break;
             }
             rem -= k;
         }
+        for (i = 0; i < count; i++) {
+            free(tmps[i]);
+        }
+        free(vec);
+        if (cfail) {
+            return mips_sc_ret(ctx, -EFAULT);
+        }
+    } else {
+        for (i = 0; i < count; i++) {
+            free(tmps[i]);
+        }
+        free(vec);
     }
-    free(vec);
     if (n < 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
     }
     if (is_write && n > 0) {
-        rt32_vm_sync_shared_fd((int)fd);
+        int src = rt32_vm_sync_shared_fd((int)fd);
+        if (src != 0) {
+            return mips_sc_ret(ctx, src);
+        }
     }
     if (n > (ssize_t)0x7FFFFFFFL) {
         n = (ssize_t)0x7FFFFFFFL;

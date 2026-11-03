@@ -80,6 +80,23 @@ run_one() {
 run_one a "$ENGA"
 run_one b "$ENGB"
 
+# M32-R5-9: timeout/infra exits (>=124) and empty outputs never pass.
+for _t in a b; do
+    _c="$(cat "$WORK/$_t.exit")"
+    case "$_c" in
+        ''|*[!0-9]*) fail "infrastructure: non-numeric exit in leg $_t: $_c" ;;
+    esac
+    if [ "$_c" -ge 124 ]; then
+        fail "infrastructure exit $_c in leg $_t (>=124 timeout/signal)"
+    fi
+    if [ ! -s "$WORK/$_t.trace" ]; then
+        fail "empty instruction trace in leg $_t (exit $_c)"
+    fi
+    if [ ! -s "$WORK/$_t.regs" ]; then
+        fail "empty register dump in leg $_t (exit $_c)"
+    fi
+done
+
 divs=0
 if [ "$(cat "$WORK/a.exit")" != "$(cat "$WORK/b.exit")" ]; then
     echo "--- exit-code divergence ($ENGA vs $ENGB) ---"
