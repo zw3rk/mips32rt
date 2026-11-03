@@ -671,6 +671,19 @@ void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr)
     _Exit(128 + (signo & 0x7F));
 }
 
+/* Explicit-code trap (M32-R7-8/9): carry the architectural cause to the
+ * frame instead of the default l4a_fault_code mapping. */
+void mips_trap_code(mips32_ctx_t *ctx, int signo, int32_t code,
+    uint32_t addr)
+{
+    if (ctx != NULL && mips_signal_has_handler(signo) &&
+        mips_raise_guest_code(ctx, signo, code, addr) == 0) {
+        return;
+    }
+    (void)raise(signo);
+    _Exit(128 + (signo & 0x7F));
+}
+
 /* True when the live guest sp runs on the alternate stack. */
 static int l4a_on_altstack(const mips32_ctx_t *ctx)
 {

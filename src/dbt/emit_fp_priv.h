@@ -20,11 +20,12 @@
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
 
-/* COP1 fmt (rs) selectors. */
+/* COP1 fmt (rs) selectors (MIPS32r2 Table 6-2: S=16, D=17, W=20, L=21;
+ * 18/19 are reserved). Shared with src/interp/fp.c (0x14/0x15). */
 #define FP_FMT_S 16U
 #define FP_FMT_D 17U
-#define FP_FMT_W 18U
-#define FP_FMT_L 19U
+#define FP_FMT_W 20U
+#define FP_FMT_L 21U
 
 /* COP1 move/branch (rs) selectors. */
 #define FP_RS_MFC1 0U

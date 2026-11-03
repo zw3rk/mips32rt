@@ -249,6 +249,23 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
     mips_trap(ctx, signo, addr);
 }
 
+/* Explicit alignment fault (M32-R7-6): never inferred from FIXADE or
+ * address bits; always AdEL/AdES SIGBUS. Callers use this for LL/SC,
+ * fetch, and FP widths (incl. 8-byte at 4 mod 8). */
+void mips_fault_align(mips32_ctx_t *ctx, uint32_t addr)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->llbit = 0U;
+    ctx->exit_reason = MIPS32_EXIT_FAULT;
+    ctx->exit_info = addr;
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x align-fault %08x\n", ctx->pc, addr);
+    }
+    mips_trap(ctx, 10, addr);
+}
+
 /* Regime-A2 access validation (RC-U3-r3 #4): route every byte through
  * the Soft-TLB miss helper so unmapped pages fault, clean COW pages
  * promote on first write, and the TLB entry is installed for the

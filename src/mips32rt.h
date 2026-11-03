@@ -408,6 +408,9 @@ int guest_sc32(mips32_ctx_t *ctx, uint32_t va, uint32_t exp_val,
                uint32_t new_val, int *ok);                          /* aligned-only */
 /* Synchronous fault: records EXIT_FAULT (lane L1c; signals in Phase 4). */
 void mips_fault(mips32_ctx_t *ctx, uint32_t addr);
+/* Explicit alignment fault (M32-R7-6): AdEL/AdES SIGBUS regardless of
+ * FIXADE or address low bits. Mapping faults keep mips_fault. */
+void mips_fault_align(mips32_ctx_t *ctx, uint32_t addr);
 /* LL/SC exclusion spinlock (src/os/mem.c, RC-U3-r3): every store's epoch
  * bump and every SC check-and-store run under it, closing the
  * same-value race window. mips_ll_abandon releases it when a host
@@ -466,6 +469,9 @@ int mips_signal_has_handler(int signo);
 /* Synchronous trap delivery for non-memory faults (src/os/signals.c):
  * delivers signo (SIGILL/SIGFPE/SIGTRAP/...) or dies by it. */
 void mips_trap(mips32_ctx_t *ctx, int signo, uint32_t addr);
+/* Explicit-code trap (M32-R7-8/9): architectural cause -> si_code. */
+void mips_trap_code(mips32_ctx_t *ctx, int signo, int32_t code,
+    uint32_t addr);
 /* O32 signal syscalls (src/os/signals.c, wired in Phase 4): rt_sigaction
  * and rt_sigprocmask record into the guest-owned tables; sigaltstack
  * manages ctx sigalt fields; sigreturn restores from the live frame. */

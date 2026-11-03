@@ -1,17 +1,8 @@
-/*
- * src/interp/interp.c — MIPS32r2 integer reference interpreter (Phase 1).
- *
+/* src/interp/interp.c — MIPS32r2 integer reference interpreter (Phase 1).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Step-by-step oracle for the SPEC 2 integer subset: ALU/shifts, MULT/DIV
- * via hi/lo, branches with delay slots and likely-annul, J/JAL/JR/JALR
- * (ra = pc+8), SYSCALL via the L1c dispatcher, BREAK/traps via mips_trap,
- * aligned loads/stores, LWL/LWR/SWL/SWR per E05, LL/SC, RDHWR $29 and
- * MFC0/DMFC0 ulr alias, CACHE/PREF/SYNCI as NOP.  FP/COP1/COP2 and unknown
- * encodings fault; $0 stays 0; syscall exits clear llbit.
- */
+ * SPDX-License-Identifier: Apache-2.0 (SPEC 2 integer oracle; see SPEC.md). */
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -22,15 +13,10 @@
 
 static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d);
 
-/* Cross-lane hook (same weak-reference pattern as src/os/proc.c): the
- * Phase 2 DBT provides mips32_dbt_invalidate_range; without it
- * (interp-only link) SYNCI stays a pure NOP. */
+/* Cross-lane hook: DBT provides mips32_dbt_invalidate_range; else SYNCI NOP. */
 __attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
                                                       uint32_t start,
                                                       uint32_t end);
-
-/* RC-U3-R2 epoch record (src/os/mem.c): LL snapshots the shared line
- * epoch into the u3_pad tail bytes for the later SC check. */
 extern void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val);
 
 static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
@@ -42,9 +28,17 @@ static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
     return MIPS_FAULT;
 }
 
-/* Synchronous trap with an explicit signal (RC4): reserved encodings
- * deliver SIGILL, BREAK/traps SIGTRAP, integer overflow SIGFPE. Only
- * call this when no fault is recorded yet; mips_trap delivers or dies. */
+/* Explicit alignment fault (M32-R7-6): AdEL/AdES, never mapping. */
+static int fault_align_at(mips32_ctx_t *ctx, uint32_t addr)
+{
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x align at %08x\n", ctx->pc, addr);
+    }
+    mips_fault_align(ctx, addr);
+    return MIPS_FAULT;
+}
+
+/* Sync trap with explicit signal; mips_trap delivers or dies. */
 static int fault_signo_at(mips32_ctx_t *ctx, uint32_t addr, int signo)
 {
     if (ctx->trace_enabled) {
@@ -55,7 +49,19 @@ static int fault_signo_at(mips32_ctx_t *ctx, uint32_t addr, int signo)
     return MIPS_FAULT;
 }
 
-/* Fetch and decode the word at pc; fault when the fetcher did not. */
+/* Explicit si_code trap (M32-R7-8/9): architectural cause -> frame. */
+static int fault_code_at(mips32_ctx_t *ctx, uint32_t addr, int signo,
+                         int32_t code)
+{
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %08x trap %d code %d at %08x\n", ctx->pc,
+                      signo, code, addr);
+    }
+    mips_trap_code(ctx, signo, code, addr);
+    return MIPS_FAULT;
+}
+
+/* Fetch and decode the word at pc. */
 static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
 {
     uint32_t word = 0u;
@@ -65,7 +71,11 @@ static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
     if (mips_fetch(ctx, pc, &word) != 0) {
         if (ctx->exit_reason == MIPS32_EXIT_NONE &&
             ctx->sig_depth == pre_depth && ctx->pc == pre_pc) {
-            mips_fault(ctx, pc);
+            if ((pc & 3U) != 0U) {
+                mips_fault_align(ctx, pc);
+            } else {
+                mips_fault(ctx, pc);
+            }
         }
         return MIPS_FAULT;
     }
@@ -100,11 +110,7 @@ static uint32_t rot_right(uint32_t v, unsigned n)
     return (v >> n) | (v << ((32u - n) & 31u));
 }
 
-/* SYSCALL: clears llbit; dispatcher owns $v0/$a3 writeback (including
- * legitimate nonzero guest results like brk addresses and byte counts).
- * The dispatcher's int32 return is opaque here: guest-visible errors are
- * already in $v0/$a3.  Returns 0 (caller advances pc), 2 (dispatcher
- * moved pc: keep it), 1 (stop). */
+/* SYSCALL: clears llbit; 0 = advance pc, 2 = dispatcher moved pc, 1 = stop. */
 static int exec_syscall(mips32_ctx_t *ctx)
 {
     uint32_t before = ctx->pc;
@@ -119,7 +125,7 @@ static int exec_syscall(mips32_ctx_t *ctx)
     return (ctx->pc != before) ? 2 : 0;
 }
 
-/* Signed ADD/SUB overflow probes without signed UB (uint32 arithmetic). */
+/* ADD/SUB overflow probes (uint32 arithmetic, no signed UB). */
 static int add_overflows(uint32_t a, uint32_t b, uint32_t s)
 {
     return (((a ^ s) & (b ^ s)) & 0x80000000u) != 0u;
@@ -130,8 +136,7 @@ static int sub_overflows(uint32_t a, uint32_t b, uint32_t d)
     return (((a ^ b) & (a ^ d)) & 0x80000000u) != 0u;
 }
 
-/* Execute one non-control instruction; callers advance ctx->pc except
- * for exec_syscall's dispatcher-moved-pc case (returns 2). */
+/* Execute one non-control instruction. */
 static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
 {
     uint32_t rs = ctx->gpr[d->rs];
@@ -192,9 +197,18 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x0Cu: /* SYSCALL */
         return exec_syscall(ctx);
     case 0x0Du: /* BREAK */
-    case 0x3Fu: /* SDBBP */
-        return fault_signo_at(ctx, cur_pc, 5); /* SIGTRAP */
-    case 0x0Fu: /* SYNC */
+    case 0x3Fu: { /* SDBBP (M32-R7-9: preserve 20-bit code; 6/7 -> SIGFPE) */
+        uint32_t code = (d->word >> 6) & 0xFFFFFU;
+        if (code == 6u) {
+            return fault_code_at(ctx, cur_pc, 8, 2); /* FPE_INTOVF */
+        }
+        if (code == 7u) {
+            return fault_code_at(ctx, cur_pc, 8, 1); /* FPE_INTDIV */
+        }
+        return fault_code_at(ctx, cur_pc, 5, (int32_t)code);
+    }
+    case 0x0Fu: /* SYNC (full barrier for SYNC 0: M32-R7-5) */
+        atomic_thread_fence(memory_order_seq_cst);
         return 0;
     case 0x10u: /* MFHI */
         interp_set_reg(ctx, d->rd, ctx->hi);
@@ -236,20 +250,20 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             ctx->hi = rs % rt;
         }
         return 0;
-    case 0x20u: /* ADD */
+    case 0x20u: /* ADD (M32-R7-8: FPE_INTOVF) */
         out = rs + rt;
         if (add_overflows(rs, rt, out)) {
-            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
+            return fault_code_at(ctx, cur_pc, 8, 2);
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
     case 0x21u: /* ADDU */
         interp_set_reg(ctx, d->rd, rs + rt);
         return 0;
-    case 0x22u: /* SUB */
+    case 0x22u: /* SUB (M32-R7-8: FPE_INTOVF) */
         out = rs - rt;
         if (sub_overflows(rs, rt, out)) {
-            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
+            return fault_code_at(ctx, cur_pc, 8, 2);
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
@@ -274,18 +288,21 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x2Bu: /* SLTU */
         interp_set_reg(ctx, d->rd, rs < rt ? 1u : 0u);
         return 0;
-    case 0x30u: /* TGE */
-        return (int32_t)rs >= (int32_t)rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
-    case 0x31u: /* TGEU */
-        return rs >= rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
-    case 0x32u: /* TLT */
-        return (int32_t)rs < (int32_t)rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
-    case 0x33u: /* TLTU */
-        return rs < rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
-    case 0x34u: /* TEQ */
-        return rs == rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
-    case 0x36u: /* TNE */
-        return rs != rt ? fault_signo_at(ctx, cur_pc, 5) : 0;
+    case 0x30u: case 0x31u: case 0x32u: case 0x33u: case 0x34u: case 0x36u: {
+        uint32_t code = (d->word >> 6) & 0x3FFU; /* M32-R7-9: 10-bit code */
+        int fire = (d->funct == 0x30u) ? ((int32_t)rs >= (int32_t)rt) :
+                   (d->funct == 0x31u) ? (rs >= rt) :
+                   (d->funct == 0x32u) ? ((int32_t)rs < (int32_t)rt) :
+                   (d->funct == 0x33u) ? (rs < rt) :
+                   (d->funct == 0x34u) ? (rs == rt) : (rs != rt);
+        if (!fire)
+            return 0;
+        if (code == 6u)
+            return fault_code_at(ctx, cur_pc, 8, 2);
+        if (code == 7u)
+            return fault_code_at(ctx, cur_pc, 8, 1);
+        return fault_code_at(ctx, cur_pc, 5, (int32_t)code);
+    }
     default:
         return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
@@ -298,12 +315,14 @@ static int exec_special2(mips32_ctx_t *ctx, uint32_t cur_pc,
     uint32_t rt = ctx->gpr[d->rt];
 
     switch (d->funct) {
-    case 0x00u: /* MADD */
+    case 0x00u: /* MADD (wrap modulo 2^64, unsigned only: M32-R7-4) */
         {
-            int64_t acc = (int64_t)(((uint64_t)ctx->hi << 32) | ctx->lo);
-            acc += (int64_t)(int32_t)rs * (int64_t)(int32_t)rt;
-            ctx->lo = (uint32_t)(uint64_t)acc;
-            ctx->hi = (uint32_t)((uint64_t)acc >> 32);
+            uint64_t acc = ((uint64_t)ctx->hi << 32) | ctx->lo;
+            uint64_t prod = (uint64_t)(int64_t)(int32_t)rs *
+                            (uint64_t)(int64_t)(int32_t)rt;
+            acc += prod;
+            ctx->lo = (uint32_t)acc;
+            ctx->hi = (uint32_t)(acc >> 32);
         }
         return 0;
     case 0x01u: /* MADDU */
@@ -320,12 +339,14 @@ static int exec_special2(mips32_ctx_t *ctx, uint32_t cur_pc,
             interp_set_reg(ctx, d->rd, (uint32_t)p);
         }
         return 0;
-    case 0x04u: /* MSUB */
+    case 0x04u: /* MSUB (wrap modulo 2^64, unsigned only: M32-R7-4) */
         {
-            int64_t acc = (int64_t)(((uint64_t)ctx->hi << 32) | ctx->lo);
-            acc -= (int64_t)(int32_t)rs * (int64_t)(int32_t)rt;
-            ctx->lo = (uint32_t)(uint64_t)acc;
-            ctx->hi = (uint32_t)((uint64_t)acc >> 32);
+            uint64_t acc = ((uint64_t)ctx->hi << 32) | ctx->lo;
+            uint64_t prod = (uint64_t)(int64_t)(int32_t)rs *
+                            (uint64_t)(int64_t)(int32_t)rt;
+            acc -= prod;
+            ctx->lo = (uint32_t)acc;
+            ctx->hi = (uint32_t)(acc >> 32);
         }
         return 0;
     case 0x05u: /* MSUBU */
@@ -347,7 +368,7 @@ static int exec_special2(mips32_ctx_t *ctx, uint32_t cur_pc,
     }
 }
 
-/* EXT/INS/BSHFL/RDHWR (SPECIAL3, major opcode 0x1F). */
+/* SPECIAL3: EXT/INS/BSHFL/RDHWR. */
 static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
                          const mips_dec_t *d)
 {
@@ -404,7 +425,7 @@ static int exec_special3(mips32_ctx_t *ctx, uint32_t cur_pc,
     }
 }
 
-/* COP0: only MFC0/DMFC0 of the ulr alias (rd 4, sel 2) are wired. */
+/* COP0: only ulr alias (rd 4, sel 2) wired. */
 static int exec_cop0(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
 {
     if ((d->rs == 0u || d->rs == 1u) && d->rd == 4u &&
@@ -451,7 +472,18 @@ static int exec_regimm_trap(mips32_ctx_t *ctx, uint32_t cur_pc,
     default:
         return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
     }
-    return fire ? fault_signo_at(ctx, cur_pc, 5) : 0; /* SIGTRAP */
+    if (!fire) {
+        return 0;
+    }
+    /* M32-R7-9: immediate traps preserve the 16-bit immediate as the
+     * code; Linux BREAK-compat 6/7 select SIGFPE. */
+    if ((uint32_t)(d->simm & 0xFFFF) == 6u) {
+        return fault_code_at(ctx, cur_pc, 8, 2);
+    }
+    if ((uint32_t)(d->simm & 0xFFFF) == 7u) {
+        return fault_code_at(ctx, cur_pc, 8, 1);
+    }
+    return fault_code_at(ctx, cur_pc, 5, (int32_t)d->simm);
 }
 
 static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
@@ -472,7 +504,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
          * not an address error; the guest_ld16 helper emulates it in
          * software.  Only fault inline when FIXADE is clear. */
         if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
@@ -483,7 +515,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return do_lwl(ctx, addr, d->rt);
     case 0x23u: /* LW */
         if (((addr & 3u) != 0u) && ctx->fixade_enabled == 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
@@ -498,7 +530,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return 0;
     case 0x25u: /* LHU */
         if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_ld16(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
@@ -514,7 +546,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return 0;
     case 0x29u: /* SH */
         if (((addr & 1u) != 0u) && ctx->fixade_enabled == 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_st16(ctx, addr, ctx->gpr[d->rt] & 0xFFFFu) != 0) {
             return MIPS_FAULT;
@@ -524,7 +556,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return do_swl(ctx, addr, ctx->gpr[d->rt]);
     case 0x2Bu: /* SW */
         if (((addr & 3u) != 0u) && ctx->fixade_enabled == 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_st32(ctx, addr, ctx->gpr[d->rt]) != 0) {
             return MIPS_FAULT;
@@ -536,7 +568,7 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         /* LL/SC stay aligned-only: FIXADE emulates integer loads and
          * stores, never atomics. */
         if ((addr & 3u) != 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
         if (guest_ld32(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
@@ -544,25 +576,17 @@ static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         mips_ll_record(ctx, addr, v);
         interp_set_reg(ctx, d->rt, v);
         return 0;
-    case 0x38u: { /* SC */
+    case 0x38u: { /* SC (M32-R7-6/7: align fault; every SC via store
+        * validation so a dead reservation on read-only memory faults) */
         int sc_ok = 0;
 
         if ((addr & 3u) != 0u) {
-            return fault_at(ctx, addr);
+            return fault_align_at(ctx, addr);
         }
-        if (ctx->llbit != 0u && ctx->lladdr == addr) {
-            /* RC4 threads: the re-read/store pair must be one atomic
-             * step, otherwise two threads both observe the LL value
-             * and both succeed (mutex owner corruption).  The host
-             * CAS linearizes concurrent SCs; validation inside
-             * preserves the fault side effect. */
-            if (guest_sc32(ctx, addr, ctx->llval, ctx->gpr[d->rt],
-                           &sc_ok) != 0) {
-                return MIPS_FAULT;
-            }
-        } else if (guest_ld32(ctx, addr, &v) != 0) {
-            /* Dead reservation still faults on a bad address (matches
-             * the LDXR side effect in the DBT emitter). */
+        /* guest_sc32 validates PROT_WRITE before testing the
+         * reservation and never modifies memory on failure. */
+        if (guest_sc32(ctx, addr, ctx->llval, ctx->gpr[d->rt],
+                       &sc_ok) != 0) {
             return MIPS_FAULT;
         }
         interp_set_reg(ctx, d->rt, (uint32_t)sc_ok);
@@ -584,11 +608,11 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
         return exec_special(ctx, cur_pc, d);
     case 0x01u: /* REGIMM traps / SYNCI (branches never reach here) */
         return exec_regimm_trap(ctx, cur_pc, d);
-    case 0x08u: /* ADDI */
+    case 0x08u: /* ADDI (M32-R7-8: FPE_INTOVF) */
         rs = ctx->gpr[d->rs];
         out = rs + (uint32_t)d->simm;
         if (add_overflows(rs, (uint32_t)d->simm, out)) {
-            return fault_signo_at(ctx, cur_pc, 8); /* SIGFPE */
+            return fault_code_at(ctx, cur_pc, 8, 2);
         }
         interp_set_reg(ctx, d->rt, out);
         return 0;
@@ -657,10 +681,7 @@ static int exec_simple(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     }
 }
 
-/* Control transfer with delay slot: link (ra = pc+8) first; likely
- * not-taken annuls the slot with no fetch of pc+4; otherwise the slot
- * runs with in_delay_slot = 1 and a fault there keeps pc at the branch
- * (SPEC 2.2).  A branch in the slot is undefined; the inner one wins. */
+/* Control transfer with delay slot (SPEC 2.2). */
 static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 {
     uint32_t rs = ctx->gpr[d->rs];
@@ -792,6 +813,7 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     ctx->pc = pc + 4u;
     {
         mips_dec_t s;
+        unsigned pre_depth = ctx->sig_depth;
         int rc;
 
         if (fetch_decode(ctx, pc + 4u, &s) != 0) {
@@ -811,7 +833,18 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
             ctx->pc = taken ? target : pc + 8u;
             ctx->next_pc = ctx->pc + 4u;
         } else if (rc == 2) {
-            rc = 0;
+            /* Delay-slot syscall (M32-R7-2): record the post-slot
+             * destination before handling. Ordinary completion leaves
+             * pc at pc+8, so apply the branch; a handler redirect
+             * (new sig_depth, pc elsewhere) wins and is preserved. */
+            if (ctx->sig_depth != pre_depth) {
+                ctx->next_pc = ctx->pc + 4u;
+                rc = 0;
+            } else {
+                ctx->pc = taken ? target : pc + 8u;
+                ctx->next_pc = ctx->pc + 4u;
+                rc = 0;
+            }
         } else if (rc == MIPS_FAULT && ctx->exit_reason != MIPS32_EXIT_NONE) {
             ctx->pc = pc;
             ctx->next_pc = pc + 4u;

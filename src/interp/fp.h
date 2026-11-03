@@ -51,6 +51,57 @@ static inline uint32_t fp_fcc_mask(unsigned cc)
     return (cc == 0u) ? (1u << 23) : (1u << (24u + cc));
 }
 
+/* FR-aware FPR accessors (M32-R7-1): FR=1 keeps one 64-bit lane per
+ * register; FR=0 pairs even/odd low halves for D/L values (even holds
+ * the low word, odd the high word) while single words stay in the
+ * addressed lane's low half. MFHC1/MTHC1 high halves stay flat
+ * (E03 qemu round-trip) and are untouched here. */
+static inline uint64_t mips_fpr_get_d(const mips32_ctx_t *ctx, unsigned fd)
+{
+    if (ctx->fr_mode == 0u) {
+        unsigned e = fd & ~1u;
+        uint32_t lo = (uint32_t)ctx->fpr[e];
+        uint32_t hi = (uint32_t)ctx->fpr[e + 1u];
+        return ((uint64_t)hi << 32) | (uint64_t)lo;
+    }
+    return ctx->fpr[fd];
+}
+
+static inline void mips_fpr_set_d_raw(mips32_ctx_t *ctx, unsigned fd,
+                                      uint64_t v)
+{
+    if (ctx->fr_mode == 0u) {
+        unsigned e = fd & ~1u;
+        ctx->fpr[e] = (ctx->fpr[e] & 0xFFFFFFFF00000000ULL) |
+                      (uint32_t)v;
+        ctx->fpr[e + 1u] = (ctx->fpr[e + 1u] & 0xFFFFFFFF00000000ULL) |
+                           (uint32_t)(v >> 32);
+        return;
+    }
+    ctx->fpr[fd] = v;
+}
+
+static inline uint32_t mips_fpr_get_w(const mips32_ctx_t *ctx, unsigned fs)
+{
+    return (uint32_t)ctx->fpr[fs];
+}
+
+static inline void mips_fpr_set_w_raw(mips32_ctx_t *ctx, unsigned fd,
+                                      uint32_t v)
+{
+    ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | v;
+}
+
+/* FR=0 even-register rule for D/L (R7-1). */
+static inline int fp_even(mips32_ctx_t *ctx, uint32_t pc, unsigned r)
+{
+    if (ctx->fr_mode == 0u && (r & 1u) != 0u) {
+        mips_trap(ctx, 4, pc);
+        return MIPS_FAULT;
+    }
+    return 0;
+}
+
 /*
  * Execute one COP1 floating-point instruction at guest pc.
  * Returns 0 (caller advances pc), 2 (ctx->pc already set: BC1 taken /

@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "mips32rt.h"
+#include "interp/fp.h"
 #include "interp/interp.h"
 
 /* Byte i (0 = lowest guest address) of a 32/64-bit FPR lane. */
@@ -76,16 +77,17 @@ int fpmove_mem(mips32_ctx_t *ctx, const mips_dec_t *d)
     }
     /* MIPS32r2 AdEL/AdES: LWC1/SWC1 require word alignment, LDC1/SDC1
      * require doubleword alignment (verified against qemu-mipsel/qemu-mips
-     * via test_p3_fpu unaligned-lwc1: SIGBUS sig=10 AdEL). */
+     * via test_p3_fpu unaligned-lwc1: SIGBUS sig=10 AdEL). Explicit
+     * alignment faults, never mapping (M32-R7-6). */
     if ((d->op == 0x31u || d->op == 0x39u)) {
         if ((addr & 3u) != 0u) {
-            mips_fault(ctx, addr);
+            mips_fault_align(ctx, addr);
             return MIPS_FAULT;
         }
     }
     if ((d->op == 0x35u || d->op == 0x3Du)) {
         if ((addr & 7u) != 0u) {
-            mips_fault(ctx, addr);
+            mips_fault_align(ctx, addr);
             return MIPS_FAULT;
         }
     }
@@ -114,23 +116,34 @@ int fpmove_mem(mips32_ctx_t *ctx, const mips_dec_t *d)
         }
         return 0;
     }
-    case 0x35u: { /* LDC1 */
+    case 0x35u: { /* LDC1 (M32-R7-1: FR=0 splits across the pair) */
+        uint64_t v;
         uint8_t m[8];
-
         for (i = 0u; i < 8u; i++) {
-            uint32_t v = 0u;
-
-            if (guest_ld8(ctx, addr + i, &v) != 0) {
+            uint32_t b = 0u;
+            if (guest_ld8(ctx, addr + i, &b) != 0) {
                 return MIPS_FAULT;
             }
-            m[i] = (uint8_t)v;
+            m[i] = (uint8_t)b;
         }
-        ctx->fpr[fs] = build_u64(m, be);
+        v = build_u64(m, be);
+        if (ctx->fr_mode == 0u) {
+            if ((fs & 1u) != 0u) {
+                mips_trap(ctx, 4, ctx->pc);
+                return MIPS_FAULT;
+            }
+            mips_fpr_set_d_raw(ctx, fs, v);
+        } else {
+            ctx->fpr[fs] = v;
+        }
         return 0;
     }
-    case 0x3Du: { /* SDC1 */
-        uint64_t v = ctx->fpr[fs];
-
+    case 0x3Du: { /* SDC1 (M32-R7-1: FR=0 combines the pair lows) */
+        uint64_t v = (ctx->fr_mode == 0u) ? mips_fpr_get_d(ctx, fs) : ctx->fpr[fs];
+        if (ctx->fr_mode == 0u && (fs & 1u) != 0u) {
+            mips_trap(ctx, 4, ctx->pc);
+            return MIPS_FAULT;
+        }
         for (i = 0u; i < 8u; i++) {
             if (guest_st8(ctx, addr + i, lane_byte_u64(v, i, be)) != 0) {
                 return MIPS_FAULT;
@@ -159,26 +172,70 @@ int fpmove_cop1(mips32_ctx_t *ctx, const mips_dec_t *d)
     case 0x04u: /* MTC1: low 32 bits, upper lane preserved */
         ctx->fpr[fs] = (ctx->fpr[fs] & 0xFFFFFFFF00000000ULL) | ctx->gpr[rt];
         return 0;
-    case 0x02u: /* CFC1: $31 = FCSR, $0 = FIR (read-only ID). */
+    case 0x02u: { /* CFC1 (M32-R7-19: QEMU aliases 25/26/28). */
+        uint32_t f = ctx->fcsr;
         if (fs == 31u) {
-            interp_set_reg(ctx, rt, ctx->fcsr);
+            interp_set_reg(ctx, rt, f);
             return 0;
         }
         if (fs == 0u) {
-            /* qemu-mipsel-observed FIR (MIPS32r2, S+D, Legacy NaN). */
             interp_set_reg(ctx, rt, 0x00739300u);
             return 0;
         }
+        if (fs == 25u) {
+            interp_set_reg(ctx, rt, ((f >> 24) & 0xFEu) | ((f >> 23) & 1u));
+            return 0;
+        }
+        if (fs == 26u) {
+            interp_set_reg(ctx, rt, f & 0x0003F07Cu);
+            return 0;
+        }
+        if (fs == 28u) {
+            interp_set_reg(ctx, rt, (f & 0x00000F83u) | ((f >> 22) & 4u));
+            return 0;
+        }
         return MIPS_FAULT;
-    case 0x06u: /* CTC1: $31 = FCSR, $0 = FIR (writes ignored). */
+    }
+    case 0x06u: { /* CTC1 (M32-R7-19: masks + aliases + pending check). */
+        uint32_t v = ctx->gpr[rt];
+        uint32_t f = ctx->fcsr;
+        int32_t code = 7;
         if (fs == 31u) {
-            ctx->fcsr = ctx->gpr[rt];
+            f = (v & 0xFF81FFFFu) | (f & ~0xFF81FFFFu);
+        } else if (fs == 0u) {
             return 0;
+        } else if (fs == 25u) {
+            if ((v & 0xFFFFFF00u) != 0u)
+                return 0;
+            f = (f & 0x017FFFFFu) | ((v & 0xFEu) << 24) | ((v & 1u) << 23);
+        } else if (fs == 26u) {
+            if ((v & 0x007C0000u) != 0u)
+                return 0;
+            f = (f & 0xFFFC0F83u) | (v & 0x0003F07Cu);
+        } else if (fs == 28u) {
+            if ((v & 0x007C0000u) != 0u)
+                return 0;
+            f = (f & 0xFEFFF07Cu) | (v & 0x00000F83u) | ((v & 4u) << 22);
+        } else {
+            return MIPS_FAULT;
         }
-        if (fs == 0u) {
-            return 0;
+        ctx->fcsr = f;
+        if ((((f >> 7) & 0x1Fu) & ((f >> 12) & 0x1Fu)) != 0u) {
+            if ((f & 0x10000u) != 0u && (f & 0x800u) != 0u)
+                code = 7;
+            else if ((f & 0x8000u) != 0u && (f & 0x400u) != 0u)
+                code = 3;
+            else if ((f & 0x4000u) != 0u && (f & 0x200u) != 0u)
+                code = 4;
+            else if ((f & 0x2000u) != 0u && (f & 0x100u) != 0u)
+                code = 5;
+            else if ((f & 0x1000u) != 0u && (f & 0x80u) != 0u)
+                code = 6;
+            mips_trap_code(ctx, 8, code, ctx->pc);
+            return MIPS_FAULT;
         }
-        return MIPS_FAULT;
+        return 0;
+    }
     default:
         return MIPS_FAULT;
     }

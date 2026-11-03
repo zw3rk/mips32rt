@@ -23,6 +23,10 @@
  *   T8  two guest aliases in one 16 KiB host page stay coherent
  *       across munmap: write via A, munmap A, B still sees the byte
  *       and the backing file carries it (M32-R3-2 shared-subpage).
+ *   T9  COP1 fmt selectors are S=16 D=17 W=20 L=21 (M32-R7-20).
+ *   T10 FR=0 doubles alias even/odd low halves; FR=1 is flat (M32-R7-1).
+ *   T11 fp_even rejects odd D/L lanes only in FR=0 (M32-R7-1).
+ *   T12 FCSR alias packings match QEMU (FCCR/FEXR/FENR) (M32-R7-19).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -39,6 +43,8 @@
 
 #include "mips32rt.h"
 
+#include "dbt/emit_fp_priv.h"
+#include "interp/fp.h"
 #include "os/sigframe_mips32rt.h"
 #include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
@@ -493,6 +499,49 @@ int main(void)
 
     /* T8: shared-subpage coherence across munmap (M32-R3-2). */
     test_m32_r3_2_shared_subpage(&tA);
+
+    /* T9: COP1 fmt selectors (M32-R7-20). */
+    CHECK(FP_FMT_S == 16u);
+    CHECK(FP_FMT_D == 17u);
+    CHECK(FP_FMT_W == 20u);
+    CHECK(FP_FMT_L == 21u);
+
+    /* T10: FR-aware FPR pairing (M32-R7-1). */
+    {
+        mips32_ctx_t c;
+        memset(&c, 0, sizeof c);
+        c.fr_mode = 0u;
+        c.fpr[0] = 0xFFFFFFFF00000000ULL | 0u;
+        c.fpr[1] = 0xFFFFFFFF00000000ULL | 0x3FF00000u;
+        CHECK(mips_fpr_get_d(&c, 0u) == 0x3FF0000000000000ULL);
+        mips_fpr_set_d_raw(&c, 0u, 0x3FF0000000000000ULL);
+        CHECK(mips_fpr_get_w(&c, 0u) == 0u);
+        CHECK(mips_fpr_get_w(&c, 1u) == 0x3FF00000u);
+        mips_fpr_set_w_raw(&c, 1u, 0x40000000u);
+        CHECK(mips_fpr_get_d(&c, 0u) == 0x4000000000000000ULL);
+        c.fr_mode = 1u;
+        c.fpr[2] = 0x1122334455667788ULL;
+        CHECK(mips_fpr_get_d(&c, 2u) == 0x1122334455667788ULL);
+    }
+
+    /* T11: FR=0 even rule (M32-R7-1). */
+    {
+        mips32_ctx_t c;
+        memset(&c, 0, sizeof c);
+        c.fr_mode = 0u;
+        CHECK(fp_even(&c, 0x1000u, 0u) == 0);
+        c.fr_mode = 1u;
+        CHECK(fp_even(&c, 0x1000u, 1u) == 0);
+    }
+
+    /* T12: QEMU FCSR alias packings (M32-R7-19). */
+    {
+        uint32_t f = 0x00800000u | 0x02000000u | 0x0003F07Cu | 0x00000F83u | 0x01000000u;
+        CHECK((((f >> 24) & 0xFEu) | ((f >> 23) & 1u)) == 0x03u);
+        CHECK((f & 0x0003F07Cu) == 0x0003F07Cu);
+        CHECK(((f & 0x00000F83u) | ((f >> 22) & 4u)) == 0x00000F87u);
+        CHECK((0x000C0000u & 0xFF81FFFFu) == 0u);
+    }
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

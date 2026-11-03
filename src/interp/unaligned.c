@@ -25,7 +25,9 @@ static uint32_t set_pos(uint32_t v, unsigned p, uint32_t b)
     return (v & ~((uint32_t)0xFFu << (8u * p))) | ((b & 0xFFu) << (8u * p));
 }
 
-/* Load the 4 bytes of the aligned word PA (endianness-neutral). */
+/* Load the 4 bytes of the aligned word PA (endianness-neutral).
+ * guest_ld8 records the fault itself; just propagate MIPS_FAULT so a
+ * delivered handler frame is not faulted a second time (M32-R7-3). */
 static int load_bytes(mips32_ctx_t *ctx, uint32_t pa, uint8_t m[4])
 {
     unsigned i;
@@ -34,9 +36,6 @@ static int load_bytes(mips32_ctx_t *ctx, uint32_t pa, uint8_t m[4])
         uint32_t v = 0u;
 
         if (guest_ld8(ctx, pa + i, &v) != 0) {
-            if (ctx->exit_reason == MIPS32_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
             return MIPS_FAULT;
         }
         m[i] = (uint8_t)v;
@@ -44,7 +43,7 @@ static int load_bytes(mips32_ctx_t *ctx, uint32_t pa, uint8_t m[4])
     return 0;
 }
 
-/* Store m[lo..hi] to PA+lo..PA+hi (endianness-neutral). */
+/* Store m[lo..hi] to PA+lo..PA+hi (endianness-neutral, same rule). */
 static int store_bytes(mips32_ctx_t *ctx, uint32_t pa, const uint8_t m[4],
                        unsigned lo, unsigned hi)
 {
@@ -52,9 +51,6 @@ static int store_bytes(mips32_ctx_t *ctx, uint32_t pa, const uint8_t m[4],
 
     for (i = lo; i <= hi; i++) {
         if (guest_st8(ctx, pa + i, m[i]) != 0) {
-            if (ctx->exit_reason == MIPS32_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
             return MIPS_FAULT;
         }
     }

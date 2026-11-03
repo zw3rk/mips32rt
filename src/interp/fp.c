@@ -1,15 +1,6 @@
-/*
- * src/interp/fp.c — FPU reference interpreter (Phase 3, lane L3a).
- *
+/* src/interp/fp.c — FPU reference interpreter (Phase 3, lane L3a).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Software IEEE-754 S/D arithmetic in pure integer math (no host float/fenv).
- * NaN/ABS semantics follow experiments/E03/FINDINGS.md (selected by
- * ctx->nan2008: Legacy quiet bit = MSB clear, 2008 = MSB set; sNaN raises
- * Invalid / SIGFPE when Enable.V is set, else quiets with payload kept).
- * ABS/NEG/MOV are non-arithmetic sign-bit ops; MFHC1/MTHC1 are FR-agnostic.
- */
+ * SPDX-License-Identifier: Apache-2.0 (integer IEEE-754 S/D; see SPEC.md). */
 
 #include <stdint.h>
 
@@ -17,14 +8,14 @@
 #include "interp/fp.h"
 #include "interp/interp.h"
 
-/* Exception indices: I U O Z V. Flag bit = 1 << (e + 2), enable << 5. */
+/* Exception indices I/U/O/Z/V. */
 enum { FP_E_I = 0, FP_E_U = 1, FP_E_O = 2, FP_E_Z = 3, FP_E_V = 4 };
 
-/* Binary format parameters: [0] = S, [1] = D. */
+/* Format params: [0]=S, [1]=D. */
 struct fp_fmt { unsigned eb; unsigned mb; int bias; };
 static const struct fp_fmt fp_ff[2] = { { 8u, 23u, 127 }, { 11u, 52u, 1023 } };
 
-/* Pending FP exception state for one instruction. */
+/* Per-insn FP exception state. */
 struct fp_st { mips32_ctx_t *ctx; uint32_t pc; uint32_t cause; uint32_t fl; int trap; };
 
 static void fp_raise(struct fp_st *s, unsigned e)
@@ -36,15 +27,17 @@ static void fp_raise(struct fp_st *s, unsigned e)
         s->trap = 1;
 }
 
-/* Cause (17:12) replaced per-insn, Flags (6:2) accumulate. Trap: Cause
- * sticks, Flags do not (E03: post-trap keeps Cause.V, no Flags.V, no E
- * bit: qemu-mipsel reports 0x10800 for the Invalid trap). */
+/* Cause replaced per-insn, Flags accumulate; trap maps cause to FPE_* (R7-8). */
 static int fp_commit(struct fp_st *s)
 {
+    int32_t code = ((s->cause & 0x10000u) != 0u) ? 7 :
+                   ((s->cause & 0x08000u) != 0u) ? 3 :
+                   ((s->cause & 0x04000u) != 0u) ? 4 :
+                   ((s->cause & 0x02000u) != 0u) ? 5 : 6;
     s->ctx->fcsr &= ~0x3F000u;
     s->ctx->fcsr |= s->cause;
     if (s->trap) {
-        mips_trap(s->ctx, 8, s->pc);
+        mips_trap_code(s->ctx, 8, code, s->pc);
         return MIPS_FAULT;
     }
     s->ctx->fcsr |= s->fl;
@@ -55,7 +48,7 @@ static int fp_write_s(struct fp_st *s, unsigned fd, uint32_t v)
 {
     if (fp_commit(s) != 0)
         return MIPS_FAULT;
-    s->ctx->fpr[fd] = (s->ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | v;
+    mips_fpr_set_w_raw(s->ctx, fd, v);
     return 0;
 }
 
@@ -63,11 +56,10 @@ static int fp_write_d(struct fp_st *s, unsigned fd, uint64_t v)
 {
     if (fp_commit(s) != 0)
         return MIPS_FAULT;
-    s->ctx->fpr[fd] = v;
+    mips_fpr_set_d_raw(s->ctx, fd, v);
     return 0;
 }
 
-/* Unpacked value classes. */
 enum { FP_ZERO = 0, FP_SUB = 1, FP_NORM = 2, FP_INF = 3, FP_NAN = 4 };
 
 typedef struct {
@@ -100,7 +92,7 @@ static fpv_t fp_unpack(unsigned f, uint64_t w, int nan2008)
     return v;
 }
 
-/* Mode default Invalid-operation quiet NaN (E03 table). */
+/* Default quiet NaN. */
 static uint64_t fp_default_nan(unsigned f, int nan2008)
 {
     if (f == 0u)
@@ -108,14 +100,14 @@ static uint64_t fp_default_nan(unsigned f, int nan2008)
     return nan2008 ? 0x7FF8000000000000ULL : 0x7FF7FFFFFFFFFFFFULL;
 }
 
-/* Impose the mode quiet bit on an sNaN, preserving sign + payload. */
+/* Impose mode quiet bit, keep sign + payload. */
 static uint64_t fp_quiet(unsigned f, uint64_t w, int nan2008)
 {
     uint64_t top = (uint64_t)1 << (fp_ff[f].mb - 1u);
     return nan2008 ? (w | top) : (w & ~top);
 }
 
-/* Full mantissa: hidden leading bit for normals, bare frac otherwise. */
+/* Full mantissa with hidden bit for normals. */
 static uint64_t fp_full(unsigned f, const fpv_t *v)
 {
     if (v->cls == FP_NORM)
@@ -123,7 +115,7 @@ static uint64_t fp_full(unsigned f, const fpv_t *v)
     return v->frac;
 }
 
-/* sNaN: Invalid + Legacy canonical QNaN, 2008 quieted w/ payload. */
+/* sNaN: Invalid + quieted payload. */
 static int fp_nan2(struct fp_st *s, unsigned f, const fpv_t *a,
                    const fpv_t *b, uint64_t *out)
 {
@@ -146,7 +138,7 @@ static int fp_nan2(struct fp_st *s, unsigned f, const fpv_t *a,
     return 1;
 }
 
-/* 53x53 -> 106-bit product from 27-bit limbs (no __int128). */
+/* 53x53 product from 27-bit limbs. */
 static void fp_mul53(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
 {
     uint64_t p0 = (a & 0x7FFFFFFULL) * (b & 0x7FFFFFFULL);
@@ -163,7 +155,7 @@ static void fp_mul53(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
     *lo = l;
 }
 
-/* Normalize finite nonzero (m, e) so m lies in [2^MB, 2^(MB+1)). */
+/* Normalize (m,e) to [2^MB,2^(MB+1)). */
 static void fp_norm(unsigned f, uint64_t *m, int32_t *e)
 {
     uint64_t hid = (uint64_t)1 << fp_ff[f].mb;
@@ -173,7 +165,7 @@ static void fp_norm(unsigned f, uint64_t *m, int32_t *e)
     }
 }
 
-/* Swap two (mantissa, exp, sign) triples after subnormal normalization. */
+/* Swap (m,e,s) triples. */
 static void fp_swap(uint64_t *m1, int32_t *e1, int *s1,
                     uint64_t *m2, int32_t *e2, int *s2)
 {
@@ -182,12 +174,7 @@ static void fp_swap(uint64_t *m1, int32_t *e1, int *s1,
     *m2 = tm; *e2 = te; *s2 = ts;
 }
 
-/* Pack value = man * 2^(E - MB - 3), man != 0: normalize hidden bit to
- * MB+3 (GRS in bits 2:0), round once per FCSR RM, then overflow
- * (O+I, directed-rounding results when trap-disabled) and tininess
- * (shift to subnormal, U when tiny and inexact).  Tininess is detected
- * before rounding; a result rounding up to the smallest normal is
- * exact-normal (E == emin). */
+/* Pack man*2^(E-MB-3) with GRS rounding, overflow and tininess (R7-11/12). */
 static uint64_t fp_round_pack(struct fp_st *s, unsigned f, int sign,
                               int32_t E, uint64_t man, int sticky)
 {
@@ -220,11 +207,10 @@ static uint64_t fp_round_pack(struct fp_st *s, unsigned f, int sign,
             man >>= need;
         }
         E = emin;
-        if (man == 0u) {
-            if (sticky) {
-                fp_raise(s, FP_E_U);
-                fp_raise(s, FP_E_I);
-            }
+        /* M32-R7-12: a zero retained mantissa with a nonzero tail must
+         * continue through directed rounding (e.g. RZ+ min-subnorm/16
+         * rounds to min-subnorm); only exact zero returns early. */
+        if (man == 0u && !sticky) {
             return ((uint64_t)(sign & 1)) << (p->mb + p->eb);
         }
     }
@@ -246,12 +232,15 @@ static uint64_t fp_round_pack(struct fp_st *s, unsigned f, int sign,
     if (tiny && any)
         fp_raise(s, FP_E_U);
     if (E > emax) {
-        /* Overflow is always inexact (result not representable). */
+        /* Overflow is always inexact (result not representable).
+         * M32-R7-11: directed saturation returns the largest finite
+         * magnitude (exponent one below all-ones), not NaN. */
         uint64_t ebits = (((uint64_t)1 << p->eb) - 1u) << p->mb;
+        uint64_t maxe = ((((uint64_t)1 << p->eb) - 2u) << p->mb);
         fp_raise(s, FP_E_O);
         fp_raise(s, FP_E_I);
         if (rm == 1u || (rm == 2u && sign) || (rm == 3u && !sign))
-            return (((uint64_t)(sign & 1)) << (p->mb + p->eb)) | ebits |
+            return (((uint64_t)(sign & 1)) << (p->mb + p->eb)) | maxe |
                    ((((uint64_t)1) << p->mb) - 1u);
         return (((uint64_t)(sign & 1)) << (p->mb + p->eb)) | ebits;
     }
@@ -263,7 +252,7 @@ static uint64_t fp_round_pack(struct fp_st *s, unsigned f, int sign,
            (man & ((((uint64_t)1) << p->mb) - 1u));
 }
 
-/* ADD/SUB core (sub flips b; NaN operands pass through by fp_nan2). */
+/* ADD/SUB core. */
 static uint64_t fp_addsub(struct fp_st *s, unsigned f, uint64_t aw,
                           uint64_t bw, int sub)
 {
@@ -306,6 +295,10 @@ static uint64_t fp_addsub(struct fp_st *s, unsigned f, uint64_t aw,
     fp_norm(f, &m2, &e2);
     if (e1 < e2)
         fp_swap(&m1, &e1, &s1, &m2, &e2, &s2);
+    /* M32-R7-10: extend to MB+3 (GRS in bits 2:0) before alignment so
+     * the discarded tail keeps guard/round/sticky information. */
+    m1 <<= 3;
+    m2 <<= 3;
     d = e1 - e2;
     if (d >= 64) {
         sticky |= (m2 != 0u);
@@ -314,8 +307,6 @@ static uint64_t fp_addsub(struct fp_st *s, unsigned f, uint64_t aw,
         sticky |= ((m2 & ((((uint64_t)1) << d) - 1u)) != 0u);
         m2 >>= d;
     }
-    m1 <<= 3;
-    m2 <<= 3;
     if (s1 == s2) {
         m1 += m2;
     } else if (m1 >= m2) {
@@ -331,7 +322,7 @@ static uint64_t fp_addsub(struct fp_st *s, unsigned f, uint64_t aw,
     return fp_round_pack(s, f, s1, e1, m1, sticky);
 }
 
-/* MUL core. */
+/* MUL. */
 static uint64_t fp_mul(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw)
 {
     const struct fp_fmt *p = &fp_ff[f];
@@ -378,8 +369,7 @@ static uint64_t fp_mul(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw)
     }
 }
 
-/* DIV core: restoring division with K = MB+6 fraction bits; the final
- * remainder decides sticky (further quotient bits exist iff r != 0). */
+/* DIV core. */
 static uint64_t fp_div(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw)
 {
     const struct fp_fmt *p = &fp_ff[f];
@@ -429,7 +419,7 @@ static uint64_t fp_div(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw)
     return fp_round_pack(s, f, sign, (e1 - e2) + sh - 3, q >> sh, stk);
 }
 
-/* Integer square root: MB+4 root bits from radicand m, MSB first. */
+/* Integer square root. */
 static uint64_t fp_isqrt(unsigned f, uint64_t m, int *sticky)
 {
     unsigned total = fp_ff[f].mb + 4u, bl = 0u, i, pairs, sh;
@@ -457,7 +447,7 @@ static uint64_t fp_isqrt(unsigned f, uint64_t m, int *sticky)
     return r;
 }
 
-/* SQRT core. */
+/* SQRT. */
 static uint64_t fp_sqrt(struct fp_st *s, unsigned f, uint64_t aw)
 {
     int n8 = s->ctx->nan2008;
@@ -506,9 +496,7 @@ static uint64_t fp_sqrt(struct fp_st *s, unsigned f, uint64_t aw)
                          r, stk);
 }
 
-/* C.cond comparison. cond bits: bit2 less, bit1 equal, bit0 unordered;
- * bit3 signals Invalid on quiet NaNs too. sNaN always raises Invalid.
- * With the trap disabled an Invalid comparison yields FCC=false. */
+/* C.cond comparison (R7-13/14: explicit zero path, independent invalid). */
 static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
                       unsigned cond, unsigned cc)
 {
@@ -524,6 +512,14 @@ static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
             invalid = 1;
     } else if (a.cls == FP_ZERO && b.cls == FP_ZERO) {
         equal = 1;
+    } else if (a.cls == FP_ZERO || b.cls == FP_ZERO) {
+        /* M32-R7-13: zero exponent (0) otherwise misorders against
+         * subnormal/normal exponents; compare explicitly. */
+        if (a.cls == FP_ZERO) {
+            less = b.sign ? 0 : 1;
+        } else {
+            less = a.sign ? 1 : 0;
+        }
     } else if (a.sign != b.sign) {
         less = a.sign;
     } else if (a.cls == FP_INF || b.cls == FP_INF) {
@@ -540,10 +536,12 @@ static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
         else
             less = a.sign ? (c > 0) : (c < 0);
     }
+    /* M32-R7-14: evaluate the condition independently; Invalid raises
+     * but a disabled trap still writes back the unordered result. */
     if (invalid) {
         fp_raise(s, FP_E_V);
-        res = 0;
-    } else if (unord) {
+    }
+    if (unord) {
         res = (cond & 1u) != 0u;
     } else {
         res = ((less && (cond & 4u)) || (equal && (cond & 2u))) != 0;
@@ -557,10 +555,7 @@ static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
     return 0;
 }
 
-/* Float -> int (CVT.W/CVT.L, ROUND/TRUNC/CEIL/FLOOR). nbits 32/64;
- * forced_rm < 0 selects FCSR RM; no_inexact suppresses the I flag for
- * the ROUND family. Out-of-range/NaN/Inf raise Invalid with 0x7FFF...
- * Returns 1 on Invalid with *out set, else 0. */
+/* Float->int (R7-15 always raises Inexact; R7-17 mode-specific invalid). */
 static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
                      int forced_rm, int no_inexact, uint64_t *out)
 {
@@ -572,9 +567,12 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
     int neg, rm = (forced_rm < 0) ? (int)(s->ctx->fcsr & 0x3u) : forced_rm;
     int dropped = 0, inc = 0;
 
+    (void)no_inexact;
     if (a.cls == FP_NAN || a.cls == FP_INF) {
         fp_raise(s, FP_E_V);
-        *out = bad;
+        /* M32-R7-17: NAN2008 invalid conversion yields 0, legacy
+         * yields the saturated maxint. */
+        *out = (n8 != 0 && a.cls == FP_NAN) ? 0u : bad;
         return 1;
     }
     if (a.cls == FP_ZERO) {
@@ -615,8 +613,8 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
             inc = neg;
         }
         ip += (uint64_t)inc;
-        if (!no_inexact)
-            fp_raise(s, FP_E_I);
+        /* M32-R7-15: explicit rounding never suppresses Inexact. */
+        fp_raise(s, FP_E_I);
     }
     lim = ((uint64_t)1) << (nbits - 1);
     if ((!neg && ip > lim - 1u) || (neg && ip > lim)) {
@@ -629,7 +627,7 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
     return 0;
 }
 
-/* Int -> float (CVT.S/CVT.D from W/L): exact when it fits, else rounded. */
+/* Int->float. */
 static uint64_t fp_from_int(struct fp_st *s, unsigned f, int neg, uint64_t mag)
 {
     const struct fp_fmt *p = &fp_ff[f];
@@ -651,10 +649,7 @@ static uint64_t fp_from_int(struct fp_st *s, unsigned f, int neg, uint64_t mag)
     return fp_round_pack(s, f, neg, E, mag, sticky);
 }
 
-/* CVT.D.S / CVT.S.D. NaN payloads keep the HIGH bits (low-bit
- * truncation would alias the mode defaults: D legacy default
- * 0x7ff7ffffffffffff must narrow to 0x7fbfffff). A narrowing that
- * empties the payload keeps bit 0 so the result stays a NaN. */
+/* CVT.D.S/CVT.S.D (R7-16: quieting never empties the fraction). */
 static uint64_t fp_cvt_fmt(struct fp_st *s, unsigned df, uint64_t w)
 {
     int n8 = s->ctx->nan2008;
@@ -662,14 +657,22 @@ static uint64_t fp_cvt_fmt(struct fp_st *s, unsigned df, uint64_t w)
 
     if (a.cls == FP_NAN) {
         uint64_t frac = (df == 1u) ? (a.frac << 29) : (a.frac >> 29);
-        uint64_t out;
+        uint64_t out, q, qfrac;
         if (a.qnan == 0)
             fp_raise(s, FP_E_V);
-        if (df == 0u && frac == 0u)
+        if (frac == 0u)
             frac = 1u;
         out = (((uint64_t)(a.sign & 1)) << (fp_ff[df].mb + fp_ff[df].eb)) |
               ((((uint64_t)1 << fp_ff[df].eb) - 1u) << fp_ff[df].mb) | frac;
-        return (a.qnan == 0) ? fp_quiet(df, out, n8) : out;
+        if (a.qnan != 0)
+            return out;
+        /* M32-R7-16: quieting must never empty the fraction (legacy
+         * sNaN widening clears the only set bit -> infinity). */
+        q = fp_quiet(df, out, n8);
+        qfrac = q & ((((uint64_t)1) << fp_ff[df].mb) - 1u);
+        if (qfrac == 0u)
+            q |= 1u;
+        return q;
     }
     if (a.cls == FP_INF || a.cls == FP_ZERO) {
         uint64_t m = (a.cls == FP_ZERO) ? 0u :
@@ -692,17 +695,6 @@ static uint64_t fp_cvt_fmt(struct fp_st *s, unsigned df, uint64_t w)
     }
 }
 
-/* FR=0 requires even registers for 64-bit (D/L) operands. */
-static int fp_even(mips32_ctx_t *ctx, uint32_t pc, unsigned r)
-{
-    if (ctx->fr_mode == 0u && (r & 1u) != 0u) {
-        mips_trap(ctx, 4, pc); /* Reserved: odd 64-bit lane in FR=0. */
-        return MIPS_FAULT;
-    }
-    return 0;
-}
-
-/* S/D-format instruction dispatch (rs field 16/17, f = 0/1). */
 static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
                      unsigned f)
 {
@@ -710,62 +702,68 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
     struct fp_st s = { ctx, pc, 0u, 0u, 0 };
     uint64_t v;
 
-    if (func >= 48u) { /* compares: fd holds cc, no even check on it. */
+    if (func >= 48u) {
+        uint64_t af, bf;
         if (f != 0u && (fp_even(ctx, pc, fs) != 0 || fp_even(ctx, pc, ft) != 0))
             return MIPS_FAULT;
-        return fp_compare(&s, f, ctx->fpr[fs], ctx->fpr[ft],
-                          func & 15u, d->sa >> 2);
+        af = (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs);
+        bf = (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft);
+        return fp_compare(&s, f, af, bf, func & 15u, d->sa >> 2);
     }
     if (f != 0u && (fp_even(ctx, pc, fs) != 0 ||
         (func <= 3u && fp_even(ctx, pc, ft) != 0) ||
-        ((func <= 11u || func == 33u || func == 37u) &&
-         fp_even(ctx, pc, fd) != 0)))
+        ((func <= 11u || func == 17u || func == 18u || func == 19u ||
+          func == 33u || func == 37u) && fp_even(ctx, pc, fd) != 0)))
         return MIPS_FAULT;
     switch (func) {
-    case 0u: v = fp_addsub(&s, f, ctx->fpr[fs], ctx->fpr[ft], 0); break;
-    case 1u: v = fp_addsub(&s, f, ctx->fpr[fs], ctx->fpr[ft], 1); break;
-    case 2u: v = fp_mul(&s, f, ctx->fpr[fs], ctx->fpr[ft]); break;
-    case 3u: v = fp_div(&s, f, ctx->fpr[fs], ctx->fpr[ft]); break;
-    case 4u: v = fp_sqrt(&s, f, ctx->fpr[fs]); break;
-    case 5u: /* ABS/NEG/MOV: no FCSR update, bypass commit. */
-        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | ((uint32_t)ctx->fpr[fs] & 0x7FFFFFFFu);
-        else ctx->fpr[fd] = ctx->fpr[fs] & 0x7FFFFFFFFFFFFFFFULL;
+    case 0u: v = fp_addsub(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft), 0); break;
+    case 1u: v = fp_addsub(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft), 1); break;
+    case 2u: v = fp_mul(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft)); break;
+    case 3u: v = fp_div(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft)); break;
+    case 4u: v = fp_sqrt(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs)); break;
+    case 5u:
+        if (f == 0u) mips_fpr_set_w_raw(ctx, fd, mips_fpr_get_w(ctx, fs) & 0x7FFFFFFFu);
+        else mips_fpr_set_d_raw(ctx, fd, mips_fpr_get_d(ctx, fs) & 0x7FFFFFFFFFFFFFFFULL);
         return 0;
     case 6u:
-        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | (uint32_t)ctx->fpr[fs];
-        else ctx->fpr[fd] = ctx->fpr[fs];
+        if (f == 0u) mips_fpr_set_w_raw(ctx, fd, mips_fpr_get_w(ctx, fs));
+        else mips_fpr_set_d_raw(ctx, fd, mips_fpr_get_d(ctx, fs));
         return 0;
     case 7u:
-        if (f == 0u) ctx->fpr[fd] = (ctx->fpr[fd] & 0xFFFFFFFF00000000ULL) | ((uint32_t)ctx->fpr[fs] ^ 0x80000000u);
-        else ctx->fpr[fd] = ctx->fpr[fs] ^ 0x8000000000000000ULL;
+        if (f == 0u) mips_fpr_set_w_raw(ctx, fd, mips_fpr_get_w(ctx, fs) ^ 0x80000000u);
+        else mips_fpr_set_d_raw(ctx, fd, mips_fpr_get_d(ctx, fs) ^ 0x8000000000000000ULL);
         return 0;
-    case 8u: case 9u: case 10u: case 11u: /* ROUND/TRUNC/CEIL/FLOOR.L */
-        if (fp_to_int(&s, f, ctx->fpr[fs], 64, (int)(func - 8u), 1, &v) != 0)
-            v = 0x7FFFFFFFFFFFFFFFULL;
+    case 8u: case 9u: case 10u: case 11u:
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, (int)(func - 8u), 0, &v);
         return fp_write_d(&s, fd, v);
-    case 12u: case 13u: case 14u: case 15u: /* ROUND/TRUNC/CEIL/FLOOR.W */
-        if (fp_to_int(&s, f, ctx->fpr[fs], 32, (int)(func - 12u), 1, &v) != 0)
-            v = 0x7FFFFFFFULL;
+    case 12u: case 13u: case 14u: case 15u:
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, (int)(func - 12u), 0, &v);
         return fp_write_s(&s, fd, (uint32_t)v);
+    case 17u: case 18u: case 19u: {
+        int go = (func == 17u) ? ((((ctx->fcsr & fp_fcc_mask((ft >> 2) & 7u)) != 0) == ((ft & 1u) != 0))) : (func == 18u) ? (ctx->gpr[ft] == 0u) : (ctx->gpr[ft] != 0u);
+        if (!go)
+            return 0;
+        if (f == 0u) mips_fpr_set_w_raw(ctx, fd, mips_fpr_get_w(ctx, fs));
+        else mips_fpr_set_d_raw(ctx, fd, mips_fpr_get_d(ctx, fs));
+        return 0;
+    }
     case 32u:
         if (f == 0u) {
             mips_trap(ctx, 4, pc);
             return MIPS_FAULT;
         }
-        return fp_write_s(&s, fd, (uint32_t)fp_cvt_fmt(&s, 0u, ctx->fpr[fs]));
+        return fp_write_s(&s, fd, (uint32_t)fp_cvt_fmt(&s, 0u, mips_fpr_get_d(ctx, fs)));
     case 33u:
         if (f != 0u) {
             mips_trap(ctx, 4, pc);
             return MIPS_FAULT;
         }
-        return fp_write_d(&s, fd, fp_cvt_fmt(&s, 1u, ctx->fpr[fs]));
+        return fp_write_d(&s, fd, fp_cvt_fmt(&s, 1u, (uint64_t)mips_fpr_get_w(ctx, fs)));
     case 36u:
-        if (fp_to_int(&s, f, ctx->fpr[fs], 32, -1, 0, &v) != 0)
-            v = 0x7FFFFFFFULL;
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, -1, 0, &v);
         return fp_write_s(&s, fd, (uint32_t)v);
     case 37u:
-        if (fp_to_int(&s, f, ctx->fpr[fs], 64, -1, 0, &v) != 0)
-            v = 0x7FFFFFFFFFFFFFFFULL;
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, -1, 0, &v);
         return fp_write_d(&s, fd, v);
     default:
         mips_trap(ctx, 4, pc); /* Reserved S/D funct. */
@@ -777,7 +775,6 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
     return fp_write_d(&s, fd, v);
 }
 
-/* W/L-format (integer source) CVT.S/CVT.D dispatch (rs field 20/21). */
 static int fp_fmt_wl(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
                      unsigned src64)
 {
@@ -792,7 +789,7 @@ static int fp_fmt_wl(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
         mips_trap(ctx, 4, pc); /* Reserved W/L funct or FR=0 lane. */
         return MIPS_FAULT;
     }
-    v = src64 ? (int64_t)ctx->fpr[fs] : (int64_t)(int32_t)ctx->fpr[fs];
+    v = src64 ? (int64_t)mips_fpr_get_d(ctx, fs) : (int64_t)(int32_t)mips_fpr_get_w(ctx, fs);
     neg = (v < 0) ? 1 : 0;
     mag = neg ? (0u - (uint64_t)v) : (uint64_t)v;
     r = fp_from_int(&s, func - 32u, neg, mag);
@@ -800,10 +797,7 @@ static int fp_fmt_wl(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
                            fp_write_d(&s, fd, r);
 }
 
-/* BC1F/BC1T/BC1FL/BC1TL (rs field 8): rt holds cc (bits 20:18), nd
- * (bit 17), tf (bit 16). Likely-not-taken annuls the delay slot with
- * no fetch (SPEC 2.2 page-end rule); otherwise the slot runs once via
- * interp_step with in_delay_slot set, and a slot-internal branch wins. */
+/* BC1 branch with delay slot (R7-2 preserves handler redirect). */
 static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
 {
     unsigned cc = (d->rt >> 2) & 7u, pre_depth = ctx->sig_depth;
@@ -846,6 +840,11 @@ static int fp_bc1(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     }
     if (rc == 1)
         return 1;
+    /* M32-R7-2: a slot-internal syscall may redirect to a handler
+     * (interp_step normalizes it to 0 with pc at the handler). Keep
+     * the redirect instead of overwriting it with the branch target. */
+    if (ctx->sig_depth != pre_depth)
+        return 2;
     if (slot_ctrl)
         return 2;
     ctx->pc = taken ? target : pc + 8u;
@@ -858,10 +857,13 @@ int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     if (d->op == 0x13u && ((d->funct & 0x26u) == 0x20u)) {
         unsigned f = d->funct & 1u, fr = d->rs, ft = d->rt, fs = d->rd, fd = d->sa;
         struct fp_st s = { ctx, pc, 0u, 0u, 0 };
-        uint64_t v;
+        uint64_t v, ms, mt, mr;
         if (f != 0u && (fp_even(ctx, pc, fr) || fp_even(ctx, pc, ft) || fp_even(ctx, pc, fs) || fp_even(ctx, pc, fd)))
             return MIPS_FAULT;
-        v = fp_addsub(&s, f, fp_mul(&s, f, ctx->fpr[fs], ctx->fpr[ft]), ctx->fpr[fr], (int)((d->funct >> 3) & 1u));
+        ms = (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs);
+        mt = (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, ft) : mips_fpr_get_d(ctx, ft);
+        mr = (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fr) : mips_fpr_get_d(ctx, fr);
+        v = fp_addsub(&s, f, fp_mul(&s, f, ms, mt), mr, (int)((d->funct >> 3) & 1u));
         if ((d->funct & 0x10u) != 0u && fp_unpack(f, v, ctx->nan2008).cls != FP_NAN)
             v ^= (f == 0u) ? 0x80000000ULL : 0x8000000000000000ULL;
         return (f == 0u) ? fp_write_s(&s, fd, (uint32_t)v) : fp_write_d(&s, fd, v);
