@@ -196,12 +196,8 @@ int guest_mem_init(mips32_ctx_t *ctx)
     ctx->u3_pad[0] = 0u;
     ctx->u3_pad[1] = 0u;
     ctx->u3_pad[2] = 0u;
-    /* Wave U3: connect the two-regime VM (FIXADE default-on, A1/A2
-     * select, A2 arena/TLB allocation). */
-    mips32_fixade_init(ctx);
-    if (mips32_vm32_init(ctx) != 0) {
-        return MIPS_FAULT;
-    }
+    /* M32-R9-1: FIXADE/A1/A2 selection now lives in rt32_vm_init above;
+     * re-running mips32_vm32_init here would leak the A2 Soft-TLB. */
     return 0;
 }
 
@@ -502,6 +498,30 @@ static void note_store_locked(mips32_ctx_t *ctx, uint32_t va, uint32_t len)
     }
 }
 
+/* M32-R9-2: true when [va, va+len) overlaps a PROT_EXEC VMA in the
+ * ctx mirror.  Same staleness as range_covered above; erring toward an
+ * extra invalidation is always safe.  Caller snapshots this before the
+ * store and invalidates after the LL critical section. */
+static int store_overlaps_exec(const mips32_ctx_t *ctx, uint32_t va,
+                               uint32_t len)
+{
+    uint64_t end64;
+    size_t i;
+
+    if (ctx == NULL || len == 0u) {
+        return 0;
+    }
+    end64 = (uint64_t)va + (uint64_t)len;
+    for (i = 0u; i < ctx->region_count; i++) {
+        const mips32_region_t *r = &ctx->regions[i];
+        if ((uint64_t)r->start < end64 && (uint64_t)r->end > (uint64_t)va &&
+            (r->prot & (uint32_t)PROT_EXEC) != 0U) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Locked guest store: data write plus epoch/reservation update under
  * one mips_ll_lock critical section. All interp stores go through
  * here so an SC's check-and-store can never interleave with them.
@@ -513,10 +533,12 @@ static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
     _Atomic uint64_t *tab;
     _Atomic uint8_t *flag;
     void *dst;
+    int exec_hit;
 
     if (ctx == NULL || src == NULL || len == 0u) {
         return;
     }
+    exec_hit = store_overlaps_exec(ctx, va, len);
     /* M32-R4-2: the read/readv commit path stores guest memory onto
      * itself (dst == src). memcpy with equal pointers is UB via its
      * restrict contract, so skip the copy but keep the epoch bump. */
@@ -529,6 +551,9 @@ static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
             if (dst != src) {
                 memcpy(dst, src, len);
             }
+            if (exec_hit != 0) {
+                vm_invalidate_jit(ctx, va, va + len);
+            }
             return;
         }
     }
@@ -538,6 +563,9 @@ static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
     }
     note_store_locked(ctx, va, len);
     mips_ll_unlock(ctx);
+    if (exec_hit != 0) {
+        vm_invalidate_jit(ctx, va, va + len);
+    }
 }
 
 /* M32-R3-4: public bulk-store path for syscall copyout and other

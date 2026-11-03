@@ -13,6 +13,8 @@
 #define _GNU_SOURCE
 #include "vm_priv.h"
 
+#include "vm/vm32.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +133,15 @@ int rt32_vm_init(mips32_ctx_t *ctx, uint64_t requested_window)
                 }
             }
         }
+    }
+
+    /* M32-R9-1: connect the two-regime VM here so every production
+     * path gets a regime (run_guest via this call; execve inherits it
+     * across rt32_vm_reset_for_exec, which preserves it): FIXADE
+     * default-on plus the A1/A2 select for this host's page size. */
+    mips32_fixade_init(ctx);
+    if (mips32_vm32_init(ctx) != 0) {
+        return -1;
     }
 
     vm_lock_acquire();

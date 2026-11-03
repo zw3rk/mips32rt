@@ -64,6 +64,11 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
     if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
     }
+    /* M32-R9-4: reject unknown prot bits like mprotect does below instead
+     * of silently masking them into the VMA record. */
+    if ((prot & ~0x7U) != 0U) {
+        return (uint32_t)(-EINVAL);
+    }
 
     uint64_t aligned_len = vm_page_align_up((uint64_t)len);
     if (aligned_len == 0ULL || aligned_len > (uint64_t)MIPS32_TASK_SIZE_TOP) {

@@ -177,12 +177,12 @@ static int32_t sc_read(mips32_ctx_t *ctx, uint32_t sp)
 
 static int32_t sc_write(mips32_ctx_t *ctx, uint32_t sp)
 {
-    const uint8_t *host_buf;
-    int            ok = 1;
-    uint32_t       fd;
-    uint32_t       buf;
-    uint32_t       count;
-    ssize_t        n;
+    uint8_t *tmp = NULL;
+    int      ok = 1;
+    uint32_t fd;
+    uint32_t buf;
+    uint32_t count;
+    ssize_t  n;
 
     fd    = o32_arg(ctx, sp, 0, &ok);
     buf   = o32_arg(ctx, sp, 1, &ok);
@@ -190,20 +190,38 @@ static int32_t sc_write(mips32_ctx_t *ctx, uint32_t sp)
     if (!ok) {
         return sc_ret(ctx, -EFAULT);
     }
-    if (count > 0U && !range_ok(ctx, buf, count, (uint32_t)PROT_READ)) {
+    if (count == 0U) {
+        return sc_ret(ctx, 0);
+    }
+    if (!range_ok(ctx, buf, count, (uint32_t)PROT_READ)) {
         return sc_ret(ctx, -EFAULT);
     }
-    host_buf = (const uint8_t *)mips32_guest_ptr(ctx, buf);
+    /* M32-R9-3: stage via checked copy_from (mirrors sc_read), then hand
+     * the host write a stable host buffer: a concurrent munmap between
+     * the check and the write faults as -EFAULT instead of crashing the
+     * translator in host write(). */
+    tmp = (uint8_t *)malloc((size_t)count);
+    if (tmp == NULL) {
+        return sc_ret(ctx, -ENOMEM);
+    }
+    if (rt32_vm_copy_from(ctx, tmp, buf, count) != 0) {
+        free(tmp);
+        return sc_ret(ctx, -EFAULT);
+    }
     {
         int frc = rt32_vm_flush_shared_fd((int)fd);
         if (frc != 0) {
+            free(tmp);
             return sc_ret(ctx, frc);
         }
     }
-    n = write((int)fd, host_buf, (size_t)count);
+    n = write((int)fd, tmp, (size_t)count);
     if (n < 0) {
-        return sc_ret(ctx, -(int32_t)errno);
+        int e = errno;
+        free(tmp);
+        return sc_ret(ctx, -(int32_t)e);
     }
+    free(tmp);
     if (n > 0) {
         int src = rt32_vm_sync_shared_fd((int)fd);
         if (src != 0) {
@@ -260,9 +278,10 @@ static int32_t sc_mmap(mips32_ctx_t *ctx, uint32_t sp, int is_mmap2)
 
 static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
 {
-    uint8_t     *dst;
-    int          ok = 1;
-    uint32_t     va;
+    /* Fixed-size host staging: compose here, commit once below. */
+    uint8_t staged[MIPS_UTS_SIZE];
+    int     ok = 1;
+    uint32_t va;
     struct utsname un;
 
     va = o32_arg(ctx, sp, 0, &ok);
@@ -275,20 +294,25 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
     if (uname(&un) != 0) {
         return sc_ret(ctx, -(int32_t)errno);
     }
-    dst = (uint8_t *)mips32_guest_ptr(ctx, va);
-    copy_uts_field(dst + 0U * MIPS_UTS_FIELD, un.sysname);
-    copy_uts_field(dst + 1U * MIPS_UTS_FIELD, un.nodename);
-    copy_uts_field(dst + 2U * MIPS_UTS_FIELD, un.release);
-    copy_uts_field(dst + 3U * MIPS_UTS_FIELD, un.version);
-    copy_uts_field(dst + 4U * MIPS_UTS_FIELD, un.machine);
+    /* M32-R9-3: compose into host staging, then a single checked copy_to
+     * so a concurrent munmap faults as -EFAULT instead of crashing the
+     * translator mid-memcpy into a dangling guest pointer. */
+    copy_uts_field(staged + 0U * MIPS_UTS_FIELD, un.sysname);
+    copy_uts_field(staged + 1U * MIPS_UTS_FIELD, un.nodename);
+    copy_uts_field(staged + 2U * MIPS_UTS_FIELD, un.release);
+    copy_uts_field(staged + 3U * MIPS_UTS_FIELD, un.version);
+    copy_uts_field(staged + 4U * MIPS_UTS_FIELD, un.machine);
 #if defined(__linux__) && !defined(__GLIBC__)
     /* musl spells the sixth utsname field with leading underscores. */
-    copy_uts_field(dst + 5U * MIPS_UTS_FIELD, un.__domainname);
+    copy_uts_field(staged + 5U * MIPS_UTS_FIELD, un.__domainname);
 #elif defined(__linux__)
-    copy_uts_field(dst + 5U * MIPS_UTS_FIELD, un.domainname);
+    copy_uts_field(staged + 5U * MIPS_UTS_FIELD, un.domainname);
 #else
-    memset(dst + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
+    memset(staged + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
 #endif
+    if (rt32_vm_copy_to(ctx, va, staged, MIPS_UTS_SIZE) != 0) {
+        return sc_ret(ctx, -EFAULT);
+    }
     return sc_ret(ctx, 0);
 }
 

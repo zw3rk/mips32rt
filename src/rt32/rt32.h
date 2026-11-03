@@ -71,6 +71,7 @@ typedef struct rt32_elf_info {
     uint32_t text_end;
     uint32_t is_be;    /* 1 = mips BE guest, 0 = mipsel */
     uint32_t nan2008;  /* 1 = EF_MIPS_NAN2008 seen in e_flags */
+    uint32_t fr_mode;  /* 1 = FP_64/FP_64A abiflags or EF_MIPS_FP64 */
     char     interp_path[256];
 } rt32_elf_info_t;
 

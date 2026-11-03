@@ -303,7 +303,7 @@ static int run_guest(mips32_ctx_t *ctx, int exec_fd)
     /* Endianness + NaN mode from the ELF admission probe (SPEC 1.1, E03). */
     ctx->cp0_config1 = info.is_be ? 1U : 0U;
     ctx->nan2008 = info.nan2008 ? 1U : 0U;
-    ctx->fr_mode = 0U;
+    ctx->fr_mode = info.fr_mode != 0U ? 1U : 0U;
 
     if (ctx->engine < 0) {
         ctx->engine = MIPS32_ENGINE_DBT;

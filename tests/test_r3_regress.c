@@ -207,6 +207,11 @@ int mips32_vm32_init(mips32_ctx_t *ctx)
     return 0;
 }
 
+void mips32_vm32_fini(mips32_ctx_t *ctx)
+{
+    (void)ctx;
+}
+
 int mips32_vm_tlb_miss(mips32_ctx_t *ctx, uint32_t gva, int is_write, uint32_t width)
 {
     (void)ctx;

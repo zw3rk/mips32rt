@@ -410,7 +410,7 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
     ctx->llval = 0U;
     ctx->cp0_config1 = info.is_be ? 1U : 0U;
     ctx->nan2008 = info.nan2008 ? 1U : 0U;
-    ctx->fr_mode = 0U; /* O32 default; abiflags raises it in Phase 5 */
+    ctx->fr_mode = info.fr_mode != 0U ? 1U : 0U;
     ctx->exit_reason = 0U;
     ctx->exit_info = 0U;
 

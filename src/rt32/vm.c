@@ -13,6 +13,8 @@
 #define _GNU_SOURCE
 #include "vm_priv.h"
 
+#include "vm/vm32.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -635,6 +637,14 @@ void rt32_vm_reset_for_exec(mips32_ctx_t *ctx)
         ctx->vm_gen       = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
     }
     vm_lock_release();
+    /* M32-R9-1: the fresh address space keeps the host-selected regime
+     * but needs a fresh Soft-TLB (old tags describe pre-exec mappings):
+     * drop the table and re-run the FIXADE/A1/A2 select for execve. */
+    mips32_vm32_fini(ctx);
+    if (ctx != NULL) {
+        mips32_fixade_init(ctx);
+        (void)mips32_vm32_init(ctx);
+    }
 }
 
 uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
@@ -830,7 +840,23 @@ int rt32_vm_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src, uint32_t le
         vm_lock_release();
         return -EFAULT;
     }
+    /* M32-R9-2: a store landing on PROT_EXEC may rewrite live translated
+     * code: note the overlap under the lock, commit, then invalidate
+     * after release (same post-release pattern as brk above). */
+    bool exec_hit = false;
+    uint64_t end64 = (uint64_t)va + (uint64_t)len;
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const mips32_region_t *r = &g_vm_regions[i];
+        if ((uint64_t)r->start < end64 && (uint64_t)r->end > (uint64_t)va &&
+            (r->prot & (uint32_t)PROT_EXEC) != 0U) {
+            exec_hit = true;
+            break;
+        }
+    }
     mips_guest_store_commit(ctx, va, src, len);
     vm_lock_release();
+    if (exec_hit) {
+        vm_invalidate_jit(ctx, va, (uint32_t)end64);
+    }
     return 0;
 }

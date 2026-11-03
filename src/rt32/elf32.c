@@ -41,11 +41,19 @@
 #define EF_MIPS_ABI2      0x00000020U
 #define EF_MIPS_ABI       0x0000F000U
 #define E_MIPS_ABI_O32    0x00001000U
+#define EF_MIPS_FP64      0x00000200U
 #define EF_MIPS_NAN2008   0x00000400U
 
 #define PT_LOAD   1U
 #define PT_INTERP 3U
 #define PT_PHDR   6U
+
+/* .MIPS.abiflags segment type plus the fp_abi payload values that select
+ * 64-bit FPRs (MIPS ABI supplement: payload byte 7 follows version[2],
+ * isa_level, isa_rev, gpr_size, cpr1_size, cpr2_size). */
+#define PT_MIPS_ABIFLAGS 0x70000003U
+#define MIPS_FP_ABI_64   6U
+#define MIPS_FP_ABI_64A  7U
 
 #define PF_X 0x1U
 #define PF_W 0x2U
@@ -292,10 +300,27 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
     out->phent     = ehdr.e_phentsize;
     out->phnum     = ehdr.e_phnum;
     /* Endianness and FP-mode flags for the ctx (SPEC 2.1/2.2): the BE bit
-     * lives in cp0_config1 bit 0; nan2008 comes from e_flags (FR mode
-     * needs .MIPS.abiflags and arrives with the Phase 5 dynamic loader). */
+     * lives in cp0_config1 bit 0; nan2008 comes from e_flags.  M32-R9-5:
+     * fr_mode comes from the .MIPS.abiflags fp_abi payload byte (6 =
+     * FP_64 and 7 = FP_64A need FR=1; 1 = FP_DOUBLE and 5 = FP_XX stay
+     * FR=0) or, when the segment is absent, from EF_MIPS_FP64. */
     out->is_be   = is_be ? 1U : 0U;
     out->nan2008 = (ehdr.e_flags & EF_MIPS_NAN2008) != 0U ? 1U : 0U;
+    {
+        uint32_t fp_abi = 0xFFFFFFFFU;
+        for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+            if (phdrs[i].p_type == PT_MIPS_ABIFLAGS && phdrs[i].p_filesz >= 8U) {
+                uint8_t abiflags[8];
+                if (pread_full(fd, abiflags, sizeof(abiflags),
+                               (off_t)phdrs[i].p_offset) == 0) {
+                    fp_abi = (uint32_t)abiflags[7];
+                }
+                break;
+            }
+        }
+        out->fr_mode = (fp_abi == MIPS_FP_ABI_64 || fp_abi == MIPS_FP_ABI_64A ||
+                        (ehdr.e_flags & EF_MIPS_FP64) != 0U) ? 1U : 0U;
+    }
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
@@ -744,7 +769,7 @@ int rt32_elf_load(mips32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_inf
     /* SPEC 2.1 software config: bit 0 records BE (mips) vs LE (mipsel). */
     ctx->cp0_config1 = out_info->is_be;
     ctx->nan2008     = (uint8_t)out_info->nan2008;
-    ctx->fr_mode     = 0U; /* O32 default; .MIPS.abiflags may raise it in Phase 5 */
+    ctx->fr_mode     = out_info->fr_mode != 0U ? 1U : 0U;
 
     /* Load PT_INTERP if present */
     if (out_info->interp_path[0] != '\0') {
