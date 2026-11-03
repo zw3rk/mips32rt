@@ -200,9 +200,9 @@ int mips_sysroot_open(const mips32_ctx_t *ctx, int dirfd, const char *path,
     int n;
     int fd;
 
+    (void)dirfd; /* openat(2): dirfd is ignored for absolute paths. */
     if (ctx == NULL || path == NULL || path[0] != '/' ||
-        dirfd != (int)MIPS_AT_FDCWD || ctx->sysroot == NULL ||
-        ctx->sysroot[0] == '\0') {
+        ctx->sysroot == NULL || ctx->sysroot[0] == '\0') {
         return -1;
     }
     if ((host_flags & 3) != 0 || (host_flags & O_CREAT) != 0) {

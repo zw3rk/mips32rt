@@ -59,7 +59,9 @@ static uint32_t host_to_mips_flags(int host)
     if ((host & O_APPEND) != 0) {
         mips |= MIPS_O_APPEND;
     }
-    if ((host & O_DSYNC) != 0) {
+    if ((host & O_SYNC) == O_SYNC) {
+        mips |= MIPS_O_SYNC;
+    } else if ((host & O_DSYNC) != 0) {
         mips |= MIPS_O_DSYNC;
     }
     if ((host & O_NONBLOCK) != 0) {
