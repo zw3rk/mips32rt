@@ -19,7 +19,8 @@
  * code).  Wave P5 adds an inline IBTC probe: when ctx->ibtc_ptr is
  * nonzero (zero under --difftest/--trace or after any SMC write),
  * the probe resolves ctx->pc via ibtc[((pc >> 2) ^ (pc >> 12)) & 4095]
- * without a C call and counts the hit in x27.  Only EXIT_NONE/
+ * without a C call, checks the SMC epoch (M32-R8-5), and counts the
+ * hit in x27.  Only EXIT_NONE/
  * EXIT_BRANCH chain; the validated lookup exits the chain under
  * --difftest/--trace (block-lockstep parity) and on uncompiled
  * targets.  The budget bounds async-signal and quiescence latency.
@@ -69,6 +70,22 @@ dbt_trampoline_enter:
     cmp w17, w22
     b.ne .Lchain_slow
     cbz x23, .Lchain_slow
+    /* M32-R8-5: SMC epoch check.  Any SMC bump advances
+     * dbt_smc_ver_epoch; a mismatch against the snapshot the last C
+     * lookup left in ctx->ibtc_epoch means another thread invalidated
+     * behind our backs, so take the validated slow path. */
+#ifdef __APPLE__
+    adrp x16, _dbt_smc_ver_epoch@PAGE
+    ldr x16, [x16, _dbt_smc_ver_epoch@PAGEOFF]
+#else
+    adrp x16, dbt_smc_ver_epoch
+    ldr x16, [x16, :lo12:dbt_smc_ver_epoch]
+#endif
+    ldr x16, [x16]              /* live SMC epoch */
+    movz x17, #0xa838           /* MIPS32_CTX_IBTC_EPOCH_OFFSET */
+    ldr x17, [x19, x17]         /* snapshot from last C lookup */
+    cmp x16, x17
+    b.ne .Lchain_slow
     add x27, x27, #1            /* inline chain hit (stats stay in C) */
     b .Lchain_enter
 .Lchain_slow:

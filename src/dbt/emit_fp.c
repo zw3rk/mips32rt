@@ -200,13 +200,6 @@ void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be,
  * host FPCR already matches and the sync is skipped.  Only the slow
  * path saves the original FPCR in X23 and programs RM.  A64_TMP2
  * carries the mask: it is dead at every sync/restore call site (the
- * sync body itself reuses it). */
-/* Sync the host FPCR rounding mode from FCSR (W21) with a fast path
- * (Wave P lane P4): when (FCSR & FP_FCSR_FAST_MASK) == 0 the guest runs
- * round-to-nearest with no enabled traps and no flush-to-zero, so the
- * host FPCR already matches and the sync is skipped.  Only the slow
- * path saves the original FPCR in X23 and programs RM.  A64_TMP2
- * carries the mask: it is dead at every sync/restore call site (the
  * sync body re-extracts RM into it on the slow path). */
 void fp_fpcr_sync(a64_buf_t *b)
 {
@@ -281,14 +274,10 @@ static void fp_halves(a64_buf_t *b, unsigned vd, unsigned is_d)
     }
 }
 
-/* Shared NaN classifier: FCMP sets V iff vd is NaN, so B.VC skips
- * the cold path with no FPR->GPR traffic on ordinary values (quiet
- * runs before the FPSR clear, fix runs after the FPSR read, so the
- * FCMP cannot pollute the operation's FPSR flags).  The cold path
- * reconstructs the halves and the quiet bit exactly as before; the
- * caller patches ph1/ph2 after emitting its writeback.  ph2 is a
- * never-taken CBNZ WZR (CBNZ on the zero register never fires), which
- * keeps the caller's patch slot valid while falling through. */
+/* Shared NaN classifier: FCMP sets V iff vd is NaN, so B.VC skips the
+ * cold path on ordinary values (FPSR-safe: quiet runs before the clear,
+ * fix after the read).  ph2 is a never-taken CBNZ WZR keeping the
+ * caller's patch slot valid while falling through. */
 static void fp_nan_test(a64_buf_t *b, unsigned vd, unsigned is_d,
                         size_t *ph1, size_t *ph2)
 {
@@ -380,14 +369,10 @@ void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d)
     a64_patch_cbz_w(b, ph3, b->count);
 }
 
-/* Merge an operation's exception bits (FPSR IOC/DZC/OFC/UFC/IXC in the
- * low 5 bits of wfpsr5) into FCSR (W21): Cause[17:12] is replaced
- * (cleared then set, E never set: qemu reports 0x10800 on Invalid
- * trap), Flags[6:2] accumulate.  An enabled exception stores FCSR and
- * exits EXIT_TRAP at cur (Flags left untouched); otherwise Flags are
- * updated and emission continues.
- * RBIT maps bit k to bit 31-k, so LSR 15 lands V..I on Cause 16..12
- * and LSR 25 on Flags 6..2. */
+/* Merge FPSR exception bits (low 5 of wfpsr5) into FCSR (W21): Cause
+ * is replaced, Flags accumulate (RBIT + LSR 15/25 land V..I on Cause
+ * 16..12 / Flags 6..2).  An enabled exception stores FCSR and exits
+ * EXIT_TRAP at cur; otherwise Flags update and emission continues. */
 void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
 {
     size_t ph;
@@ -427,9 +412,8 @@ void fp_finish(a64_buf_t *b, unsigned wfpsr5, uint32_t cur)
     a64_emit_str_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
 }
 
-/* C.cond.fmt: ordered/unordered compare per E03, FCC[cc] writeback.
- * Signalling variants set Invalid on unordered input; the sticky bit
- * (FP_STICKY) carries pre-quiet Invalid through the FPSR merge. */
+/* C.cond.fmt per E03 with FCC[cc] writeback; FP_STICKY carries
+ * pre-quiet Invalid of signalling compares through the FPSR merge. */
 static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
                      int nan2008)
 {
@@ -482,9 +466,7 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
     }
     fp_fpsr_read(b, 22U);
     a64_emit_orr_reg_w(b, 22U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
-    /* Shelter the compare result in W24: fp_finish reuses W16/W17
-     * (A64_TMP1/TMP2) as scratch, so W17 would not survive.  X24 is
-     * otherwise dead (fp_fpsr_* no longer save/restore host FPSR). */
+    /* Shelter the compare result in W24 (fp_finish clobbers W16/W17). */
     a64_emit_mov_w(b, 24U, 17U);
     fp_finish(b, 22U, cur);
     a64_emit_mov_imm32(b, 22U, 1U << fccpos);
@@ -496,10 +478,27 @@ static int fp_cmp_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
 
 /* Wave P5 FP batch: open accumulates host FPSR + sticky in W24;
  * flush merges them into ctx->fcsr Flags[6:2] before the final op,
- * which then replaces Cause and accumulates its own Flags exactly. */
-static void fp_batch_begin(a64_buf_t *b)
+ * which then replaces Cause and accumulates its own Flags exactly.
+ * M32-R8-7: enables are re-read from the runtime FCSR (a later CTC1
+ * may arm traps after translation); with any enable set the deferred
+ * path would miss intermediate traps, so single-step instead. */
+static void fp_batch_begin(a64_buf_t *b, uint32_t cur)
 {
+    size_t ph_en;
+
     a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
+    a64_emit_ubfm_w(b, A64_TMP1, 21U, FP_FCSR_ENABLE_SHIFT,
+                    FP_FCSR_ENABLE_SHIFT + 4U);
+    ph_en = a64_emit_cbz_w_placeholder(b, false, A64_TMP1);
+    emit_flush(b);
+    a64_emit_mov_imm32(b, A64_TMP1, cur);
+    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
+    a64_emit_mov_imm32(b, A64_TMP1, cur + 4U);
+    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_NEXT_PC_OFFSET);
+    a64_emit_mov_imm32(b, 0U, MIPS32_EXIT_SINGLE_STEP);
+    a64_emit_mov_imm32(b, 1U, 0U);
+    a64_emit_ret(b);
+    a64_patch_cbz_w(b, ph_en, b->count);
     fp_fpcr_sync(b);
     fp_fpsr_clear(b);
     a64_emit_mov_imm32(b, 24U, 0U);
@@ -521,8 +520,7 @@ static void fp_batch_flush(a64_buf_t *b)
     b->fp_batch_open = 0U;
 }
 
-/* S/D ADD/SUB/MUL/DIV/SQRT with FPCR sync, FPSR merge and legacy
- * canonicalization.  Operands in V0/V1 (SQRT uses V0 only), result V2. */
+/* S/D ADD/SUB/MUL/DIV/SQRT: operands V0/V1 (SQRT: V0), result V2. */
 static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                        int be, int nan2008)
 {
@@ -556,7 +554,7 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     }
     if (b->fp_defer_finish != 0U) {
         if (b->fp_batch_open == 0U) {
-            fp_batch_begin(b);
+            fp_batch_begin(b, cur);
         }
         if (opc == 0xFFU) {
             fp_emit1(b, ptype, 0x01U, 0x30U, 2U, 0U);
@@ -631,8 +629,7 @@ static int fp_arith_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
 }
 
 /* COP1X MADD/MSUB/NMADD/NMSUB (op 0x13, funct & 0x26 == 0x20):
- * unfused FMUL V2,V0,V1 then FADD/FSUB V2,V2,V3, plus non-NaN FNEG
- * for NMADD/NMSUB after reading FPSR (matches interp fp.c:857).
+ * unfused FMUL then FADD/FSUB plus non-NaN FNEG for NMADD/NMSUB.
  * fr=rs, ft=rt, fs=rd, fd=sa, f=funct&1. */
 static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                       int be, int fr_mode, int nan2008)
@@ -671,7 +668,7 @@ static int fp_madd_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     }
     if (b->fp_defer_finish != 0U) {
         if (b->fp_batch_open == 0U) {
-            fp_batch_begin(b);
+            fp_batch_begin(b, cur);
         }
         fp_emit2(b, ptype, 0x02U, 2U, 0U, 1U);
         fp_emit2(b, ptype, opc2, 2U, 2U, 3U);
@@ -827,15 +824,17 @@ static int fp_move_op(a64_buf_t *b, const mips_dec_t *d, int be)
 int dbt_emit_fp(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, uint32_t fpc,
                 int be, int fr_mode, int nan2008)
 {
-    (void)fpc;
-
+    /* M32-R8-3: an enabled FCSR trap inside a delay slot must exit with
+     * pc = branch, npc = delay_target; decline to interp_step instead. */
+    if (cur != fpc) {
+        return -1;
+    }
     if (b == NULL || d == NULL) {
         return -1;
     }
     /* Mode flags are single bits; anything else declines. FR=0 pairs
-     * D/L across even/odd low halves (M32-R7-1) while fp_ld/fp_st
-     * address flat lanes, so 64-bit FPR traffic declines to the
-     * interpreter (S low-half traffic keeps emitting). */
+     * D/L across even/odd halves (M32-R7-1), so 64-bit FPR traffic
+     * declines while S low-half traffic keeps emitting. */
     if ((unsigned)(be | fr_mode | nan2008) > 1U) {
         return -1;
     }

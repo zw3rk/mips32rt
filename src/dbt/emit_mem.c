@@ -194,6 +194,7 @@ static void emit_align_fault(a64_buf_t *b, unsigned mask_bits, uint32_t fpc,
     a64_patch_cbz_w(b, ph_mis, b->count);
     emit_flush(b);
     if (ind_slot != 0) {
+        emit_ind_link_restore(b);
         a64_emit_mov_imm32(b, A64_TMP1, fpc);
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
         emit_load_delay_target(b, A64_TMP1);

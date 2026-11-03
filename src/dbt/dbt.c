@@ -107,7 +107,7 @@ static _Atomic uint32_t g_smc_lock = 0U;
 static dbt_smc_entry_t  g_smc_table[DBT_SMC_TABLE_SIZE];
 static _Atomic uint32_t g_smc_used_count = 0U;
 static _Atomic uint64_t g_smc_flush_epoch = 1U;
-static _Atomic uint64_t g_smc_ver_epoch = 1U;
+_Atomic uint64_t dbt_smc_ver_epoch = 1U;
 
 /* RC4 threads: one cache per host thread.  A shared cache would race
  * concurrent compiles (bump allocator, block/ibtc/ras tables, SMC
@@ -276,7 +276,7 @@ static void dbt_flush_all(mips32_ctx_t *ctx)
         g_smc_table[i].used = 0U;
     }
     atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
     mips32_spin_unlock(&g_smc_lock);
 
@@ -323,14 +323,14 @@ uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page)
     if (atomic_load_explicit(&g_smc_used_count, memory_order_acquire) == 0U) {
         return 1U;
     }
-    ver_ep = atomic_load_explicit(&g_smc_ver_epoch, memory_order_acquire);
+    ver_ep = atomic_load_explicit(&dbt_smc_ver_epoch, memory_order_acquire);
     if (dbt_cache != NULL && dbt_cache->smc_memo_valid != 0 &&
         dbt_cache->smc_memo_page == page &&
         dbt_cache->local_ver_epoch == ver_ep) {
         return dbt_cache->smc_memo_version;
     }
     mips32_spin_lock(&g_smc_lock);
-    ver_ep = atomic_load_explicit(&g_smc_ver_epoch, memory_order_relaxed);
+    ver_ep = atomic_load_explicit(&dbt_smc_ver_epoch, memory_order_relaxed);
     for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
         if (g_smc_table[i].used != 0U && g_smc_table[i].page == page) {
             v = g_smc_table[i].version;
@@ -365,7 +365,7 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
             if (g_smc_table[i].version == 0U) {
                 g_smc_table[i].version = 1U;
             }
-            atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U,
+            atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U,
                 memory_order_release);
             mips32_spin_unlock(&g_smc_lock);
             return;
@@ -378,7 +378,7 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
             g_smc_table[i].used = 1U;
             atomic_fetch_add_explicit(&g_smc_used_count, 1U,
                 memory_order_relaxed);
-            atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U,
+            atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U,
                 memory_order_release);
             mips32_spin_unlock(&g_smc_lock);
             return;
@@ -391,7 +391,7 @@ void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
         g_smc_table[i].used = 0U;
     }
     atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_smc_ver_epoch, 1U, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
     mips32_spin_unlock(&g_smc_lock);
     dbt_flush_local(ctx);
@@ -547,6 +547,9 @@ void *dbt_chain_next(mips32_ctx_t *ctx)
     if (code == NULL) {
         return NULL;
     }
+    /* M32-R8-5: snapshot the validated epoch for the inline probe. */
+    ctx->ibtc_epoch = atomic_load_explicit(&dbt_smc_ver_epoch,
+        memory_order_acquire);
     ctx->blocks_executed++;
     return code;
 }
@@ -836,6 +839,9 @@ int dbt_main(mips32_ctx_t *ctx)
         } else {
             ctx->ibtc_ptr = (uint64_t)(uintptr_t)dbt_cache->ibtc;
         }
+        /* M32-R8-5: snapshot the validated epoch for the inline probe. */
+        ctx->ibtc_epoch = atomic_load_explicit(&dbt_smc_ver_epoch,
+            memory_order_acquire);
         if (mips_hostfault_run(ctx, code, &reason) != 0) {
             continue;
         }

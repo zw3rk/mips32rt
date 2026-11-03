@@ -88,6 +88,9 @@ void *dbt_chain_next(mips32_ctx_t *ctx);
  */
 uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page);
 void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va);
+/* M32-R8-5: process-wide SMC version epoch (bumped on every SMC state
+ * change); the trampoline probe compares it against ctx->ibtc_epoch. */
+extern _Atomic uint64_t dbt_smc_ver_epoch;
 
 /* Host entry point (src/dbt/trampoline_a64.S). Never touches x18. */
 uint32_t dbt_trampoline_enter(mips32_ctx_t *ctx, void *code);

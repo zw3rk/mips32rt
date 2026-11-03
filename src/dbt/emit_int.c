@@ -12,9 +12,8 @@
 #include "rt32/a64_emit.h"
 #include "interp/decode.h"
 #include "dbt/emit_priv.h"
-/* FP emitter (src/dbt/emit_fp.c): 0 emitted (advance 4), nonzero declines
- * to the dispatcher's fallback.  BC1 declines here; its native branch
- * lives in emit_branch below, which owns the delay-slot instruction. */
+/* FP emitter: 0 emitted, nonzero declines.  BC1 declines; its branch
+ * lives in emit_branch, which owns the delay-slot instruction. */
 int dbt_emit_fp(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, uint32_t fpc,
                 int be, int fr_mode, int nan2008);
 /* Cached guest GPR -> host W register (SPEC 2.1 order). */
@@ -25,8 +24,7 @@ static const int8_t kGprHost[32] = {
 static const uint8_t kCached[16] = {
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 29, 31
 };
-/* RC-U3-R2 epoch page (src/os/mem.c): translation-time mapping
- * guarantee for blocks that emit epoch-table accesses. */
+/* RC-U3-R2 epoch page (src/os/mem.c); ensured at translation time. */
 extern int mips_ll_epoch_ensure(mips32_ctx_t *ctx);
 int gpr_host(unsigned g) { return (g < 32U) ? (int)kGprHost[g] : -1; }
 /* Guest GPR value into a host register (cached host, wzr, or tmp load). */
@@ -105,6 +103,17 @@ void emit_load_delay_target(a64_buf_t *b, unsigned dst)
     a64_emit_ldr_imm_w(b, dst, A64_TMP1, 0U);
 }
 
+/* M32-R8-4: restore an aliased JALR jump source from delay_target
+ * (runs after the exit's flush; the cached copy dies at the RET). */
+void emit_ind_link_restore(a64_buf_t *b)
+{
+    if (b->ind_link_restore == 0U || b->ind_link_rs == MIPS32_REG_ZERO) {
+        return;
+    }
+    emit_load_delay_target(b, A64_TMP2);
+    a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)b->ind_link_rs * 4U);
+}
+
 static void emit_prologue(a64_buf_t *b, const mips_dec_t *insns,
                           unsigned count)
 {
@@ -130,9 +139,7 @@ static void emit_prologue(a64_buf_t *b, const mips_dec_t *insns,
         }
     }
 }
-/* Store back only the cached GPRs written since the last flush (or
- * block start): fault/exit paths flush whatever is dirty, while
- * straight-line code between memory ops skips the other 15 stores. */
+/* Store back cached GPRs written since the last flush (exits flush). */
 void emit_flush(a64_buf_t *b)
 {
     unsigned i;
@@ -162,9 +169,8 @@ static void emit_exit_imm(a64_buf_t *b, unsigned reason, uint32_t info,
     emit_pc_imm(b, pc, npc);
     emit_reason(b, reason, info);
 }
-/* Indirect exit: the JR/JALR target was spilled to ctx->delay_target
- * before the delay slot, which may itself clobber w23 (an FP slot op
- * spills FPCR there).  Reload it so the exit jumps to the true target. */
+/* Indirect exit: reload the target spilled before the slot (x23 is
+ * scratch across the slot). */
 static void emit_exit_indirect(a64_buf_t *b)
 {
     emit_flush(b);
@@ -176,9 +182,7 @@ static void emit_exit_indirect(a64_buf_t *b)
     a64_emit_mov_imm32(b, 1U, 0U);
     a64_emit_ret(b);
 }
-/* B.cond to a fault exit with info = cur (flags already set).  In a
- * JR/JALR delay slot next_pc recovers from ctx->delay_target (the
- * branch target) instead of fpc + 4. */
+/* B.cond fault exit (info = cur); in a delay slot npc = delay_target. */
 static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
                             uint32_t fpc, int ind_slot)
 {
@@ -188,6 +192,7 @@ static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
     a64_patch_b_cond(b, ph_f, b->count);
     if (ind_slot != 0) {
         emit_flush(b);
+        emit_ind_link_restore(b);
         a64_emit_mov_imm32(b, A64_TMP1, fpc);
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
         emit_load_delay_target(b, A64_TMP1);
@@ -200,7 +205,7 @@ static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
     a64_patch_b_cond(b, ph_c, b->count);
 }
 
-/* 3-operand ALU into dst (cached host or TMP1) + writeback. */
+/* 3-operand ALU into dst + writeback. */
 #define ALU3(fn, rd, ra, rb) \
     do { \
         int h_ = gpr_host(rd); \
@@ -387,7 +392,7 @@ static int emit_muldiv(a64_buf_t *b, const mips_dec_t *d)
     return 0;
 }
 
-/* SPECIAL ALU/shifts/MOVZ/MOVN/traps + SYSCALL/BREAK exits. */
+/* SPECIAL ALU/shifts/traps + SYSCALL/BREAK exits. */
 static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                         uint32_t fpc, int ind_slot)
 {
@@ -543,7 +548,9 @@ static int emit_special3(a64_buf_t *b, const mips_dec_t *d)
 static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                        uint32_t fpc, int ind_slot)
 {
-    static const uint8_t kCond[8] = { 10U, 2U, 11U, 12U, 13U, 0U, 0U, 1U };
+    /* M32-R8-1/2: TLTIU is unsigned below (CC), TEQI is equality (EQ),
+     * matching the SPECIAL-register table and the interp oracle. */
+    static const uint8_t kCond[8] = { 10U, 2U, 11U, 3U, 0U, 0U, 0U, 1U };
     unsigned idx;
     switch (d->rt) {
     case 0x08U: idx = 0U; break; /* TGEI */
@@ -592,12 +599,10 @@ static void emit_link_imm(a64_buf_t *b, unsigned rd, uint32_t val)
     } else { a64_emit_mov_imm32(b, A64_TMP1, val); a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, rd * 4U); }
 }
 
-/* Branch + inline delay slot (flags before link write; x23 holds the
- * indirect target across the slot, spilled to ctx->delay_target before
- * the slot so a delay-slot fault can recover next_pc).  A JALR whose
- * link register aliases its source (rd == rs) defers the link write
- * until after the slot: committing first would clobber rs, and a fault
- * in the slot would then re-execute the jump to the wrong target.
+/* Branch + inline delay slot (x23 holds the indirect target, spilled to
+ * ctx->delay_target before the slot for next_pc recovery).  M32-R8-4:
+ * the link commits before the slot even when rd == rs; slot exits with
+ * pc = branch restore an aliased rs from delay_target for fallback.
  * Returns 0 with the branch emitted, -1 when the delay slot declines
  * (the caller rewinds the buffer and single-steps instead). */
 static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
@@ -606,11 +611,10 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
 {
     uint32_t nottaken = cur + 8U, taken = 0U;
     unsigned cond = A64_COND_AL;
-    int indirect = 0, link_rd = -1, defer_link = 0;
+    int indirect = 0, link_rd = -1;
     uint32_t saved_dirty;
     size_t ph_t;
-    /* Wave P13: delay slots inherit no deferral (a stale flag would
-     * strand a slot arithmetic batch past the block end). */
+    /* Wave P13: delay slots inherit no FP deferral. */
     b->fp_defer_finish = 0U;
     switch (d->op) {
     case MIPS_OP_J: case MIPS_OP_JAL:
@@ -665,17 +669,21 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
         a64_emit_mov_imm32(b, A64_TMP1, EMIT_DELAY_TARGET_OFFSET);
         a64_emit_add_uxtw_x(b, A64_TMP1, A64_XCTX, A64_TMP1);
         a64_emit_str_imm_w(b, 23U, A64_TMP1, 0U);
-        defer_link = (link_rd >= 0 && d->funct == MIPS_FUNCT_JALR &&
-                      link_rd == (int)d->rs);
     }
-    if (link_rd >= 0 && defer_link == 0) {
+    if (link_rd >= 0) {
         emit_link_imm(b, (unsigned)link_rd, cur + 8U);
     }
     if (indirect != 0) {
-        if (emit_one(b, s, cur + 4U, cur, be, 1, ctx) < 0) return -1;
-        if (defer_link != 0) {
-            emit_link_imm(b, (unsigned)link_rd, cur + 8U);
+        /* M32-R8-4: link aliasing rs is committed; arm slot-exit restore. */
+        if (link_rd == (int)d->rs && d->rs != MIPS32_REG_ZERO) {
+            b->ind_link_restore = 1U;
+            b->ind_link_rs = (uint8_t)d->rs;
         }
+        if (emit_one(b, s, cur + 4U, cur, be, 1, ctx) < 0) {
+            b->ind_link_restore = 0U;
+            return -1;
+        }
+        b->ind_link_restore = 0U;
         emit_exit_indirect(b);
         return 0;
     }
@@ -703,9 +711,8 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
     return 0;
 }
 
-/* One straight-line insn: 0 continue, 1 exit, -1 decline.  ind_slot
- * marks a JR/JALR delay slot (fault exits recover next_pc from
- * ctx->delay_target). */
+/* One straight-line insn (0 continue, 1 exit, -1 decline); ind_slot
+ * marks a JR/JALR delay slot (fault npc recovers from delay_target). */
 static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                     uint32_t fpc, int be, int ind_slot,
                     const mips32_ctx_t *ctx)
@@ -720,8 +727,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     case MIPS_OP_XORI: case MIPS_OP_LUI:
         return emit_imm_op(b, d, cur, fpc, ind_slot);
     case MIPS_OP_COP0: return emit_cop0(b, d);
-    case MIPS_OP_COP1: /* Non-branch COP1 (moves/arithmetic): BC1 declines
-        * in dbt_emit_fp and falls back to interp_step. */
+    case MIPS_OP_COP1: /* Non-branch COP1; BC1 declines in dbt_emit_fp. */
         return (ctx != NULL &&
             dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
             ? 0 : -1;
@@ -734,8 +740,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         emit_ea(b, d->rs, d->simm);
         emit_mem_aligned(b, d, fpc, be, ind_slot);
         return 0;
-    /* Wave P lane P4: COP1 memory moves (raw opcodes; decode.h names
-     * only the integer memory ops). */
+    /* Wave P4: COP1 memory moves (raw opcodes). */
     case 0x31u: case 0x35u: case 0x39u: case 0x3du: /* LWC1/LDC1/SWC1/SDC1 */
         emit_ea(b, d->rs, d->simm);
         return emit_fp_mem(b, d, fpc, be, (ctx != NULL) ? ctx->fr_mode : 1, ind_slot);
@@ -789,8 +794,7 @@ static int slot_ok(const mips_dec_t *d)
     case MIPS_OP_SH: case MIPS_OP_SW: case MIPS_OP_LWL: case MIPS_OP_LWR:
     case MIPS_OP_SWL: case MIPS_OP_SWR: case MIPS_OP_LL: case MIPS_OP_SC:
     case 0x2FU: case 0x33U: return 1;
-    /* Wave P lane P4: FP memory moves share the fault-sync machinery
-     * with integer memory ops, so they are delay-slot safe. */
+    /* Wave P4: FP memory moves are delay-slot safe (shared fault sync). */
     case 0x31u: case 0x35u: case 0x39u: case 0x3du: return 1;
     /* Non-branch COP1 (moves/arithmetic) inlines with no exit of its
      * own; BC1 branches keep delay-slot ownership in emit_branch. */
@@ -815,12 +819,9 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         cap < 4U || (cap & 3U) != 0U)
         return -1;
     be = mips_is_be(ctx);
-    /* RC-U3-R2: emitted memory/LL/SC sequences index the shared epoch
-     * table at G + 0xFFFF0000 via x20, so the page must be mapped
-     * before the block can run.  Translation precedes execution, hence
-     * this translation-time guarantee (best-effort: the C helpers
-     * degrade gracefully when the reservation fails).  Pure-ALU blocks
-     * skip it. */
+    /* RC-U3-R2: memory/LL/SC emission indexes the epoch table at G +
+     * 0xFFFF0000, so ensure it is mapped first (best-effort; pure-ALU
+     * blocks skip this). */
     for (i = 0U; i < count; i++) {
         unsigned op = insns[i].op;
 

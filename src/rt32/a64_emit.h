@@ -93,6 +93,12 @@ typedef struct a64_buf {
      * the batch-final op; fp_batch_open tracks an open batch. */
     uint8_t   fp_defer_finish;
     uint8_t   fp_batch_open;
+    /* M32-R8-4: JR/JALR delay-slot link restore.  Armed only while a
+     * JALR rd==rs delay slot emits: its fault/single-step exits then
+     * restore guest GPR ind_link_rs from ctx->delay_target (the link
+     * already clobbered the jump source). */
+    uint8_t   ind_link_restore;
+    uint8_t   ind_link_rs;
     /* Wave P12 16-slot write-through FPR cache in v16..v31 (slot =
      * ((fs>>1)^((fs&1)<<3))&15, creg = 16+slot; even O32 regs map 1-1)
      * plus known-non-NaN / known-no-sNaN bitmaps (bit = guest FPR). */

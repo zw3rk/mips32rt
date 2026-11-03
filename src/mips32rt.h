@@ -212,6 +212,10 @@ typedef struct mips32_ctx {
     int32_t  sig_rt_code[MIPS32_RT_SIG_QUEUE_CAP];
     unsigned sig_rt_count;
     uint8_t  sc_pc_advanced;
+    /* M32-R8-5: inline-IBTC epoch snapshot (C-only tail field).  The C
+     * chaining transitions record the global SMC epoch here; the
+     * trampoline probe falls back to the validated lookup on mismatch. */
+    uint64_t ibtc_epoch;
 } mips32_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */
@@ -234,6 +238,9 @@ typedef struct mips32_ctx {
 #define MIPS32_CTX_EXIT_REASON_OFFSET   0x0b8U
 #define MIPS32_CTX_EXIT_INFO_OFFSET     0x0bcU
 #define MIPS32_CTX_FPR_OFFSET           0x0c0U
+/* C-only tail offset (M32-R8-5 inline-IBTC epoch snapshot). */
+#define MIPS32_CTX_IBTC_EPOCH_OFFSET \
+    ((uint32_t)offsetof(mips32_ctx_t, ibtc_epoch))
 
 _Static_assert(offsetof(mips32_ctx_t, gpr) == 0, "gpr must be at offset 0");
 _Static_assert(offsetof(mips32_ctx_t, pc) == 0x080, "pc must be at offset 0x080");

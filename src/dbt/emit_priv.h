@@ -52,6 +52,9 @@ void     put_rd(a64_buf_t *b, unsigned g, unsigned src);
 void     emit_flush(a64_buf_t *b);
 /* Load ctx->delay_target (JR/JALR recovery) into dst. */
 void     emit_load_delay_target(a64_buf_t *b, unsigned dst);
+/* M32-R8-4: on an armed JALR rd==rs delay-slot exit, restore the jump
+ * source from ctx->delay_target (no-op unless emit_branch armed it). */
+void     emit_ind_link_restore(a64_buf_t *b);
 
 /* Memory subsystem (src/dbt/emit_mem.c).  EA lands in w22 (A64_ADDR);
  * ind_slot is nonzero for JR/JALR delay slots (next_pc recovers from

@@ -58,8 +58,8 @@ static void trace_range(mips32_ctx_t *ctx, uint32_t start, uint32_t limit)
 
 /* True when the word is a control transfer with a delay slot (the slot
  * executes before any redirect takes effect, so the interpreter prints
- * both fetches).  J/JAL, Bcond/BcondL, REGIMM branches (rt < 8; the
- * trap immediates have no delay slot), SPECIAL JR/JALR, and BCzF/BCzT. */
+ * both fetches).  J/JAL, Bcond/BcondL, REGIMM branches (rt 0-3 and
+ * 0x10-0x13; trap immediates have no delay slot), JR/JALR, BCzF/BCzT. */
 static int has_delay_slot(uint32_t word)
 {
     uint32_t op = word >> 26;
@@ -74,7 +74,11 @@ static int has_delay_slot(uint32_t word)
         return 1;
     }
     if (op == 1U) {
-        return ((word >> 16) & 31U) < 8U;
+        /* M32-R8-6: REGIMM links (BLTZAL/BGEZAL/BLTZALL/BGEZALL,
+         * rt 0x10-0x13) have delay slots, like rt 0-3. */
+        uint32_t rt = (word >> 16) & 31U;
+
+        return rt <= 3U || (rt >= 0x10U && rt <= 0x13U);
     }
     if (op == 0U) {
         uint32_t funct = word & 63U;
