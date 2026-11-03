@@ -132,6 +132,38 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
     return 0;
 }
 
+static int elf32_check_swap(elf32_ehdr_t *eh, bool *is_be_out)
+{
+    bool be;
+    if (eh->e_ident[0] != 0x7fU || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F' ||
+        eh->e_ident[EI_CLASS] != ELFCLASS32 ||
+        (eh->e_ident[EI_DATA] != ELFDATA2LSB &&
+         eh->e_ident[EI_DATA] != ELFDATA2MSB)) {
+        return -1;
+    }
+    be = eh->e_ident[EI_DATA] == ELFDATA2MSB;
+    if (is_be_out != NULL) {
+        *is_be_out = be;
+    }
+    if (be) {
+        eh->e_type = swap16(eh->e_type);
+        eh->e_machine = swap16(eh->e_machine);
+        eh->e_version = swap32(eh->e_version);
+        eh->e_entry = swap32(eh->e_entry);
+        eh->e_phoff = swap32(eh->e_phoff);
+        eh->e_shoff = swap32(eh->e_shoff);
+        eh->e_flags = swap32(eh->e_flags);
+        eh->e_ehsize = swap16(eh->e_ehsize);
+        eh->e_phentsize = swap16(eh->e_phentsize);
+        eh->e_phnum = swap16(eh->e_phnum);
+        eh->e_shentsize = swap16(eh->e_shentsize);
+        eh->e_shnum = swap16(eh->e_shnum);
+        eh->e_shstrndx = swap16(eh->e_shstrndx);
+    }
+    return 0;
+}
+
 static int protect_and_record_seg(mips32_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
@@ -171,35 +203,10 @@ static int load_elf32_image(mips32_ctx_t *ctx, int fd, uint32_t default_pie_base
         return -1;
     }
 
-    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
-        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F') {
+    bool is_be = false;
+    if (elf32_check_swap(&ehdr, &is_be) != 0) {
         fprintf(stderr, "mips32rt: %s: not an ELF file\n", label);
         return -1;
-    }
-    if (ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
-        (ehdr.e_ident[EI_DATA] != ELFDATA2LSB &&
-         ehdr.e_ident[EI_DATA] != ELFDATA2MSB)) {
-        fprintf(stderr, "mips32rt: %s: not a 32-bit MIPS ELF\n", label);
-        return -1;
-    }
-    bool is_be = ehdr.e_ident[EI_DATA] == ELFDATA2MSB;
-    if (is_be) {
-        /* BE (mips) guest on an LE host: swap every multibyte header
-         * field once, right after read, so the rest of the loader is
-         * endian-neutral. */
-        ehdr.e_type      = swap16(ehdr.e_type);
-        ehdr.e_machine   = swap16(ehdr.e_machine);
-        ehdr.e_version   = swap32(ehdr.e_version);
-        ehdr.e_entry     = swap32(ehdr.e_entry);
-        ehdr.e_phoff     = swap32(ehdr.e_phoff);
-        ehdr.e_shoff     = swap32(ehdr.e_shoff);
-        ehdr.e_flags     = swap32(ehdr.e_flags);
-        ehdr.e_ehsize    = swap16(ehdr.e_ehsize);
-        ehdr.e_phentsize = swap16(ehdr.e_phentsize);
-        ehdr.e_phnum     = swap16(ehdr.e_phnum);
-        ehdr.e_shentsize = swap16(ehdr.e_shentsize);
-        ehdr.e_shnum     = swap16(ehdr.e_shnum);
-        ehdr.e_shstrndx  = swap16(ehdr.e_shstrndx);
     }
     if (ehdr.e_machine != EM_MIPS) {
         fprintf(stderr, "mips32rt: %s: not a MIPS (EM_MIPS) ELF\n", label);
@@ -519,19 +526,9 @@ static int interp_measure_span(int fd, uint64_t *out_span)
     if (pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
         return -1;
     }
-    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
-        ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F' ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
-        (ehdr.e_ident[EI_DATA] != ELFDATA2LSB &&
-         ehdr.e_ident[EI_DATA] != ELFDATA2MSB)) {
+    is_be = false;
+    if (elf32_check_swap(&ehdr, &is_be) != 0) {
         return -1;
-    }
-    is_be = ehdr.e_ident[EI_DATA] == ELFDATA2MSB;
-    if (is_be) {
-        ehdr.e_machine  = swap16(ehdr.e_machine);
-        ehdr.e_phoff    = swap32(ehdr.e_phoff);
-        ehdr.e_phentsize = swap16(ehdr.e_phentsize);
-        ehdr.e_phnum    = swap16(ehdr.e_phnum);
     }
     if (ehdr.e_machine != EM_MIPS || ehdr.e_phentsize != sizeof(elf32_phdr_t) ||
         ehdr.e_phnum == 0U || ehdr.e_phnum > 64U) {
@@ -610,22 +607,9 @@ static int validate_elf32_image(int fd, uint32_t default_pie_base,
     if (fd < 0 || pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
         return -1;
     }
-    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
-        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F' ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS32 ||
-        (ehdr.e_ident[EI_DATA] != ELFDATA2LSB &&
-         ehdr.e_ident[EI_DATA] != ELFDATA2MSB)) {
+    bool is_be = false;
+    if (elf32_check_swap(&ehdr, &is_be) != 0) {
         return -1;
-    }
-    bool is_be = ehdr.e_ident[EI_DATA] == ELFDATA2MSB;
-    if (is_be) {
-        ehdr.e_type      = swap16(ehdr.e_type);
-        ehdr.e_machine   = swap16(ehdr.e_machine);
-        ehdr.e_entry     = swap32(ehdr.e_entry);
-        ehdr.e_phoff     = swap32(ehdr.e_phoff);
-        ehdr.e_flags     = swap32(ehdr.e_flags);
-        ehdr.e_phentsize = swap16(ehdr.e_phentsize);
-        ehdr.e_phnum     = swap16(ehdr.e_phnum);
     }
     if (ehdr.e_machine != EM_MIPS ||
         (ehdr.e_flags & EF_MIPS_ABI2) != 0U ||

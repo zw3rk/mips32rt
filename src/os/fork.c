@@ -42,6 +42,8 @@ __attribute__((weak)) void mips32_dbt_fork_release(void);
 __attribute__((weak)) void mips_ll_fork_prepare(void);
 __attribute__((weak)) void mips_ll_fork_release(void);
 __attribute__((weak)) void mips_threads_fork_child(void);
+__attribute__((weak)) void mips_threads_fork_prepare(void);
+__attribute__((weak)) void mips_threads_fork_release(void);
 
 static int32_t fork_ret(mips32_ctx_t *ctx, int32_t raw)
 {
@@ -72,10 +74,16 @@ static void fork_stages_prepare(void)
     if (mips_ll_fork_prepare != NULL) {
         mips_ll_fork_prepare();
     }
+    if (mips_threads_fork_prepare != NULL) {
+        mips_threads_fork_prepare();
+    }
 }
 
 static void fork_stages_release(void)
 {
+    if (mips_threads_fork_release != NULL) {
+        mips_threads_fork_release();
+    }
     if (mips_ll_fork_release != NULL) {
         mips_ll_fork_release();
     }

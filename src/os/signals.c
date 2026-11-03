@@ -738,14 +738,14 @@ int32_t mips_sc_sigaltstack(mips32_ctx_t *ctx, uint32_t sp)
             nflags != L4A_SS_ONSTACK) {
             return mips_sc_ret(ctx, -L4A_EINVAL);
         }
+        if (l4a_on_altstack(ctx)) {
+            return mips_sc_ret(ctx, -L4A_EPERM);
+        }
         if (nflags == L4A_SS_DISABLE) {
             ctx->sigalt_flags = L4A_SS_DISABLE;
             ctx->sigalt_size = 0U;
             ctx->sigalt_sp = 0U;
             return mips_sc_ret(ctx, 0);
-        }
-        if (l4a_on_altstack(ctx)) {
-            return mips_sc_ret(ctx, -L4A_EPERM);
         }
         if (nsize < L4A_MINSIGSTKSZ) {
             return mips_sc_ret(ctx, -L4A_ENOMEM);

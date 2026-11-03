@@ -132,16 +132,30 @@ int32_t mips_sc_fcntl(mips32_ctx_t *ctx, uint32_t sp)
             r = (int)host_to_mips_flags(r);
         }
         break;
-    case (uint32_t)MIPS_F_SETFL:
-        if (mips_sc_flags_to_host(arg | 2U, &host_flags) != 0) {
-            /* arg has no accmode bits; OR in O_RDWR so the
-             * converter sees a valid mode while mapping flags. */
+    case (uint32_t)MIPS_F_SETFL: {
+        uint32_t m = arg & ~(3U | MIPS_O_CREAT | MIPS_O_TRUNC |
+            MIPS_O_EXCL | MIPS_O_NOCTTY | MIPS_O_DIRECTORY |
+            MIPS_O_NOFOLLOW | MIPS_O_CLOEXEC | MIPS_O_LARGEFILE);
+        if (mips_sc_flags_to_host(m, &host_flags) != 0) {
             return mips_sc_ret(ctx, -EINVAL);
         }
         host_flags &= ~(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL |
                         O_NOCTTY | O_TRUNC);
+#ifdef O_DIRECTORY
+        host_flags &= ~O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+        host_flags &= ~O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        host_flags &= ~O_CLOEXEC;
+#endif
+#ifdef O_LARGEFILE
+        host_flags &= ~O_LARGEFILE;
+#endif
         r = fcntl((int)fd, F_SETFL, host_flags);
         break;
+    }
     default:
         return mips_sc_ret(ctx, -ENOSYS); /* F_GETLK/F_SETLK*: Phase 4 */
     }

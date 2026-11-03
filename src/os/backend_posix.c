@@ -316,29 +316,6 @@ int64_t mips32_host_clock_gettime(int linux_clk_id, struct timespec *tp)
     return 0;
 }
 
-int mips32_host_worker_altstack_init(void **out_stack_mem,
-                                     size_t *out_stack_size)
-{
-    void *p;
-
-    if (out_stack_mem == NULL || out_stack_size == NULL) {
-        return -EINVAL;
-    }
-    p = malloc(64u * 1024u);
-    if (p == NULL) {
-        return -ENOMEM;
-    }
-    *out_stack_mem = p;
-    *out_stack_size = 64u * 1024u;
-    return 0;
-}
-
-void mips32_host_worker_altstack_destroy(void *stack_mem, size_t stack_size)
-{
-    (void)stack_size;
-    free(stack_mem);
-}
-
 int64_t mips32_host_fork(void)
 {
     pid_t p = fork();

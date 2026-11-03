@@ -1,14 +1,7 @@
 /*
- * src/os/syscalls.c — Phase 2 static-libc syscall layer (lane L2a)
- *
+ * src/os/syscalls.c — O32 syscall layer.
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * O32 static-libc layer: open/close/lseek/dup/pipe/readv/writev,
- * fcntl/ioctl/stat/time/getdents/readlink/access/nanosleep/ids/getrandom,
- * futex/signal/robust (Phase 4 in signals/threads.c). $a3 convention;
- * BE via xld/xst; bulk copies validate regions (-EFAULT, never raise).
- * Companion: syscalls_meta.c (split for 900-line limit).
  */
 
 #if defined(__linux__)
@@ -44,9 +37,6 @@
 int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp);
 
 
-/* ---- Small self-contained guest helpers (no faults, -EFAULT style) ---- */
-
-/* Record the $a3 convention in the guest regs; return raw host value. */
 int32_t mips_sc_ret(mips32_ctx_t *ctx, int32_t raw)
 {
     if (raw < 0) {
@@ -69,7 +59,6 @@ void mips_sc_advance_pc_once(mips32_ctx_t *ctx)
     }
 }
 
-/* True when [va, va+len) is fully covered by recorded regions with need. */
 int mips_sc_range_ok(const mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                      uint32_t need)
 {
@@ -91,7 +80,6 @@ int mips_sc_copy_to(mips32_ctx_t *ctx, uint32_t va, const void *src,
 uint32_t mips_sc_ld32(const uint8_t *p, int be);
 void mips_sc_st32(uint8_t *p, uint32_t v, int be);
 
-/* O32 argument i (0-based): $a0..$a3 for i<4, guest stack at sp+16+4*i. */
 uint32_t mips_sc_arg(mips32_ctx_t *ctx, uint32_t sp, unsigned i, int *ok)
 {
     uint32_t va;
@@ -115,7 +103,6 @@ uint32_t mips_sc_arg(mips32_ctx_t *ctx, uint32_t sp, unsigned i, int *ok)
     return val;
 }
 
-/* Guest-order scalar loads/stores on raw byte buffers. */
 uint32_t mips_sc_ld32(const uint8_t *p, int be)
 {
     if (be) {
@@ -163,7 +150,6 @@ void mips_sc_st64(uint8_t *p, uint64_t v, int be)
     }
 }
 
-/* Copy a guest NUL-terminated path into host_buf (size MIPS_PATH_MAX). */
 int mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va, char *host_buf)
 {
     uint32_t i;
@@ -181,8 +167,6 @@ int mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va, char *host_buf)
     }
     return -ENAMETOOLONG;
 }
-
-/* ---- MIPS O_* <-> host O_* conversion (host macros, so any host builds) ---- */
 
 int mips_sc_flags_to_host(uint32_t mips, int *host_out)
 {
@@ -227,12 +211,9 @@ int mips_sc_flags_to_host(uint32_t mips, int *host_out)
         host |= O_LARGEFILE;
     }
 #else
-    /* 64-bit hosts address large files by default; the bit is a no-op. */
 #endif
-    if ((mips & MIPS_O_SYNC) == MIPS_O_SYNC) {
+    if ((mips & 0x4000U) != 0U) {
         host |= O_SYNC;
-    } else if ((mips & MIPS_O_SYNC) != 0U) {
-        return -EINVAL; /* bare __O_SYNC without O_DSYNC is invalid */
     }
 #ifdef O_DIRECT
     if ((mips & MIPS_O_DIRECT) != 0U) {
@@ -288,7 +269,6 @@ int mips_sc_flags_to_host(uint32_t mips, int *host_out)
         return -EINVAL;
     }
 #endif
-    /* Any leftover bit is unknown on this host. */
     if ((mips & ~(3U | MIPS_O_APPEND | MIPS_O_DSYNC | MIPS_O_NONBLOCK |
                   MIPS_O_CREAT | MIPS_O_TRUNC | MIPS_O_EXCL |
                   MIPS_O_NOCTTY | MIPS_O_LARGEFILE | MIPS_O_SYNC |
@@ -299,8 +279,6 @@ int mips_sc_flags_to_host(uint32_t mips, int *host_out)
     *host_out = host;
     return 0;
 }
-
-/* ---- open/openat/close ---- */
 
 static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
 {
@@ -314,8 +292,6 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
     int      fd;
     int      rc;
 
-    /* Historic open(path, flags, mode) is openat(AT_FDCWD, ...) shifted
-     * by one argument slot; index the slots instead of moving regs. */
     dirfd      = (is_open != 0) ? (uint32_t)(int32_t)MIPS_AT_FDCWD
                                : mips_sc_arg(ctx, sp, 0, &ok);
     path_va    = mips_sc_arg(ctx, sp, (unsigned)(is_open != 0 ? 0 : 1), &ok);
@@ -338,8 +314,6 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
             return mips_sc_ret(ctx, (int32_t)fd);
         }
     }
-    /* Wave C2: absolute library loads resolve under --sysroot first
-     * (PT_INTERP + DT_NEEDED/RPATH); fall back to the raw host path. */
     fd = mips_sysroot_open(ctx, (int)(int32_t)dirfd, path, host_flags,
         (mode_t)(mode & 07777U));
     if (fd < 0) {
@@ -351,8 +325,6 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
     }
     return mips_sc_ret(ctx, (int32_t)fd);
 }
-
-/* ---- unlink/unlinkat ---- */
 
 static int32_t sc_unlinkat(mips32_ctx_t *ctx, uint32_t sp, int is_unlink)
 {
@@ -401,8 +373,6 @@ static int32_t sc_close(mips32_ctx_t *ctx, uint32_t sp)
     }
     return mips_sc_ret(ctx, 0);
 }
-
-/* ---- lseek/llseek (llseek pair is (hi,lo) on both endians: E01) ---- */
 
 static int32_t sc_lseek(mips32_ctx_t *ctx, uint32_t sp)
 {
@@ -468,8 +438,6 @@ static int32_t sc_llseek(mips32_ctx_t *ctx, uint32_t sp)
     return mips_sc_ret(ctx, 0);
 }
 
-/* ---- dup/dup2/dup3/pipe/pipe2 ---- */
-
 static int32_t sc_dup(mips32_ctx_t *ctx, uint32_t sp)
 {
     int      ok = 1;
@@ -522,16 +490,14 @@ static int32_t sc_dup2(mips32_ctx_t *ctx, uint32_t sp, int is_dup3)
 
 static int32_t sc_pipe(mips32_ctx_t *ctx, uint32_t sp, int is_pipe2)
 {
-    int      be;
     int      ok = 1;
-    uint8_t  out[8];
-    uint32_t fds_va;
+    uint32_t fds_va = 0U;
     uint32_t flags = 0U;
     int      fds[2];
     int      i;
 
-    fds_va = mips_sc_arg(ctx, sp, 0, &ok);
     if (is_pipe2) {
+        fds_va = mips_sc_arg(ctx, sp, 0, &ok);
         flags = mips_sc_arg(ctx, sp, 1, &ok);
     }
     if (!ok) {
@@ -568,22 +534,25 @@ static int32_t sc_pipe(mips32_ctx_t *ctx, uint32_t sp, int is_pipe2)
             }
         }
     }
-    be = mips_is_be(ctx);
-    mips_sc_st32(out, (uint32_t)fds[0], be);
-    mips_sc_st32(out + 4, (uint32_t)fds[1], be);
-    if (mips_sc_copy_to(ctx, fds_va, out, 8U) != 0) {
-        (void)close(fds[0]);
-        (void)close(fds[1]);
-        return mips_sc_ret(ctx, -EFAULT);
+    if (!is_pipe2) {
+        ctx->gpr[MIPS32_REG_V0] = (uint32_t)fds[0];
+        ctx->gpr[MIPS32_REG_V1] = (uint32_t)fds[1];
+        ctx->gpr[MIPS32_REG_A3] = 0U;
+        return fds[0];
     }
-    /* O32 pipe returns fd0 in $v0 and fd1 in $v1 (SPEC 2.3). */
-    ctx->gpr[MIPS32_REG_V0] = (uint32_t)fds[0];
-    ctx->gpr[MIPS32_REG_V1] = (uint32_t)fds[1];
-    ctx->gpr[MIPS32_REG_A3] = 0U;
-    return 0;
+    {
+        int be = mips_is_be(ctx);
+        uint8_t out[8];
+        mips_sc_st32(out, (uint32_t)fds[0], be);
+        mips_sc_st32(out + 4, (uint32_t)fds[1], be);
+        if (mips_sc_copy_to(ctx, fds_va, out, 8U) != 0) {
+            (void)close(fds[0]);
+            (void)close(fds[1]);
+            return mips_sc_ret(ctx, -EFAULT);
+        }
+    }
+    return mips_sc_ret(ctx, 0);
 }
-
-/* ---- readv/writev (MIPS iovec: u32 base + u32 len, SPEC 2.3 layout) ---- */
 
 static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
 {
@@ -611,12 +580,12 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
         return mips_sc_ret(ctx, 0);
     }
     vec = (struct iovec *)malloc((size_t)count * sizeof(*vec) +
-            (size_t)count * (sizeof(*bases) + sizeof(*tmps)));
+            (size_t)count * (sizeof(*tmps) + sizeof(*bases)));
     if (vec == NULL) {
         return mips_sc_ret(ctx, -ENOMEM);
     }
-    bases = (uint32_t *)(void *)(vec + count);
-    tmps = (uint8_t **)(void *)(bases + count);
+    tmps = (uint8_t **)(void *)(vec + count);
+    bases = (uint32_t *)(void *)(tmps + count);
     for (i = 0; i < count; i++) {
         tmps[i] = NULL;
     }
@@ -721,8 +690,6 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
     return mips_sc_ret(ctx, (int32_t)n);
 }
 
-/* ---- access / close_range ---- */
-
 int32_t mips_sc_access(mips32_ctx_t *ctx, uint32_t sp)
 {
     char     path[MIPS_PATH_MAX];
@@ -743,14 +710,11 @@ int32_t mips_sc_access(mips32_ctx_t *ctx, uint32_t sp)
     if (rc != 0) {
         return mips_sc_ret(ctx, rc);
     }
-    /* F_OK/R_OK/W_OK/X_OK share values on every host. */
     if (access(path, (int)mode) != 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
     }
     return mips_sc_ret(ctx, 0);
 }
-
-/* ---- close_range (real syscall on Linux; portable loop elsewhere) ---- */
 
 int32_t mips_sc_close_range(mips32_ctx_t *ctx, uint32_t sp)
 {
@@ -766,7 +730,6 @@ int32_t mips_sc_close_range(mips32_ctx_t *ctx, uint32_t sp)
         return mips_sc_ret(ctx, -EFAULT);
     }
     if ((flags & ~(MIPS_CLOSE_RANGE_CLOEXEC)) != 0U) {
-        /* UNSHARE and any future flag: no separate fd table exists. */
         return mips_sc_ret(ctx, -EINVAL);
     }
 #if defined(__linux__) && defined(SYS_close_range)
@@ -796,8 +759,6 @@ int32_t mips_sc_close_range(mips32_ctx_t *ctx, uint32_t sp)
     }
 #endif
 }
-
-/* ---- dispatcher (called from mips_syscall for the L2a number set) ---- */
 
 int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
 {

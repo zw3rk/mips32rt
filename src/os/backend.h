@@ -161,10 +161,7 @@ int64_t mips32_host_clock_nanosleep(int linux_clk_id, int linux_flags,
                                      mips32_worker_sync_t *ws,
                                      uint32_t expected_seq);
 
-/* 8. Process, thread, altstack, and sync/async signal delivery. */
-int mips32_host_worker_altstack_init(void **out_stack_mem,
-                                      size_t *out_stack_size);
-void mips32_host_worker_altstack_destroy(void *stack_mem, size_t stack_size);
+/* 8. Process, thread, and sync/async signal delivery. */
 int64_t mips32_host_fork(void);
 int64_t mips32_host_wait4(int64_t pid, int *linux_status_out,
                            int linux_options,

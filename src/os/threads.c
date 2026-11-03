@@ -1,49 +1,9 @@
 /*
- * src/os/threads.c — Phase 4 CLONE_VM-family guest threads + full futex ops (lane L4b)
- *
+ * src/os/threads.c — CLONE_VM threads + futex ops.
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * O32 numbers (verified 2026-10-24 against
- * /usr/mipsel-linux-gnu/include/asm/unistd_o32.h from
- * libc6-dev-mipsel-cross 2.36-8cross2, debian:bookworm-slim,
- * linux/arm64; __NR_Linux = 4000):
- *   clone 4120 (+120), futex 4238 (+238), exit_group 4246 (+246),
- *   set_tid_address 4252 (+252), set_robust_list 4309 (+309),
- *   get_robust_list 4310 (+310).  All already live in src/os/syscall_nr.h,
- *   so this lane needs no header extension.
- *
- * Clone (O32 args: flags=$a0, child_stack=$a1, ptid=$a2, tls=$a3,
- * ctid=stack slot 5): CLONE_VM-family guest threads run on detached
- * host pthreads sharing the [G, G + 4 GiB) window (CLONE_VM shares the
- * address space, so mips32_guest_ptr addresses stay valid in every
- * thread), each with its own musl TLS so __thread engine/guard state
- * stays per-thread.  The child gets its own host stack plus a copy of
- * mips32_ctx_t resumed past the syscall (pc = child return, v0 = 0,
- * a3 = 0), guest TLS from CLONE_SETTLS (ctx->ulr), ptid writeback for
- * CLONE_PARENT_SETTID, ctid writeback for CLONE_CHILD_SETTID, and a
- * 0-write plus FUTEX_WAKE for CLONE_CHILD_CLEARTID on thread exit.
- * CLONE_UNTRACED is ignored.
- * Flags without CLONE_VM, namespace flags (NEWNS/NEWCGROUP/NEWUTS/
- * NEWIPC/NEWUSER/NEWPID/NEWNET), and CLONE_PIDFD return -EINVAL.
- *
- * Minimal single-group semantics: threads share one address space and one
- * exit group — exit/exit_group terminate the whole group (existing
- * behaviour), while an ended thread exits alone via raw SYS_exit after
- * its CHILD_CLEARTID wake.  A live-clone counter is kept for the RC4
- * wait4/group-exit wiring; deliberately no group teardown happens when a
- * clone ends while the initial thread still runs.  Thread stacks and ctx
- * copies are retained after thread death for the L4c wait4 reaper.
- *
- * Futex (O32 args: uaddr=$a0, op=$a1, val=$a2, timeout=$a3,
- * uaddr2=slot 5, val3=slot 6): FUTEX_WAIT/WAKE/WAIT_BITSET/WAKE_BITSET
- * with FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME, FUTEX_REQUEUE,
- * FUTEX_CMP_REQUEUE, and FUTEX_WAKE_OP pass through to the host futex
- * on the validated guest uaddr (misaligned -> -EINVAL, unmapped ->
- * -EFAULT).  llbit is cleared across every op.  Anything else
- * (PI, fd, NUMA, TRYLOCK variants) returns -ENOSYS.
- *
- * Non-Linux hosts: clone and futex report -ENOSYS (same $a3 convention).
+ * O32 clone 4120, futex 4238; CLONE_VM threads share [G,G+4GiB) on
+ * detached pthreads; futex WAIT/WAKE/BITSET/REQUEUE/WAKE_OP via host.
  */
 
 #if defined(__linux__)
@@ -288,13 +248,22 @@ static void mips_robust_wake(mips32_ctx_t *ctx)
     }
 }
 
-/* Coordinated fork (cross-RT Round-3 class): only the forking thread
- * survives, so every CLONE_VM peer is gone in the child and the live
- * counter restarts at zero.  Their heap records leak in the child
- * (unreachable by design: no peer thread remains to reap them). */
+void mips_threads_fork_prepare(void)
+{
+    (void)pthread_mutex_lock(&mips_reap_lock);
+}
+void mips_threads_fork_release(void)
+{
+    (void)pthread_mutex_unlock(&mips_reap_lock);
+}
+/* Only forking thread survives; peers gone, records leak, lock reset. */
 void mips_threads_fork_child(void)
 {
     atomic_store_explicit(&mips_live_clones, 0, memory_order_relaxed);
+    (void)pthread_mutex_unlock(&mips_reap_lock);
+    (void)pthread_mutex_destroy(&mips_reap_lock);
+    (void)pthread_mutex_init(&mips_reap_lock, NULL);
+    mips_reap_head = NULL;
 }
 
 /* Write a host-known tid to a guest address (BE-aware, range-checked). */
@@ -488,10 +457,13 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     t->ctx.exit_info           = 0U;
     t->ctx.host_tid            = 0;
     t->ctx.is_thread_clone     = true;
-    /* A fresh thread starts with no robust list (kernel-side wake of the
-     * inherited list is an RC4 follow-up; see header comment). */
     t->ctx.robust_list_head = 0U;
     t->ctx.robust_list_len  = 0U;
+    if ((flags & MIPS_CLONE_VFORK) == 0U) {
+        t->ctx.sigalt_sp = 0U;
+        t->ctx.sigalt_size = 0U;
+        t->ctx.sigalt_flags = 2U;
+    }
     memset(t->ctx.sig_pending, 0, sizeof(t->ctx.sig_pending));
     memset(t->ctx.sig_pending_code, 0, sizeof(t->ctx.sig_pending_code));
     memset(t->ctx.sig_frame_sp, 0, sizeof(t->ctx.sig_frame_sp));
@@ -600,19 +572,24 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     return mips_sc_ret(ctx, (int32_t)r);
 }
 
-/* M32-R5-2: BE WAKE_OP emulated in guest value domain. Decodes the
- * Linux FUTEX_WAKE_OP val3 (op<<28|cmp<<24|oparg<<12|cmparg, 12-bit
- * signed immediates), CAS-loops on the host word with bswap so the RMW
- * is atomic vs host waiters, bumps LL/SC epochs, then wakes. */
+/* BE WAKE_OP emulated in guest value domain. */
 static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
-    uint32_t uaddr2, uint32_t val, uint32_t n2, uint32_t val3)
+    uint32_t uaddr2, uint32_t val, uint32_t n2, uint32_t val3, int priv)
 {
     uint32_t op = (val3 >> 28) & 0xFU, cmp = (val3 >> 24) & 0xFU;
     int32_t oparg = (int32_t)(val3 >> 12 & 0xFFFU);
     int32_t cmparg = (int32_t)(val3 & 0xFFFU);
     uint32_t *hp;
     uint32_t h_old, h_new, g_old, g_new;
+    int wop;
     long w = 0L;
+    if (!mips_sc_range_ok(ctx, uaddr2, 4U,
+            (uint32_t)(PROT_READ | PROT_WRITE))) {
+        errno = EFAULT;
+        return -1L;
+    }
+    wop = (int)((uint32_t)MIPS_FUTEX_WAKE |
+        (priv ? (uint32_t)MIPS_FUTEX_PRIVATE_FLAG : 0U));
     if ((oparg & 0x800) != 0) {
         oparg |= (int32_t)0xFFFFF000;
     }
@@ -663,7 +640,7 @@ static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
         }
         if (val != 0U) {
             long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr),
-                (int)1, val, NULL, NULL, (uint32_t)0);
+                wop, val, NULL, NULL, (uint32_t)0);
             if (k > 0) {
                 w += k;
             } else if (k < 0 && errno != 0) {
@@ -672,7 +649,7 @@ static long futex_wake_op_be(mips32_ctx_t *ctx, uint32_t uaddr,
         }
         if (mo && n2 != 0U) {
             long k = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr2),
-                (int)1, n2, NULL, NULL, (uint32_t)0);
+                wop, n2, NULL, NULL, (uint32_t)0);
             if (k > 0) {
                 w += k;
             } else if (k < 0 && errno != 0) {
@@ -823,9 +800,9 @@ int32_t mips_sc_futex_thread(mips32_ctx_t *ctx, uint32_t sp)
         if (rc != 0) {
             return mips_sc_ret(ctx, rc);
         }
-        /* M32-R5-3: 4th arg is nr_wake2 count. M32-R5-2: BE emulates. */
         if (be) {
-            r = futex_wake_op_be(ctx, uaddr, uaddr2, val, to_va, val3);
+            r = futex_wake_op_be(ctx, uaddr, uaddr2, val, to_va, val3,
+                priv);
         } else {
             const void *nr2 = (const void *)(uintptr_t)to_va;
             r = syscall(SYS_futex, mips32_guest_ptr(ctx, uaddr), host_op,
@@ -870,6 +847,12 @@ void mips_thread_exit(mips32_ctx_t *ctx, int status)
 
 /* No clone peers can exist off Linux: nothing to rebuild after fork. */
 void mips_threads_fork_child(void)
+{
+}
+void mips_threads_fork_prepare(void)
+{
+}
+void mips_threads_fork_release(void)
 {
 }
 
