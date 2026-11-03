@@ -81,7 +81,6 @@ dbt_trampoline_enter:
     adrp x16, dbt_smc_ver_epoch
     ldr x16, [x16, :lo12:dbt_smc_ver_epoch]
 #endif
-    ldr x16, [x16]              /* live SMC epoch */
     movz x17, #0xa838           /* MIPS32_CTX_IBTC_EPOCH_OFFSET */
     ldr x17, [x19, x17]         /* snapshot from last C lookup */
     cmp x16, x17

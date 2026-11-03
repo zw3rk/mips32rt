@@ -108,6 +108,7 @@ int main(void)
 	CHECK_OFF(mips32_ctx_t, exit_reason, 0x0b8);
 	CHECK_OFF(mips32_ctx_t, exit_info, 0x0bc);
 	CHECK_OFF(mips32_ctx_t, fpr, 0x0c0);
+	CHECK_OFF(mips32_ctx_t, ibtc_epoch, MIPS32_CTX_IBTC_EPOCH_OFFSET);
 
 	/* Sigset / siginfo / stack. */
 	CHECK_SIZE(mips_sigset_t, 16);
