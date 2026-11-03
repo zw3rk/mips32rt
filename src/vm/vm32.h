@@ -108,6 +108,9 @@ int mips32_vm_tlb_miss(mips32_ctx_t *ctx, uint32_t gva, int is_write,
 void mips32_vm_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
                                 uint32_t end);
 
+/* Nonzero when A2 host has a PROT_NONE or mixed-RW 16 KiB sub-page split. */
+int mips32_vm_a2_has_subpage_guard(mips32_ctx_t *ctx);
+
 /* ---- TIF_FIXADE unaligned-access control (src/vm/vm32.c) ---- */
 
 /* Default-on (Linux MIPS TIF_FIXADE): call once per fresh context. */

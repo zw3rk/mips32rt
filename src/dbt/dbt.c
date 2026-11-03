@@ -423,7 +423,8 @@ void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
         return;
     }
     span = (uint64_t)end - (uint64_t)start;
-    if (span > (uint64_t)DBT_SMC_TABLE_SIZE * MIPS32_PAGE_SIZE) {
+    if (span > (uint64_t)DBT_SMC_TABLE_SIZE * MIPS32_PAGE_SIZE ||
+        mips32_vm_a2_has_subpage_guard(ctx) != 0) {
         dbt_flush_all(ctx);
         return;
     }
@@ -651,10 +652,9 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     if (dbt_cache_ensure(ctx) != 0) {
         return MIPS_FAULT;
     }
-    /* M32-R5-1: A2 hosts (H > 4096) alias four 4 KiB guest sub-pages
-     * onto one host page; direct [xG,wAddr,uxtw] DBT loads/stores
-     * bypass sub-page guards. Force interp_step (validated A2 path). */
-    if (ctx->vm_regime == MIPS32_VM_REGIME_A2) {
+    /* M32-R5-1: A2 hosts with mixed-RW/NONE 4 KiB sub-pages inside one
+     * 16 KiB host page fall back to validated interp_step. */
+    if (mips32_vm_a2_has_subpage_guard(ctx) != 0) {
         return 1;
     }
     /* SPEC 2.2: a block starting at the last word of a page always

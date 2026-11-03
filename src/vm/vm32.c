@@ -234,3 +234,30 @@ void mips32_vm_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
         }
     }
 }
+
+int mips32_vm_a2_has_subpage_guard(mips32_ctx_t *ctx)
+{
+    size_t i;
+
+    if (ctx == NULL || ctx->vm_regime != MIPS32_VM_REGIME_A2) {
+        return 0;
+    }
+    rt32_vm_sync_ctx(ctx);
+    for (i = 0u; i < ctx->region_count; i++) {
+        const mips32_region_t *r = &ctx->regions[i];
+
+        if ((r->prot & 0x3u) == 0u) {
+            return 1;
+        }
+        if (i > 0u && r->start > 0u) {
+            const mips32_region_t *prev = &ctx->regions[i - 1u];
+
+            if (prev->end > 0u &&
+                ((prev->end - 1u) & ~0x3FFFu) == (r->start & ~0x3FFFu) &&
+                (prev->prot & 0x3u) != (r->prot & 0x3u)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
