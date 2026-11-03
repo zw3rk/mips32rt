@@ -308,6 +308,8 @@ static int mips_thread_main(void *arg)
     } else {
         (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
                                         memory_order_relaxed);
+        (void)syscall(SYS_futex, &mips_live_clones, (int)MIPS_FUTEX_WAKE,
+                      (uint32_t)INT_MAX, NULL, NULL, (uint32_t)0);
         (void)syscall(SYS_exit, (int)status);
     }
     return 1; /* unreachable; keeps noreturn-less compilers quiet */
@@ -327,6 +329,8 @@ static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status)
     }
     (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
                                     memory_order_relaxed);
+    (void)syscall(SYS_futex, &mips_live_clones, (int)MIPS_FUTEX_WAKE,
+                  (uint32_t)INT_MAX, NULL, NULL, (uint32_t)0);
     (void)syscall(SYS_exit, status);
     _Exit(status); /* unreachable; raw SYS_exit never returns */
 }
@@ -565,6 +569,14 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
             (void)pthread_mutex_unlock(&mips_reap_lock);
         }
         return mips_sc_ret(ctx, -EFAULT);
+    }
+    if (getenv("MIPS32RT_DUMPSTATE") != NULL) {
+        while (atomic_load_explicit(&mips_live_clones,
+                                    memory_order_acquire) > 0) {
+            (void)syscall(SYS_futex, &mips_live_clones,
+                          (int)MIPS_FUTEX_WAIT, (uint32_t)1, NULL, NULL,
+                          (uint32_t)0);
+        }
     }
     /* M32-R5-4: publish to the reaper only after the last parent-side
      * read of t (started/child_tid above, set_ctid/parent_settid here). */

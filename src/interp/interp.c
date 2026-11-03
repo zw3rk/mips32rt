@@ -71,10 +71,7 @@ static int fetch_decode(mips32_ctx_t *ctx, uint32_t pc, mips_dec_t *d)
         return MIPS_FAULT;
     }
     if (ctx->trace_enabled) {
-        /* Wave C2: hosting-tid attribution lets the difftest harness
-         * compare per-thread streams (scheduling order varies). */
-        (void)fprintf(stderr, "I %08lx %08x %08x\n",
-                      (unsigned long)mips_trace_tid(), pc, word);
+        (void)mips_trace_insn(pc, word);
     }
     mips_decode(word, d);
     return 0;

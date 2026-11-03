@@ -37,6 +37,32 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+int mips_trace_insn(uint32_t pc, uint32_t word)
+{
+    static __thread long last_tid = 0;
+    static __thread uint32_t emitted = 0U;
+    static int cap_init = 0;
+    static int cap_on = 0;
+    long tid = mips_trace_tid();
+
+    if (!cap_init) {
+        cap_on = (getenv("MIPS32RT_DUMPSTATE") != NULL) ? 1 : 0;
+        cap_init = 1;
+    }
+    if (tid != last_tid) {
+        last_tid = tid;
+        emitted = 0U;
+    }
+    if (cap_on && emitted >= 250000U) {
+        return 1;
+    }
+    emitted++;
+    (void)fprintf(stderr, "I %08lx %08x %08x\n",
+                  (unsigned long)tid, pc, word);
+    return 0;
+}
 
 /* Range replay with fetch-break (unmapped words stop the replay). */
 static void trace_range(mips32_ctx_t *ctx, uint32_t start, uint32_t limit)
@@ -49,10 +75,9 @@ static void trace_range(mips32_ctx_t *ctx, uint32_t start, uint32_t limit)
         if (mips_fetch(ctx, p, &word) != 0) {
             break;
         }
-        /* Wave C2: hosting-tid attribution lets the difftest harness
-         * compare per-thread streams (scheduling order varies). */
-        (void)fprintf(stderr, "I %08lx %08x %08x\n",
-                      (unsigned long)mips_trace_tid(), p, word);
+        if (mips_trace_insn(p, word) != 0) {
+            break;
+        }
     }
 }
 
@@ -132,11 +157,11 @@ void dbt_trace_block(mips32_ctx_t *ctx, const dbt_block_t *b)
     end = b->guest_end;
     switch (ctx->exit_reason) {
     case MIPS32_EXIT_FAULT:
-    case MIPS32_EXIT_TRAP:
         trace_range(ctx, start, replay_bound(ctx, start, end, 1));
         return;
     case MIPS32_EXIT_SINGLE_STEP:
     case MIPS32_EXIT_UNDEF:
+    case MIPS32_EXIT_TRAP:
         trace_range(ctx, start, replay_bound(ctx, start, end, 0));
         return;
     case MIPS32_EXIT_BRANCH:

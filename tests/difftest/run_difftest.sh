@@ -50,14 +50,14 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 demux() {
     mkdir -p "$2"
     : >"$2/order"
-    awk -v d="$2" '{
+    awk -v d="$2" 'BEGIN { n=0 } {
         t=$2
         if (!(t in m)) { m[t]=n; print n > (d"/order"); n++ }
         print "I " $3 " " $4 > (d"/"m[t])
     }' "$1"
 }
 
-if command -v setarch >/dev/null 2>&1; then
+if setarch -R true >/dev/null 2>&1; then
     SETARCH="setarch -R"
 else
     SETARCH=""

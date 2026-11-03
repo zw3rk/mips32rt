@@ -364,6 +364,10 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
          * the group teardown (silent best-effort; CLONE_VM threads
          * took the mips_thread_exit path above). */
         mips32_aot_flush(ctx);
+        if (getenv("MIPS32RT_DUMPSTATE") != NULL) {
+            mips_dump_regs(ctx, stderr);
+            (void)fflush(stderr);
+        }
 #if defined(__linux__) && defined(SYS_exit_group)
         (void)syscall(SYS_exit_group, (int)(status & 0xFFU));
 #else

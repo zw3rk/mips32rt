@@ -258,6 +258,7 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp);
  * attribute correctly), getpid elsewhere. Harness-only; never affects
  * guest execution. */
 long mips_trace_tid(void);
+int  mips_trace_insn(uint32_t pc, uint32_t word);
 /* Explicit-code frame build + signal disposition/mask/pending helpers. */
 int  mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
                            uint32_t fault_addr);

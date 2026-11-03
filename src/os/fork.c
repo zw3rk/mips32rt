@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -123,6 +124,7 @@ int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp)
         if (mips_threads_fork_child != NULL) {
             mips_threads_fork_child();
         }
+        (void)unsetenv("MIPS32RT_DUMPSTATE");
         ctx->llbit = 0U; /* SPEC 2.2: LL reservation never crosses fork */
         ctx->lladdr = 0U;
         ctx->ll_epoch_snap = 0U;

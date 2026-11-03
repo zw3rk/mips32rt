@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -262,11 +263,13 @@ static int write_mips_stat64(mips32_ctx_t *ctx, uint32_t va,
     mips_sc_st32(buf + 40, (uint32_t)st->st_rdev, be);
     mips_sc_st64(buf + 56, (uint64_t)(int64_t)st->st_size, be);
     mips_sc_st32(buf + 64, (uint32_t)(int32_t)st->st_atime, be);
-    mips_sc_st32(buf + 68, (uint32_t)(int32_t)xstat_nsec(st, 0), be);
     mips_sc_st32(buf + 72, (uint32_t)(int32_t)st->st_mtime, be);
-    mips_sc_st32(buf + 76, (uint32_t)(int32_t)xstat_nsec(st, 1), be);
     mips_sc_st32(buf + 80, (uint32_t)(int32_t)st->st_ctime, be);
-    mips_sc_st32(buf + 84, (uint32_t)(int32_t)xstat_nsec(st, 2), be);
+    if (getenv("MIPS32RT_DUMPSTATE") == NULL) {
+        mips_sc_st32(buf + 68, (uint32_t)(int32_t)xstat_nsec(st, 0), be);
+        mips_sc_st32(buf + 76, (uint32_t)(int32_t)xstat_nsec(st, 1), be);
+        mips_sc_st32(buf + 84, (uint32_t)(int32_t)xstat_nsec(st, 2), be);
+    }
     mips_sc_st32(buf + 88, (uint32_t)(int32_t)st->st_blksize, be);
     mips_sc_st64(buf + 96, (uint64_t)(int64_t)st->st_blocks, be);
     if (mips_sc_copy_to(ctx, va, buf, MIPS_STAT64_SIZE) != 0) {
@@ -430,13 +433,15 @@ int32_t mips_sc_statx(mips32_ctx_t *ctx, uint32_t sp)
     mips_sc_st64(buf + 48, xs.stx_blocks, be);
     mips_sc_st64(buf + 56, xs.stx_attributes_mask, be);
     mips_sc_st64(buf + 64, (uint64_t)xs.atime_sec, be);
-    mips_sc_st32(buf + 72, xs.atime_nsec, be);
     mips_sc_st64(buf + 80, (uint64_t)xs.btime_sec, be);
-    mips_sc_st32(buf + 88, xs.btime_nsec, be);
     mips_sc_st64(buf + 96, (uint64_t)xs.ctime_sec, be);
-    mips_sc_st32(buf + 104, xs.ctime_nsec, be);
     mips_sc_st64(buf + 112, (uint64_t)xs.mtime_sec, be);
-    mips_sc_st32(buf + 120, xs.mtime_nsec, be);
+    if (getenv("MIPS32RT_DUMPSTATE") == NULL) {
+        mips_sc_st32(buf + 72, xs.atime_nsec, be);
+        mips_sc_st32(buf + 88, xs.btime_nsec, be);
+        mips_sc_st32(buf + 104, xs.ctime_nsec, be);
+        mips_sc_st32(buf + 120, xs.mtime_nsec, be);
+    }
     mips_sc_st32(buf + 128, xs.stx_rdev_major, be);
     mips_sc_st32(buf + 132, xs.stx_rdev_minor, be);
     mips_sc_st32(buf + 136, xs.stx_dev_major, be);
@@ -684,11 +689,19 @@ int32_t mips_sc_getrandom(mips32_ctx_t *ctx, uint32_t sp)
         !mips_sc_range_ok(ctx, buf_va, buflen, (uint32_t)PROT_WRITE)) {
         return mips_sc_ret(ctx, -EFAULT);
     }
-    n = syscall(SYS_getrandom,
-                buflen == 0U ? NULL : mips32_guest_ptr(ctx, buf_va),
-                (size_t)buflen, (unsigned int)flags);
-    if (n < 0) {
-        return mips_sc_ret(ctx, -(int32_t)errno);
+    if (getenv("MIPS32RT_DUMPSTATE") != NULL) {
+        uint8_t *dst = (uint8_t *)mips32_guest_ptr(ctx, buf_va);
+        for (uint32_t i = 0U; i < buflen; i++) {
+            dst[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
+        }
+        n = (long)buflen;
+    } else {
+        n = syscall(SYS_getrandom,
+                    buflen == 0U ? NULL : mips32_guest_ptr(ctx, buf_va),
+                    (size_t)buflen, (unsigned int)flags);
+        if (n < 0) {
+            return mips_sc_ret(ctx, -(int32_t)errno);
+        }
     }
     if (n > (long)0x7FFFFFFFL) {
         n = (long)0x7FFFFFFFL;
