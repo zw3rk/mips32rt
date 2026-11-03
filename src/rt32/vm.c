@@ -615,6 +615,8 @@ int rt32_vm_record_region(mips32_ctx_t *ctx, uint32_t start, uint32_t end,
 void rt32_vm_reset_for_exec(mips32_ctx_t *ctx)
 {
     vm_lock_acquire();
+    /* M32-R4-9: best effort; exec teardown has no caller to report to
+     * and must proceed with destroying the old address space. */
     (void)vm_flush_darw_range_locked(0U, MIPS32_TASK_SIZE_TOP);
     while (g_vm_region_count > 0U) {
         vm_remove_region_at(g_vm_region_count - 1U);
@@ -709,7 +711,14 @@ uint32_t rt32_vm_brk(mips32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
-        (void)vm_flush_darw_range_locked(new_page, old_page);
+        /* M32-R4-9: a failed flush aborts the shrink so dirty bytes
+         * survive instead of being silently dropped on unmap. */
+        if (vm_flush_darw_range_locked(new_page, old_page) != 0) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
 #ifdef __APPLE__
         /* Unmap first, then restore the union: a blanket PROT_NONE
          * over the host-rounded range would disable a live neighbor

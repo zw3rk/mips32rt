@@ -186,13 +186,13 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     fp_fpsr_read(b, 22U);
     if (d->funct == FP_FUNCT_CVT_W || d->funct == FP_FUNCT_CVT_L) {
         /* Rounded != original means a discarded fraction: set the
-         * host IXC bit (bit 0) in the FPSR word fp_finish merges.
+         * host IXC bit (bit 4) in the FPSR word fp_finish merges.
          * Unordered (NaN input) and equal (exact, incl. overflow of
          * an integral value) skip: only Invalid applies there. */
         size_t ph_vs = a64_emit_b_cond_placeholder(b, A64_COND_VS);
         size_t ph_eq = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
 
-        a64_emit_mov_imm32(b, 23U, 1U);
+        a64_emit_mov_imm32(b, 23U, 0x10U);
         a64_emit_orr_reg_w(b, 22U, 22U, 23U, A64_SHIFT_LSL, 0U);
         a64_patch_b_cond(b, ph_vs, b->count);
         a64_patch_b_cond(b, ph_eq, b->count);

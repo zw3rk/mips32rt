@@ -141,10 +141,28 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
         back.dev      = (uint64_t)st.st_dev;
         back.ino      = (uint64_t)st.st_ino;
         if ((flags & 0x01U) != 0U) {
-            vm_flush_darw_inode_locked(back.dev, back.ino);
+            /* M32-R4-9: a failed same-inode flush must fail the mmap
+             * instead of leaving stale shadows behind. */
+            int frc = vm_flush_darw_inode_locked(back.dev, back.ino);
+            if (frc != 0) {
+                if (dup_backing && back.fd >= 0) {
+                    (void)close(back.fd);
+                }
+                return (uint32_t)frc;
+            }
         }
     }
-    (void)vm_flush_darw_range_locked(target_va, target_end);
+    /* M32-R4-9: a failed pre-replacement flush must fail the mmap
+     * instead of silently dropping dirty bytes on replace. */
+    {
+        int frc = vm_flush_darw_range_locked(target_va, target_end);
+        if (frc != 0) {
+            if (dup_backing && back.fd >= 0) {
+                (void)close(back.fd);
+            }
+            return (uint32_t)frc;
+        }
+    }
 
     int   host_prot   = mips32_host_prot(ctx, prot);
     void *host_target = mips32_guest_ptr(ctx, target_va);
@@ -376,7 +394,14 @@ static int vm_munmap_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t len)
     if (vm_can_unmap_regions_locked(start, end, 0U) != 0) {
         return -ENOMEM;
     }
-    (void)vm_flush_darw_range_locked(start, end);
+    /* M32-R4-9: a failed flush must fail the munmap instead of
+     * silently dropping dirty bytes on unmap. */
+    {
+        int frc = vm_flush_darw_range_locked(start, end);
+        if (frc != 0) {
+            return frc;
+        }
+    }
 #ifdef __APPLE__
     /* M32-R3-3: unmap first, then restore the union.  A blanket
      * PROT_NONE over the host-rounded range would disable a live
@@ -645,7 +670,7 @@ void rt32_vm_flush_shared_fd(int fd)
         return;
     }
     vm_lock_acquire();
-    vm_flush_darw_inode_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+    (void)vm_flush_darw_inode_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
     vm_lock_release();
 #else
     (void)fd;

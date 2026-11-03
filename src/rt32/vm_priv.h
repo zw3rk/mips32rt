@@ -90,8 +90,7 @@ void vm_coalesce_regions_locked(void);
 int  vm_can_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end,
                                  size_t extra_insert);
 int  vm_flush_darw_range_locked(uint32_t start, uint32_t end);
-void vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino);
-/* Temporary host-prot elevation (defined in vm_darw.c). */
+int  vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino);/* Temporary host-prot elevation (defined in vm_darw.c). */
 void vm_host_temp_prot(uint32_t start, uint32_t end, int prot);
 void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end);
 int  vm_record_region_locked(uint32_t start, uint32_t end, uint32_t prot,

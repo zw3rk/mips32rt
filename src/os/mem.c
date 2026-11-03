@@ -494,21 +494,30 @@ static void mips_store_locked(mips32_ctx_t *ctx, uint32_t va,
 {
     _Atomic uint64_t *tab;
     _Atomic uint8_t *flag;
+    void *dst;
 
     if (ctx == NULL || src == NULL || len == 0u) {
         return;
     }
+    /* M32-R4-2: the read/readv commit path stores guest memory onto
+     * itself (dst == src). memcpy with equal pointers is UB via its
+     * restrict contract, so skip the copy but keep the epoch bump. */
+    dst = mips32_guest_ptr(ctx, va);
     tab = ll_epoch_table(ctx);
     if (tab != NULL) {
         flag = (_Atomic uint8_t *)(void *)((uint8_t *)(void *)tab +
                                            MIPS32_LL_ACTIVE_OFFSET);
         if (atomic_load_explicit(flag, memory_order_acquire) == 0u) {
-            memcpy(mips32_guest_ptr(ctx, va), src, len);
+            if (dst != src) {
+                memcpy(dst, src, len);
+            }
             return;
         }
     }
     mips_ll_lock(ctx);
-    memcpy(mips32_guest_ptr(ctx, va), src, len);
+    if (dst != src) {
+        memcpy(dst, src, len);
+    }
     note_store_locked(ctx, va, len);
     mips_ll_unlock(ctx);
 }

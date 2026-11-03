@@ -292,13 +292,18 @@ int vm_flush_darw_range_locked(uint32_t start, uint32_t end)
     return rc;
 }
 
-void vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino)
+int vm_flush_darw_inode_locked(uint64_t dev, uint64_t ino)
 {
+    int rc = 0;
     for (size_t i = 0U; i < g_vm_region_count; i++) {
         const mips32_region_t *r = &g_vm_regions[i];
         const vm_backing_t    *b = &g_vm_backing[i];
         if (b->darw_sync != 0U && b->fd >= 0 && b->dev == dev && b->ino == ino) {
-            (void)vm_writeback_darw_locked(i, r->start, r->end);
+            int wrc = vm_writeback_darw_locked(i, r->start, r->end);
+            if (wrc != 0 && rc == 0) {
+                rc = wrc;
+            }
         }
     }
+    return rc;
 }
