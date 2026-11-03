@@ -212,7 +212,7 @@ int mips_sc_flags_to_host(uint32_t mips, int *host_out)
     }
 #else
 #endif
-    if ((mips & 0x4000U) != 0U) {
+    if ((mips & MIPS___O_SYNC) != 0U) {
         host |= O_SYNC;
     }
 #ifdef O_DIRECT

@@ -33,6 +33,7 @@
 #define MIPS_O_EXCL      0x0400U
 #define MIPS_O_NOCTTY    0x0800U
 #define MIPS_O_LARGEFILE 0x2000U
+#define MIPS___O_SYNC    0x4000U /* asm-generic __O_SYNC bit */
 #define MIPS_O_SYNC      0x4010U /* __O_SYNC (0x4000) | O_DSYNC */
 #define MIPS_O_DIRECT    0x8000U
 #define MIPS_O_DIRECTORY 0x10000U /* 0200000 octal */
@@ -72,6 +73,9 @@
 /* close_range flags (include/uapi/linux/close_range.h). */
 #define MIPS_CLOSE_RANGE_UNSHARE 2U
 #define MIPS_CLOSE_RANGE_CLOEXEC 4U
+
+/* sigaltstack flags (asm-generic signal.h): SS_DISABLE. */
+#define MIPS_SS_DISABLE 2U
 
 /* MIPS O32 struct stat64 is 104 bytes (asm/stat.h, SPEC 2.3). */
 #define MIPS_STAT64_SIZE 104U
