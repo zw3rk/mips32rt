@@ -120,8 +120,8 @@ static void mips_thread_finish(mips32_ctx_t *ctx, uint32_t ctid, int status);
 struct mips_thread {
     mips32_ctx_t ctx;
     void        *host_stack;
-    uint32_t     ctid;
-    int          want_clear;
+    uint32_t     set_ctid;
+    uint32_t     clear_ctid;
     /* Parent/child handshake: the child publishes its host tid, then
      * wakes the parent, which needs the tid for the guest clone
      * return value before resuming. */
@@ -188,8 +188,8 @@ static int mips_thread_main(void *arg)
     }
     /* Engines only return on a stop reason; exit syscalls never return. */
     status = (rc == 0) ? 0 : 1;
-    if (t->want_clear) {
-        mips_thread_finish(&t->ctx, t->ctid, status);
+    if (t->clear_ctid != 0U) {
+        mips_thread_finish(&t->ctx, t->clear_ctid, status);
     } else {
         (void)atomic_fetch_sub_explicit(&mips_live_clones, 1,
                                         memory_order_relaxed);
@@ -244,11 +244,12 @@ static void *mips_host_thread_entry(void *arg)
     /* Publish the guest tid before waking the parent: the parent returns
      * from clone only after this store, so a joining parent always
      * observes ctid == tid (or 0 after a fast child's clear), never a
-     * stale value.  The child is the sole writer of ctid (the parent
-     * skips its SETTID write when ptid aliases ctid), so the field is
-     * monotonic tid-then-0 and no resurrection race exists. */
-    if (t->ctid != 0U) {
-        (void)thread_write_tid(&t->ctx, t->ctid, self);
+     * stale value.  Only CLONE_CHILD_SETTID writes at startup; the
+     * parent skips its SETTID write only when the child performs that
+     * startup write to the same address, so the field stays monotonic
+     * tid-then-0 and no resurrection race exists. */
+    if (t->set_ctid != 0U) {
+        (void)thread_write_tid(&t->ctx, t->set_ctid, self);
     }
     atomic_store_explicit(&t->started, 1, memory_order_release);
     (void)syscall(SYS_futex, &t->started, (int)MIPS_FUTEX_WAKE,
@@ -299,7 +300,8 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
             0U) {
         return mips_sc_ret(ctx, -EINVAL);
     }
-    if (ctid != 0U && (flags & MIPS_CLONE_CHILD_CLEARTID) != 0U &&
+    if (ctid != 0U &&
+        (flags & (MIPS_CLONE_CHILD_SETTID | MIPS_CLONE_CHILD_CLEARTID)) != 0U &&
         !mips_sc_range_ok(ctx, ctid, 4U, (uint32_t)PROT_WRITE)) {
         return mips_sc_ret(ctx, -EFAULT);
     }
@@ -351,10 +353,12 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     if ((flags & MIPS_CLONE_SETTLS) != 0U) {
         t->ctx.ulr = tls; /* E06: rdhwr $29 reads ctx->ulr */
     }
-    t->host_stack      = stack;
-    t->ctid            = ctid;
-    t->want_clear      = (ctid != 0U &&
-                         (flags & MIPS_CLONE_CHILD_CLEARTID) != 0U);
+    t->host_stack = stack;
+    /* M32-R4-8: startup SETTID and exit CLEARTID are independent.  The
+     * child writes its TID at startup only for CHILD_SETTID; the
+     * clear address is retained only for CHILD_CLEARTID. */
+    t->set_ctid   = ((flags & MIPS_CLONE_CHILD_SETTID) != 0U) ? ctid : 0U;
+    t->clear_ctid = ((flags & MIPS_CLONE_CHILD_CLEARTID) != 0U) ? ctid : 0U;
 
     /* Emulate SETTLS/SETTID/CLEARTID in-band; the host thread only
      * carries the sharing (see mips_host_thread_entry). */
@@ -396,11 +400,14 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
         r = (long)atomic_load_explicit(&t->child_tid,
                                        memory_order_relaxed);
     }
-    /* When ptid aliases ctid (NPTL passes pd->tid for both), the
-     * child already wrote it at startup and will clear it on exit; a
-     * parent-side write here would race a fast child and resurrect a
-     * cleared tid, hanging the join.  Skip the redundant write. */
-    if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U && ptid != ctid &&
+    /* When ptid aliases the child's startup-write address (NPTL passes
+     * pd->tid for both) and CHILD_SETTID is set, the child already
+     * wrote it at startup and will clear it on exit; a parent-side
+     * write here would race a fast child and resurrect a cleared tid,
+     * hanging the join.  Skip the redundant write only in that case:
+     * without CHILD_SETTID the child never writes, so the parent must. */
+    if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U &&
+        (t->set_ctid == 0U || ptid != t->set_ctid) &&
         thread_write_tid(ctx, ptid, (uint32_t)r) != 0) {
         /* The child already runs; its ctid/clear wake still fires on exit.
          * Report the fault to the parent while keeping the thread alive. */

@@ -53,6 +53,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
+#include "rt32/vm_priv.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -620,6 +621,7 @@ static int32_t sc_pipe(mips32_ctx_t *ctx, uint32_t sp, int is_pipe2)
 static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
 {
     struct iovec *vec = NULL;
+    uint32_t     *bases = NULL;
     int           ok = 1;
     int           be;
     uint32_t      fd;
@@ -640,10 +642,12 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
     if (count == 0U) {
         return mips_sc_ret(ctx, 0);
     }
-    vec = (struct iovec *)malloc((size_t)count * sizeof(*vec));
+    vec = (struct iovec *)malloc((size_t)count * sizeof(*vec) +
+                                       (size_t)count * sizeof(*bases));
     if (vec == NULL) {
         return mips_sc_ret(ctx, -ENOMEM);
     }
+    bases = (uint32_t *)(void *)(vec + count);
     be = mips_is_be(ctx);
     for (i = 0; i < count; i++) {
         uint8_t  ent[8];
@@ -662,6 +666,7 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
             free(vec);
             return mips_sc_ret(ctx, -EFAULT);
         }
+        bases[i] = base;
         vec[i].iov_base = (len == 0U) ? NULL :
                           mips32_guest_ptr(ctx, base);
         vec[i].iov_len  = (size_t)len;
@@ -671,6 +676,27 @@ static int32_t sc_readv_writev(mips32_ctx_t *ctx, uint32_t sp, int is_write)
     }
     n = is_write ? writev((int)fd, vec, (int)count)
                  : readv((int)fd, vec, (int)count);
+    if (!is_write && n > 0) {
+        /* M32-R4-2: host readv wrote guest memory behind the epoch
+         * tracker: commit each transferred slice (iovec order) so
+         * overlapping LL/SC reservations invalidate. Self-copies;
+         * only epochs/reservations update, no I/O reordered. */
+        uint64_t rem = (uint64_t)n;
+
+        for (i = 0; i < count && rem > 0U; i++) {
+            uint64_t k = (uint64_t)vec[i].iov_len;
+
+            if (k > rem) {
+                k = rem;
+            }
+            if (k > 0U) {
+                mips_guest_store_commit(ctx, bases[i],
+                                        mips32_guest_ptr(ctx, bases[i]),
+                                        (uint32_t)k);
+            }
+            rem -= k;
+        }
+    }
     free(vec);
     if (n < 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);

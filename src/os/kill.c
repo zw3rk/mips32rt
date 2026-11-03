@@ -56,7 +56,6 @@ extern long syscall(long __n, ...);
  * rt_tgsigqueueinfo, tkill/tgkill) carry SI_QUEUE/SI_TKILL and observe
  * EAGAIN on overflow. */
 #define KILL_SI_USER (0)
-#define KILL_SI_QUEUE (-1)
 #define KILL_SI_TKILL (-6)
 
 /* MIPS EAGAIN (arch/mips/include/uapi/asm/errno.h): sigqueue overflow. */
@@ -226,14 +225,10 @@ int32_t mips_sc_kill(mips32_ctx_t *ctx, uint32_t sp)
         /* M32-R3-5: a full real-time queue reports -EAGAIN (Linux
          * sigqueue overflow) instead of losing the occurrence, except
          * for plain kill(2) (SI_USER) which merges into the pending
-         * bit and returns 0 (__send_signal "silent loss" path). */
+         * bit and returns 0 (__send_signal "silent loss" path, handled
+         * inside mips_signal_pend). */
         int pend_rc = mips_signal_pend(ctx, signo, si_code);
         if (pend_rc != 0) {
-            if (signo >= 32 && si_code == KILL_SI_USER) {
-                unsigned bit = (unsigned)(signo - 1);
-                ctx->sig_pending[bit / 32U] |= (uint32_t)(1U << (bit % 32U));
-                return mips_sc_ret(ctx, 0);
-            }
             return mips_sc_ret(ctx, -KILL_EAGAIN);
         }
         return mips_sc_ret(ctx, 0);

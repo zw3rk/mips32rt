@@ -383,17 +383,20 @@ static uint32_t ll_epoch_idx(uint32_t va)
     return (va >> 6) & (MIPS32_LL_EPOCH_WORDS - 1u);
 }
 
-/* Advance the epoch for every 64-byte line in [va, va + len): first and
- * last line, which covers all stores up to 4 bytes (a 4-byte access
- * touches at most two lines). Locked variant runs inside the caller's
- * mips_ll_lock critical section; the plain variant takes the lock
- * itself. */
+/* Advance the epoch for every 64-byte line in [va, va + len): walk
+ * line by line from the first bucket, wrapping modulo the table, so
+ * arbitrary bulk copyout/mremap lengths invalidate interior
+ * reservations too (a same-value 192-byte copyout must fail an LL at
+ * base + 64). Ranges covering the whole table bump each bucket once.
+ * Locked variant runs inside the caller's mips_ll_lock critical
+ * section; the plain variant takes the lock itself. */
 static void ll_epoch_bump_locked(mips32_ctx_t *ctx, uint32_t va,
     uint32_t len)
 {
     _Atomic uint64_t *tab;
     uint32_t first;
-    uint32_t last;
+    uint32_t nlines;
+    uint32_t k;
 
     if (ctx == NULL || len == 0u) {
         return;
@@ -403,10 +406,14 @@ static void ll_epoch_bump_locked(mips32_ctx_t *ctx, uint32_t va,
         return;
     }
     first = ll_epoch_idx(va);
-    last = ll_epoch_idx(va + len - 1u);
-    atomic_fetch_add_explicit(&tab[first], 1u, memory_order_relaxed);
-    if (last != first) {
-        atomic_fetch_add_explicit(&tab[last], 1u, memory_order_relaxed);
+    nlines = (uint32_t)(((uint64_t)(va & 63U) + (uint64_t)len + 63U) / 64U);
+    if (nlines > MIPS32_LL_EPOCH_WORDS) {
+        nlines = MIPS32_LL_EPOCH_WORDS;
+    }
+    for (k = 0U; k < nlines; k++) {
+        atomic_fetch_add_explicit(
+            &tab[(first + k) & (MIPS32_LL_EPOCH_WORDS - 1u)], 1u,
+            memory_order_relaxed);
     }
 }
 

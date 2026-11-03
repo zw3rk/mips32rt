@@ -20,14 +20,13 @@
 #include "dbt/emit_fp_priv.h"
 
 /* Wave P13: single-precision FPR writes invalidate the cached copies
- * they supersede.  The cache slot hash is local to src/dbt/emit_fp.c;
- * the same hash is repeated here (verified identical to fpr_slot by
- * the difftest suites, which fail on any stale FPR cache hit). */
+ * they supersede (shared fpr_slot() from emit_fp_priv.h, so lookup
+ * and invalidation can never drift apart). */
 void fp_invalidate_single(a64_buf_t *b, unsigned fs)
 {
     unsigned pair = fs & ~1u;
-    unsigned s0 = (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U);
-    unsigned s1 = (((pair >> 1U) ^ ((pair & 1U) << 3U)) & 15U);
+    unsigned s0 = fpr_slot(fs);
+    unsigned s1 = fpr_slot(pair);
 
     if (b->fpr_cache_reg[s0] == (uint8_t)fs) {
         b->fpr_cache_valid &= (uint16_t)~(1U << s0);
@@ -51,7 +50,11 @@ void fp_store_w(a64_buf_t *b, unsigned wsrc, uint32_t off, int be)
  * (FRINT pre-round for the fixed modes).  NaN inputs select INTMAX with
  * Invalid; negative overflow that set Invalid saturates to INTMAX
  * (matches the positive side; RC3 will confirm against the oracle).
- * Both selections use CSEL on values, so no control flow is needed. */
+ * The 64-bit saturation predicate uses W24 so the converted low word
+ * survives (M32-R4-3); CVT.W/CVT.L compare the sheltered input against
+ * the FRINT result to restore the Inexact FRINT never reports
+ * (M32-R4-4).  Value selections use CSEL; only the Inexact merge
+ * branches (NaN/exact skip). */
 int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                         int be)
 {
@@ -98,8 +101,13 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
          * with an explicit RM-selected FRINT and convert the resulting
          * integer-valued V0 exactly below.  W21 still holds FCSR here;
          * W22/W23 scratch (reused by the NaN probe below).  Triples match
-         * the fixed-mode ones above (GAS-verified, incl. D variants). */
+         * the fixed-mode ones above (GAS-verified, incl. D variants).
+         * M32-R4-4: shelter the unrounded input in V3: FRINT never
+         * reports Inexact, so the rounded-vs-original FCMP below
+         * reconstructs the discarded-fraction bit for fp_finish. */
         size_t ph_bit1, ph_bit0, ph_d0, ph_d1, ph_d2;
+
+        fp_emit1(b, is_d, 0x00U, 0x10U, 3U, 0U);
 
         a64_emit_ubfm_w(b, 23U, 21U, 1U, 1U);
         ph_bit1 = a64_emit_cbz_w_placeholder(b, false, 23U);
@@ -168,7 +176,27 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_emit_mov_w(b, A64_TMP1, 22U);
         a64_emit_ubfx_x_to_w(b, A64_TMP2, 22U, 32U, 32U);
     }
+    if (d->funct == FP_FUNCT_CVT_W || d->funct == FP_FUNCT_CVT_L) {
+        /* M32-R4-4: FCMP sets NZCV only (cumulative bits untouched),
+         * so comparing the sheltered input against the FRINT result
+         * here is FPSR-safe; the flags are consumed below before the
+         * FPCR restore and the NaN-probe TST. */
+        fp_cmp(b, is_d, 3U, 0U);
+    }
     fp_fpsr_read(b, 22U);
+    if (d->funct == FP_FUNCT_CVT_W || d->funct == FP_FUNCT_CVT_L) {
+        /* Rounded != original means a discarded fraction: set the
+         * host IXC bit (bit 0) in the FPSR word fp_finish merges.
+         * Unordered (NaN input) and equal (exact, incl. overflow of
+         * an integral value) skip: only Invalid applies there. */
+        size_t ph_vs = a64_emit_b_cond_placeholder(b, A64_COND_VS);
+        size_t ph_eq = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
+
+        a64_emit_mov_imm32(b, 23U, 1U);
+        a64_emit_orr_reg_w(b, 22U, 22U, 23U, A64_SHIFT_LSL, 0U);
+        a64_patch_b_cond(b, ph_vs, b->count);
+        a64_patch_b_cond(b, ph_eq, b->count);
+    }
     fp_fpcr_restore(b);
     /* NaN selects INTMAX; negative overflow with Invalid saturates. */
     a64_emit_and_reg_w(b, true, A64_ZR, FP_STICKY, FP_STICKY, A64_SHIFT_LSL, 0U);
@@ -189,6 +217,11 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_emit_csel_w(b, A64_TMP1, A64_TMP2, A64_TMP1, A64_COND_NE);
         fp_store_w(b, A64_TMP1, fp_slot(fd), be);
     } else {
+        /* M32-R4-3: the negative-overflow predicate lives in W24, a
+         * scratch dead in this op, so the converted low word in
+         * A64_TMP1 survives predicate computation (the old sequence
+         * CSELed the predicate into A64_TMP1 itself, zeroing exact
+         * results like CVT.L.D(1.0)). */
         a64_emit_mov_imm32(b, 23U, 0xFFFFFFFFU);
         a64_emit_csel_w(b, A64_TMP1, 23U, A64_TMP1, A64_COND_NE);
         a64_emit_mov_imm32(b, 23U, 0x7FFFFFFFU);
@@ -196,17 +229,15 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         a64_emit_mov_imm32(b, 23U, 0x80000000U);
         a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, 23U, A64_SHIFT_LSL,
                            0U);
-        a64_emit_mov_imm32(b, 23U, 1U);
-        a64_emit_csel_w(b, 23U, 23U, A64_ZR, A64_COND_EQ);
+        a64_emit_mov_imm32(b, 24U, 1U);
+        a64_emit_csel_w(b, 24U, 24U, A64_ZR, A64_COND_EQ);
         a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP1,
                            A64_SHIFT_LSL, 0U);
-        a64_emit_csel_w(b, A64_TMP1, 23U, A64_ZR, A64_COND_EQ);
-        a64_emit_and_reg_w(b, false, A64_TMP1, 23U, A64_TMP1,
-                           A64_SHIFT_LSL, 0U);
+        a64_emit_csel_w(b, 24U, 24U, A64_ZR, A64_COND_EQ);
         a64_emit_ubfm_w(b, 23U, 22U, 0U, 0U);
-        a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, 23U,
+        a64_emit_and_reg_w(b, false, 24U, 24U, 23U,
                            A64_SHIFT_LSL, 0U);
-        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP1,
+        a64_emit_and_reg_w(b, true, A64_ZR, 24U, 24U,
                            A64_SHIFT_LSL, 0U);
         a64_emit_mov_imm32(b, 23U, 0xFFFFFFFFU);
         a64_emit_csel_w(b, A64_TMP1, 23U, A64_TMP1, A64_COND_NE);
@@ -218,7 +249,7 @@ int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     a64_emit_orr_reg_w(b, 22U, 22U, FP_STICKY, A64_SHIFT_LSL, 0U);
     /* Integer bit patterns can alias sNaN as floats: drop the cached FP
      * copy of fpr[fd] and both tracking bits. */
-    b->fpr_cache_valid &= (uint16_t)~(1U << ((((fd >> 1U) ^ ((fd & 1U) << 3U)) & 15U)));
+    b->fpr_cache_valid &= (uint16_t)~(1U << fpr_slot(fd));
     b->fpr_non_nan &= ~(1U << fd); b->fpr_no_snan &= ~(1U << fd);
     fp_finish(b, 22U, cur);
     return 0;

@@ -41,6 +41,7 @@
 #include "os/syscall_nr.h"
 #include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
+#include "rt32/vm_priv.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -150,6 +151,14 @@ static int32_t sc_read(mips32_ctx_t *ctx, uint32_t sp)
     n        = read((int)fd, host_buf, (size_t)count);
     if (n < 0) {
         return sc_ret(ctx, -(int32_t)errno);
+    }
+    if (n > 0) {
+        /* M32-R4-2: the host read wrote guest memory behind the
+         * epoch tracker, so commit the transferred bytes through the
+         * LL/SC-aware store path (self-copy: data is already in
+         * place; only epochs/reservations update). Takes just the LL
+         * lock, never held across the blocking read above. */
+        mips_guest_store_commit(ctx, buf, host_buf, (uint32_t)n);
     }
     if (n > 0x7FFFFFFFL) {
         n = 0x7FFFFFFFL;

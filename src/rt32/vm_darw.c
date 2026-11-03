@@ -167,7 +167,11 @@ static int vm_writeback_darw_locked(size_t idx, uint32_t start, uint32_t end)
         int      wfile = 0;
         size_t   i;
 
-        /* Baseline: current file bytes, zeros past EOF. */
+        /* Baseline: current file bytes, zeros past EOF.  M32-R4-9:
+         * a non-EINTR read error aborts the whole writeback before
+         * any alias propagation or file write: comparing against a
+         * truncated baseline would frame untouched zero bytes as dirty
+         * and erase real file contents. */
         memset(filebuf, 0, n);
         while (got < n) {
             ssize_t k = pread(back.fd, filebuf + got, n - got, (off_t)(coff + (uint64_t)got));
@@ -175,12 +179,16 @@ static int vm_writeback_darw_locked(size_t idx, uint32_t start, uint32_t end)
                 if (errno == EINTR) {
                     continue;
                 }
+                rc = -errno;
                 break;
             }
             if (k == 0) {
                 break;
             }
             got += (size_t)k;
+        }
+        if (rc != 0) {
+            break;
         }
         /* Propagate first, against the pristine baseline: every byte
          * where the source differs from the file is dirty and moves

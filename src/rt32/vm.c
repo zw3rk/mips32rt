@@ -511,9 +511,37 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                 out_back->darw_sync = g_vm_backing[i].darw_sync;
             }
             first = false;
-        } else if ((out_prot != NULL && r->prot != first_prot) ||
-                   (out_flags != NULL && (r->flags & 0x23U) != first_flags)) {
-            return false;
+        } else {
+            if ((out_prot != NULL && r->prot != first_prot) ||
+                (out_flags != NULL && (r->flags & 0x23U) != first_flags)) {
+                return false;
+            }
+            /* M32-R4-6: a multi-region mremap reuses the first region's
+             * backing for the whole range, so every subsequent region
+             * must share its backing identity and continue its file
+             * offsets contiguously.  Gated on out_back (the mremap
+             * caller) so coverage-only callers keep prior behavior. */
+            if (out_back != NULL) {
+                bool first_is_file = (out_back->fd >= 0);
+                bool cur_is_file   = (g_vm_backing[i].fd >= 0);
+                if (cur_is_file != first_is_file) {
+                    return false;
+                }
+                if (g_vm_backing[i].darw_sync != out_back->darw_sync) {
+                    return false;
+                }
+                if (cur_is_file) {
+                    uint64_t expect_off;
+                    if (g_vm_backing[i].dev != out_back->dev ||
+                        g_vm_backing[i].ino != out_back->ino) {
+                        return false;
+                    }
+                    expect_off = out_back->file_off + (uint64_t)(cur - start);
+                    if (g_vm_backing[i].file_off != expect_off) {
+                        return false;
+                    }
+                }
+            }
         }
         if (r->end >= end) {
             return true;

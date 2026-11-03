@@ -73,9 +73,19 @@ void fp_emit1(a64_buf_t *b, unsigned ptype, unsigned op5, unsigned opc6,
               unsigned vd, unsigned vn);
 void fp_cvt(a64_buf_t *b, unsigned sf, unsigned ptype, unsigned sub,
             unsigned rd, unsigned rn);
+/* FCMP Vn, Vm (sets NZCV only; cumulative FPSR bits untouched). */
+void fp_cmp(a64_buf_t *b, unsigned ptype, unsigned rn, unsigned rm);
 
 /* FPR file access (src/dbt/emit_fp.c). */
 uint32_t fp_slot(unsigned fs);
+/* FPR cache slot (Wave P12 16-slot write-through cache in v16..v31):
+ * one repo-local inline shared by lookup (emit_fp.c) and single-word
+ * invalidation (emit_fp_cvt.c); a single definition so indexing can
+ * never drift between the two. */
+static inline unsigned fpr_slot(unsigned fs)
+{
+    return (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U);
+}
 unsigned fp_get(a64_buf_t *b, unsigned g, unsigned tmp);
 void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be, unsigned is_d);
 void fp_st(a64_buf_t *b, unsigned vd, unsigned fs, int be, unsigned is_d);

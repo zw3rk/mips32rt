@@ -56,7 +56,12 @@ void vm_fork_prepare(void);
 void vm_fork_release(void);
 /* LL/SC-aware bulk guest store (defined in src/os/mem.c): data write
  * plus epoch/reservation update under one LL critical section.  Call
- * with g_vm_lock held (VM outer, LL inner); src must be non-NULL. */
+ * with g_vm_lock held (VM outer, LL inner); src must be non-NULL.
+ * Syscall read-completion paths may call it without g_vm_lock for an
+ * already-validated, already-populated range (e.g. a self-commit of
+ * bytes a blocking host read just wrote): it touches only stable
+ * window memory and LL state, never VMA metadata, and takes just the
+ * LL lock (no path acquires g_vm_lock while holding the LL lock). */
 void mips_guest_store_commit(mips32_ctx_t *ctx, uint32_t va,
                              const void *src, uint32_t len);
 

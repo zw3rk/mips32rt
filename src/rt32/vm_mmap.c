@@ -29,11 +29,6 @@
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 
-/* Provider A hook (src/vm/vm_file.c): declared locally so vm32.h stays
- * untouched.  Mirrors private file bytes into the A2 arena. */
-extern int mips32_file_populate_private(mips32_ctx_t *ctx, uint32_t gva,
-                                        uint32_t len, int fd,
-                                        uint64_t file_off);
 /* Keep the A2 Soft-TLB coherent wherever the DBT range is invalidated. */
 static void vm_invalidate_all(mips32_ctx_t *ctx, uint32_t start,
                               uint32_t end)
@@ -156,11 +151,17 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
 #ifdef __APPLE__
     uint32_t h_start = target_va & ~0x3FFFU;
     uint32_t h_end   = (target_end + 0x3FFFU) & ~0x3FFFU;
-    if ((target_va & 0x3FFFU) == 0U && (aligned_len & 0x3FFFULL) == 0ULL &&
-        ((host_flags & MAP_ANONYMOUS) != 0 || (host_off & 0x3FFF) == 0)) {
+    /* M32-R4-5/M32-R4-10: on Darwin every file mapping is shadow-backed
+     * (anonymous host pages populated from the file, MAP_SHARED tracked
+     * via darw_sync alias propagation) instead of mixing direct
+     * MAP_SHARED host pages with shadow aliases: replacing a 4 KiB
+     * sub-page of a direct shared page would zero the underlying file,
+     * and baseline-diff flushes cannot tell a stale shadow from newer
+     * direct writes.  Anonymous mappings keep the direct path. */
+    if ((host_flags & MAP_ANONYMOUS) != 0U &&
+        (target_va & 0x3FFFU) == 0U && (aligned_len & 0x3FFFULL) == 0ULL) {
         void *res = mmap(host_target, (size_t)aligned_len, host_prot,
-                         host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-                         (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
+                         host_flags | MAP_FIXED, -1, 0);
         if (res == MAP_FAILED) {
             int err = errno;
             if (dup_backing && back.fd >= 0) {
@@ -169,30 +170,54 @@ static uint32_t vm_mmap2_ext_locked(mips32_ctx_t *ctx, uint32_t addr, uint32_t l
             return (uint32_t)(-err);
         }
     } else {
+        /* M32-R4-7: stage the fallible file population before touching
+         * live mappings: pread into a zeroed staging buffer first, so a
+         * read error returns with no modified bytes and no elevated
+         * protection.  Zero-fill plus pread_full is byte-identical to
+         * the old in-place memset plus populate_private/pread sequence
+         * (mips32_guest_ptr is G + gva, the same HVA the A2 private
+         * helper uses), so the A2 private path stages the same way. */
+        uint8_t *stage = NULL;
+
         shadow_elevated = true;
-        if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
-                     PROT_READ | PROT_WRITE) != 0) {
-            int err = errno;
-            if (dup_backing && back.fd >= 0) {
-                (void)close(back.fd);
-            }
-            return (uint32_t)(-err);
-        }
-        memset(host_target, 0, (size_t)aligned_len);
         if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0) {
-            int prc = ((flags & 0x01U) == 0U && ctx->vm_regime == MIPS32_VM_REGIME_A2)
-                ? mips32_file_populate_private(ctx, target_va, (uint32_t)aligned_len,
-                                               fd, (uint64_t)host_off)
-                : pread_full(fd, (uint8_t *)host_target, (size_t)aligned_len, host_off);
+            int prc;
+
+            stage = (uint8_t *)malloc((size_t)aligned_len);
+            if (stage == NULL) {
+                if (dup_backing && back.fd >= 0) {
+                    (void)close(back.fd);
+                }
+                return (uint32_t)(-ENOMEM);
+            }
+            memset(stage, 0, (size_t)aligned_len);
+            prc = pread_full(fd, stage, (size_t)aligned_len, host_off);
             if (prc != 0) {
+                free(stage);
                 if (dup_backing && back.fd >= 0) {
                     (void)close(back.fd);
                 }
                 return (uint32_t)prc;
             }
-            if ((flags & 0x01U) != 0U) {
-                back.darw_sync = 1U;
+        }
+        if (mprotect(mips32_guest_ptr(ctx, h_start), (size_t)(h_end - h_start),
+                     PROT_READ | PROT_WRITE) != 0) {
+            int err = errno;
+            free(stage);
+            if (dup_backing && back.fd >= 0) {
+                (void)close(back.fd);
             }
+            return (uint32_t)(-err);
+        }
+        if (stage != NULL) {
+            memcpy(host_target, stage, (size_t)aligned_len);
+            free(stage);
+        } else {
+            memset(host_target, 0, (size_t)aligned_len);
+        }
+        if ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0 &&
+            (flags & 0x01U) != 0U) {
+            back.darw_sync = 1U;
         }
     }
 #else

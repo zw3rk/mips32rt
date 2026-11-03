@@ -47,7 +47,7 @@ void fp_emit1(a64_buf_t *b, unsigned ptype, unsigned op5, unsigned opc6,
                     ((vn & 31U) << 5) | (vd & 31U));
 }
 
-static void fp_cmp(a64_buf_t *b, unsigned ptype, unsigned rn, unsigned rm)
+void fp_cmp(a64_buf_t *b, unsigned ptype, unsigned rn, unsigned rm)
 {
     a64_emit(b, 0x1E000000U | ((ptype & 1U) << 22) | (1U << 21) |
                     ((rm & 31U) << 16) | (0x08U << 10) | ((rn & 31U) << 5));
@@ -137,12 +137,8 @@ uint32_t fp_slot(unsigned fs)
 /* S-reg i is the low 32 bits of fpr[i] (upper half preserved by
  * stores); D-reg fs is the full 64-bit fpr[fs] slot.  FR-agnostic,
  * mirroring fpmove.c LWC1/LDC1.  Wave P12: 16-slot write-through cache
- * in v16..v31 (slot = ((fs>>1)^((fs&1)<<3))&15, creg = 16+slot); even
+ * in v16..v31 (fpr_slot() from emit_fp_priv.h, creg = 16+slot); even
  * O32 regs map 1-to-1 with zero collisions. */
-static unsigned fpr_slot(unsigned fs)
-{
-    return (((fs >> 1U) ^ ((fs & 1U) << 3U)) & 15U);
-}
 void fp_ld(a64_buf_t *b, unsigned vd, unsigned fs, int be,
                   unsigned is_d)
 {
