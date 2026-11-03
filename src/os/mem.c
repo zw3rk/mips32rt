@@ -251,7 +251,8 @@ void mips_fault(mips32_ctx_t *ctx, uint32_t addr)
 
 /* Explicit alignment fault (M32-R7-6): never inferred from FIXADE or
  * address bits; always AdEL/AdES SIGBUS. Callers use this for LL/SC,
- * fetch, and FP widths (incl. 8-byte at 4 mod 8). */
+ * fetch, and FP widths (incl. 8-byte at 4 mod 8); the frame always
+ * carries BUS_ADRALN, never the addr&3 mapping guess. */
 void mips_fault_align(mips32_ctx_t *ctx, uint32_t addr)
 {
     if (ctx == NULL) {
@@ -263,7 +264,7 @@ void mips_fault_align(mips32_ctx_t *ctx, uint32_t addr)
     if (ctx->trace_enabled) {
         (void)fprintf(stderr, "F %08x align-fault %08x\n", ctx->pc, addr);
     }
-    mips_trap(ctx, 10, addr);
+    mips_trap_code(ctx, 10, 1 /* L4A_BUS_ADRALN */, addr);
 }
 
 /* Regime-A2 access validation (RC-U3-r3 #4): route every byte through

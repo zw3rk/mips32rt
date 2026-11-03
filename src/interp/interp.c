@@ -19,15 +19,6 @@ __attribute__((weak)) void mips32_dbt_invalidate_range(mips32_ctx_t *ctx,
                                                       uint32_t end);
 extern void mips_ll_record(mips32_ctx_t *ctx, uint32_t addr, uint32_t val);
 
-static int fault_at(mips32_ctx_t *ctx, uint32_t addr)
-{
-    if (ctx->trace_enabled) {
-        (void)fprintf(stderr, "F %08x at %08x\n", ctx->pc, addr);
-    }
-    mips_fault(ctx, addr);
-    return MIPS_FAULT;
-}
-
 /* Explicit alignment fault (M32-R7-6): AdEL/AdES, never mapping. */
 static int fault_align_at(mips32_ctx_t *ctx, uint32_t addr)
 {
@@ -197,15 +188,17 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
     case 0x0Cu: /* SYSCALL */
         return exec_syscall(ctx);
     case 0x0Du: /* BREAK */
-    case 0x3Fu: { /* SDBBP (M32-R7-9: preserve 20-bit code; 6/7 -> SIGFPE) */
+    case 0x3Fu: { /* SDBBP (M32-R7-9: gas single-operand codes arrive
+        * shifted; TRAP_BRKPT for plain breaks, never the raw code). */
         uint32_t code = (d->word >> 6) & 0xFFFFFU;
-        if (code == 6u) {
+        uint32_t bcode = (code >= 1024u) ? (code >> 10) : code;
+        if (bcode == 6u) {
             return fault_code_at(ctx, cur_pc, 8, 2); /* FPE_INTOVF */
         }
-        if (code == 7u) {
+        if (bcode == 7u) {
             return fault_code_at(ctx, cur_pc, 8, 1); /* FPE_INTDIV */
         }
-        return fault_code_at(ctx, cur_pc, 5, (int32_t)code);
+        return fault_code_at(ctx, cur_pc, 5, 1); /* L4A_TRAP_BRKPT */
     }
     case 0x0Fu: /* SYNC (full barrier for SYNC 0: M32-R7-5) */
         atomic_thread_fence(memory_order_seq_cst);
@@ -301,7 +294,7 @@ static int exec_special(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)
             return fault_code_at(ctx, cur_pc, 8, 2);
         if (code == 7u)
             return fault_code_at(ctx, cur_pc, 8, 1);
-        return fault_code_at(ctx, cur_pc, 5, (int32_t)code);
+        return fault_code_at(ctx, cur_pc, 5, 0x80); /* L4A_SI_KERNEL */
     }
     default:
         return fault_signo_at(ctx, cur_pc, 4); /* SIGILL */
@@ -475,15 +468,8 @@ static int exec_regimm_trap(mips32_ctx_t *ctx, uint32_t cur_pc,
     if (!fire) {
         return 0;
     }
-    /* M32-R7-9: immediate traps preserve the 16-bit immediate as the
-     * code; Linux BREAK-compat 6/7 select SIGFPE. */
-    if ((uint32_t)(d->simm & 0xFFFF) == 6u) {
-        return fault_code_at(ctx, cur_pc, 8, 2);
-    }
-    if ((uint32_t)(d->simm & 0xFFFF) == 7u) {
-        return fault_code_at(ctx, cur_pc, 8, 1);
-    }
-    return fault_code_at(ctx, cur_pc, 5, (int32_t)d->simm);
+    /* M32-R7-9: simm is the comparison operand, never a trap code. */
+    return fault_code_at(ctx, cur_pc, 5, 0x80); /* L4A_SI_KERNEL */
 }
 
 static int exec_mem(mips32_ctx_t *ctx, uint32_t cur_pc, const mips_dec_t *d)

@@ -95,9 +95,8 @@ static fpv_t fp_unpack(unsigned f, uint64_t w, int nan2008)
 /* Default quiet NaN. */
 static uint64_t fp_default_nan(unsigned f, int nan2008)
 {
-    if (f == 0u)
-        return nan2008 ? 0x7FC00000ULL : 0x7FBFFFFFULL;
-    return nan2008 ? 0x7FF8000000000000ULL : 0x7FF7FFFFFFFFFFFFULL;
+    return (f == 0u) ? (nan2008 ? 0x7FC00000ULL : 0x7FBFFFFFULL)
+                     : (nan2008 ? 0x7FF8000000000000ULL : 0x7FF7FFFFFFFFFFFFULL);
 }
 
 /* Impose mode quiet bit, keep sign + payload. */
@@ -557,7 +556,7 @@ static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
 
 /* Float->int (R7-15 always raises Inexact; R7-17 mode-specific invalid). */
 static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
-                     int forced_rm, int no_inexact, uint64_t *out)
+                     int forced_rm, uint64_t *out)
 {
     int n8 = s->ctx->nan2008;
     fpv_t a = fp_unpack(f, w, n8);
@@ -567,12 +566,11 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
     int neg, rm = (forced_rm < 0) ? (int)(s->ctx->fcsr & 0x3u) : forced_rm;
     int dropped = 0, inc = 0;
 
-    (void)no_inexact;
     if (a.cls == FP_NAN || a.cls == FP_INF) {
         fp_raise(s, FP_E_V);
-        /* M32-R7-17: NAN2008 invalid conversion yields 0, legacy
-         * yields the saturated maxint. */
-        *out = (n8 != 0 && a.cls == FP_NAN) ? 0u : bad;
+        /* M32-R7-17: NAN2008 NaN yields 0, NAN2008 -Inf yields INT_MIN;
+         * legacy and +Inf yield the saturated maxint. */
+        *out = (a.cls == FP_NAN) ? ((n8 != 0) ? 0u : bad) : ((n8 != 0 && a.sign != 0) ? ((uint64_t)1 << (nbits - 1)) : bad);
         return 1;
     }
     if (a.cls == FP_ZERO) {
@@ -589,7 +587,7 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
     }
     if (e >= nbits - 1) {
         fp_raise(s, FP_E_V);
-        *out = bad;
+        *out = (n8 != 0 && neg != 0) ? ((uint64_t)1 << (nbits - 1)) : bad;
         return 1;
     }
     r = (int32_t)fp_ff[f].mb - e;
@@ -619,7 +617,7 @@ static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
     lim = ((uint64_t)1) << (nbits - 1);
     if ((!neg && ip > lim - 1u) || (neg && ip > lim)) {
         fp_raise(s, FP_E_V);
-        *out = bad;
+        *out = (n8 != 0 && neg != 0) ? ((uint64_t)1 << (nbits - 1)) : bad;
         return 1;
     }
     ip &= (nbits == 64) ? ~0ULL : 0xFFFFFFFFULL;
@@ -660,6 +658,9 @@ static uint64_t fp_cvt_fmt(struct fp_st *s, unsigned df, uint64_t w)
         uint64_t out, q, qfrac;
         if (a.qnan == 0)
             fp_raise(s, FP_E_V);
+        /* M32-R7-16: legacy sNaN converts to the default NaN. */
+        if (n8 == 0 && a.qnan == 0)
+            return fp_default_nan(df, 0);
         if (frac == 0u)
             frac = 1u;
         out = (((uint64_t)(a.sign & 1)) << (fp_ff[df].mb + fp_ff[df].eb)) |
@@ -734,10 +735,10 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
         else mips_fpr_set_d_raw(ctx, fd, mips_fpr_get_d(ctx, fs) ^ 0x8000000000000000ULL);
         return 0;
     case 8u: case 9u: case 10u: case 11u:
-        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, (int)(func - 8u), 0, &v);
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, (int)(func - 8u), &v);
         return fp_write_d(&s, fd, v);
     case 12u: case 13u: case 14u: case 15u:
-        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, (int)(func - 12u), 0, &v);
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, (int)(func - 12u), &v);
         return fp_write_s(&s, fd, (uint32_t)v);
     case 17u: case 18u: case 19u: {
         int go = (func == 17u) ? ((((ctx->fcsr & fp_fcc_mask((ft >> 2) & 7u)) != 0) == ((ft & 1u) != 0))) : (func == 18u) ? (ctx->gpr[ft] == 0u) : (ctx->gpr[ft] != 0u);
@@ -760,10 +761,10 @@ static int fp_fmt_sd(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d,
         }
         return fp_write_d(&s, fd, fp_cvt_fmt(&s, 1u, (uint64_t)mips_fpr_get_w(ctx, fs)));
     case 36u:
-        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, -1, 0, &v);
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 32, -1, &v);
         return fp_write_s(&s, fd, (uint32_t)v);
     case 37u:
-        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, -1, 0, &v);
+        (void)fp_to_int(&s, f, (f == 0u) ? (uint64_t)mips_fpr_get_w(ctx, fs) : mips_fpr_get_d(ctx, fs), 64, -1, &v);
         return fp_write_d(&s, fd, v);
     default:
         mips_trap(ctx, 4, pc); /* Reserved S/D funct. */
@@ -875,12 +876,11 @@ int fp_exec(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
     switch (d->rs) {
     case 0x08u:
         return fp_bc1(ctx, pc, d);
-    case 0x03u: /* MFHC1: high 32 bits, FR-agnostic flat lane (E03). */
-        interp_set_reg(ctx, d->rt, (uint32_t)(ctx->fpr[d->rd] >> 32));
+    case 0x03u: /* MFHC1: FR=0 aliases the odd low half (E03). */
+        interp_set_reg(ctx, d->rt, (ctx->fr_mode == 0u) ? (uint32_t)ctx->fpr[d->rd | 1u] : (uint32_t)(ctx->fpr[d->rd] >> 32));
         return 0;
-    case 0x07u: /* MTHC1: high 32 bits, low half preserved. */
-        ctx->fpr[d->rd] = (ctx->fpr[d->rd] & 0xFFFFFFFFULL) |
-                          (((uint64_t)ctx->gpr[d->rt]) << 32);
+    case 0x07u: /* MTHC1: FR=0 writes the odd low half. */
+        if (ctx->fr_mode == 0u) { unsigned o = d->rd | 1u; ctx->fpr[o] = (ctx->fpr[o] & 0xFFFFFFFF00000000ULL) | ctx->gpr[d->rt]; } else { ctx->fpr[d->rd] = (ctx->fpr[d->rd] & 0xFFFFFFFFULL) | ((uint64_t)ctx->gpr[d->rt] << 32); }
         return 0;
     case 0x10u:
         return fp_fmt_sd(ctx, pc, d, 0u);

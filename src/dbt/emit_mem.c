@@ -495,12 +495,17 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
  * preserves the upper lane); BE guests byte-swap around the host-endian
  * slot.  Stores serialize under the LL spinlock and bump/break exactly
  * like integer SW (SDC1 covers both touched words). */
-void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
-                 int be, int ind_slot)
+int emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
+                int fr_mode, int ind_slot)
 {
     unsigned fs = d->rt;
     uint32_t off = MIPS32_CTX_FPR_OFFSET + fs * 8U;
 
+    /* M32-R7-1: FR=0 pairs doubles across even/odd low halves while the
+     * emitter stores flat lanes; decline LDC1/SDC1 to the interpreter
+     * (S-word low-half traffic keeps emitting). */
+    if (fr_mode == 0 && (d->op == 0x35u || d->op == 0x3du))
+        return -1;
     emit_sync_pc(b, fpc, ind_slot);
     switch (d->op) {
     case 0x31u: { /* LWC1 */
@@ -521,7 +526,7 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         b->fpr_cache_reg[slot] = (uint8_t)fs;
         b->fpr_cache_is_d &= (uint16_t)~(1U << slot);
         b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
-        return;
+        return 0;
     }
     case 0x39u: { /* SWC1 */
         size_t ph_slow, ph_done;
@@ -546,7 +551,7 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_reservation_break(b, A64_ADDR, 1);
         emit_ll_unlock(b);
         a64_patch_b_cond(b, ph_done, b->count);
-        return;
+        return 0;
     }
     case 0x35u: { /* LDC1 */
         unsigned slot, creg, lo, hi;
@@ -572,7 +577,7 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         b->fpr_cache_reg[slot] = (uint8_t)fs;
         b->fpr_cache_is_d |= (uint16_t)(1U << slot);
         b->fpr_non_nan &= ~(1U << fs); b->fpr_no_snan &= ~(1U << fs);
-        return;
+        return 0;
     }
     case 0x3du: { /* SDC1 */
         size_t ph_slow, ph_done;
@@ -629,11 +634,12 @@ void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
         emit_reservation_break(b, A64_TMP3, 0);
         emit_ll_unlock(b);
         a64_patch_b_cond(b, ph_done, b->count);
-        return;
+        return 0;
     }
     default:
         break;
     }
+    return 0;
 }
 
 /* LL: aligned load + llbit/lladdr/llval record (align guard syncs).

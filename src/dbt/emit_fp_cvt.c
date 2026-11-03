@@ -309,55 +309,16 @@ int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     return 0;
 }
 
-/* CVT.S/D from W (single GPR) or L (even-odd GPR pair, O32 order). */
+/* CVT.S/D from W/L (M32-R7-20): the interpreter owns these. The
+ * architectural source is FPR fs (d->rd), not the GPR file this
+ * emitter read via d->rt, so decline and let interp_step convert. */
 int fp_from_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
                           int be, unsigned is_d)
 {
-    unsigned rt = d->rt;
-    unsigned fd = d->sa;
-    unsigned src;
-
-    if (rt >= 32U || fd >= 32U) {
-        return -1;
-    }
-    if (d->rs == FP_FMT_W) {
-        src = fp_get(b, rt, A64_TMP1);
-        a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-        fp_fpcr_sync(b);
-        fp_fpsr_clear(b);
-        if (is_d == 0U) {
-            a64_emit_scvtf_w_to_s(b, 2U, src);
-        } else {
-            a64_emit_scvtf_w_to_d(b, 2U, src);
-        }
-    } else if (d->rs == FP_FMT_L) {
-        unsigned lo;
-        unsigned hi;
-        unsigned vlo;
-        unsigned vhi;
-
-        if ((rt & 1U) != 0U || rt + 1U >= 32U) {
-            return -1;
-        }
-        lo = (be != 0) ? rt + 1U : rt;
-        hi = (be != 0) ? rt : rt + 1U;
-        vlo = fp_get(b, lo, A64_TMP1);
-        vhi = fp_get(b, hi, A64_TMP2);
-        a64_emit_mov_w(b, 22U, vlo);
-        a64_emit_mov_w(b, 23U, vhi);
-        a64_emit_bfi_x(b, 22U, 23U, 32U, 32U);
-        a64_emit_ldr_imm_w(b, 21U, A64_XCTX, MIPS32_CTX_FCSR_OFFSET);
-        fp_fpcr_sync(b);
-        fp_fpsr_clear(b);
-        fp_cvt(b, 1U, is_d, 0x02U, 2U, 22U);
-    } else {
-        return -1;
-    }
-    fp_fpsr_read(b, 22U);
-    fp_fpcr_restore(b);
-    fp_st(b, 2U, fd, be, is_d);
-    /* Integer-to-float is always finite: set both tracking bits. */
-    b->fpr_no_snan |= (1U << fd); b->fpr_non_nan |= (1U << fd);
-    fp_finish(b, 22U, cur);
-    return 0;
+    (void)b;
+    (void)d;
+    (void)cur;
+    (void)be;
+    (void)is_d;
+    return -1;
 }

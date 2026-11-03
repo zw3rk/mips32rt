@@ -52,7 +52,13 @@ int32_t mips_sc_ret(mips32_ctx_t *ctx, int32_t raw)
 void mips_sc_advance_pc_once(mips32_ctx_t *ctx)
 {
     if (ctx != NULL && ctx->sc_pc_advanced == 0U) {
-        ctx->pc += 4U;
+        /* M32-R7-2: a slot syscall resumes at the branch target, so a
+         * frame built during delivery saves the destination EPC. */
+        if (ctx->in_delay_slot != 0U) {
+            ctx->pc = ctx->delay_target;
+        } else {
+            ctx->pc += 4U;
+        }
         ctx->next_pc = ctx->pc + 4U;
         ctx->in_delay_slot = 0U;
         ctx->sc_pc_advanced = 1U;

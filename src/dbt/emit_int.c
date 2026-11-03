@@ -738,8 +738,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
      * only the integer memory ops). */
     case 0x31u: case 0x35u: case 0x39u: case 0x3du: /* LWC1/LDC1/SWC1/SDC1 */
         emit_ea(b, d->rs, d->simm);
-        emit_fp_mem(b, d, fpc, be, ind_slot);
-        return 0;
+        return emit_fp_mem(b, d, fpc, be, (ctx != NULL) ? ctx->fr_mode : 1, ind_slot);
     case MIPS_OP_LWL: case MIPS_OP_LWR: case MIPS_OP_SWL: case MIPS_OP_SWR:
         emit_ea(b, d->rs, d->simm);
         emit_mem_unaligned(b, d, fpc, be, ind_slot);

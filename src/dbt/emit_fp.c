@@ -832,10 +832,17 @@ int dbt_emit_fp(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, uint32_t fpc,
     if (b == NULL || d == NULL) {
         return -1;
     }
-    /* Mode flags are single bits; anything else declines. */
+    /* Mode flags are single bits; anything else declines. FR=0 pairs
+     * D/L across even/odd low halves (M32-R7-1) while fp_ld/fp_st
+     * address flat lanes, so 64-bit FPR traffic declines to the
+     * interpreter (S low-half traffic keeps emitting). */
     if ((unsigned)(be | fr_mode | nan2008) > 1U) {
         return -1;
     }
+    if (fr_mode == 0 && d->op == MIPS_OP_COP1 && (d->rs == FP_FMT_D || d->rs == FP_FMT_L || d->rs == FP_RS_MFHC1 || d->rs == FP_RS_MTHC1 || d->funct == FP_FUNCT_CVT_D || d->funct == FP_FUNCT_CVT_L || (d->funct >= FP_FUNCT_ROUND && d->funct <= FP_FUNCT_FLOOR)))
+        return -1;
+    if (fr_mode == 0 && d->op == 0x13u && (d->funct & 1u) != 0u)
+        return -1;
     /* Wave P4 COP1X MADD family (op 0x13). */
     if (d->op == 0x13u) {
         return fp_madd_op(b, d, cur, be, fr_mode, nan2008);

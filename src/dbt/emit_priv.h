@@ -63,8 +63,8 @@ void emit_mem_unaligned(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
                         int be, int ind_slot);
 /* COP1 memory moves (Wave P lane P4): LWC1/SWC1/LDC1/SDC1. EA lands in
  * w22 (A64_ADDR) via emit_ea before the call. */
-void emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc,
-                 int be, int ind_slot);
+int emit_fp_mem(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
+                int fr_mode, int ind_slot);
 void emit_ll(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot);
 void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,

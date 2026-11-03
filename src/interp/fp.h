@@ -54,8 +54,8 @@ static inline uint32_t fp_fcc_mask(unsigned cc)
 /* FR-aware FPR accessors (M32-R7-1): FR=1 keeps one 64-bit lane per
  * register; FR=0 pairs even/odd low halves for D/L values (even holds
  * the low word, odd the high word) while single words stay in the
- * addressed lane's low half. MFHC1/MTHC1 high halves stay flat
- * (E03 qemu round-trip) and are untouched here. */
+ * addressed lane's low half. MFHC1/MTHC1 alias the odd low half under
+ * FR=0 (E03 qemu round-trip) and stay flat under FR=1. */
 static inline uint64_t mips_fpr_get_d(const mips32_ctx_t *ctx, unsigned fd)
 {
     if (ctx->fr_mode == 0u) {

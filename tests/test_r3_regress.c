@@ -27,6 +27,9 @@
  *   T10 FR=0 doubles alias even/odd low halves; FR=1 is flat (M32-R7-1).
  *   T11 fp_even rejects odd D/L lanes only in FR=0 (M32-R7-1).
  *   T12 FCSR alias packings match QEMU (FCCR/FEXR/FENR) (M32-R7-19).
+ *   T13 Round-7 post-fable contract: delay-slot advance resumes at the
+ *       branch target, alignment faults report BUS_ADRALN, and explicit
+ *       trap codes reach the frame verbatim (M32-R7-2/6/9).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -100,10 +103,16 @@ int32_t mips_sc_ret(mips32_ctx_t *ctx, int32_t raw)
     return raw;
 }
 
+/* Test double mirroring src/os/syscalls.c: a slot syscall resumes at
+ * the branch target so frames built during delivery save it (M32-R7-2). */
 void mips_sc_advance_pc_once(mips32_ctx_t *ctx)
 {
     if (ctx != NULL && ctx->sc_pc_advanced == 0U) {
-        ctx->pc += 4U;
+        if (ctx->in_delay_slot != 0U) {
+            ctx->pc = ctx->delay_target;
+        } else {
+            ctx->pc += 4U;
+        }
         ctx->next_pc = ctx->pc + 4U;
         ctx->in_delay_slot = 0U;
         ctx->sc_pc_advanced = 1U;
@@ -541,6 +550,74 @@ int main(void)
         CHECK((f & 0x0003F07Cu) == 0x0003F07Cu);
         CHECK(((f & 0x00000F83u) | ((f >> 22) & 4u)) == 0x00000F87u);
         CHECK((0x000C0000u & 0xFF81FFFFu) == 0u);
+    }
+
+    /* T13: Round-7 post-fable contract (M32-R7-2/6/9). */
+    {
+        mips32_ctx_t c;
+        uint32_t newsp;
+
+        memset(&c, 0, sizeof c);
+        c.guest_base = (uint64_t)(uintptr_t)fake_win;
+
+        /* R7-2: a slot syscall resumes at the branch target. */
+        c.pc = 0x400004U;
+        c.next_pc = 0x400008U;
+        c.in_delay_slot = 1U;
+        c.delay_target = 0x500000U;
+        mips_sc_advance_pc_once(&c);
+        CHECK(c.pc == 0x500000U);
+        CHECK(c.next_pc == 0x500004U);
+        CHECK(c.in_delay_slot == 0U);
+        CHECK(c.sc_pc_advanced == 1U);
+        c.sc_pc_advanced = 0U;
+        c.pc = 0x400000U;
+        c.next_pc = 0x400004U;
+        mips_sc_advance_pc_once(&c);
+        CHECK(c.pc == 0x400004U);
+        CHECK(c.next_pc == 0x400008U);
+
+        /* Frame setup mirrors T6: exact-sp stack region for delivery. */
+        c.gpr[MIPS32_REG_SP] = 0x1F001U;
+        c.pc = 0x400000U;
+        c.next_pc = 0x400004U;
+        c.in_delay_slot = 0U;
+        c.sig_depth = 0U;
+        c.region_count = 1U;
+        c.regions[0].start = 0x7FFF7000U & ~0xFFFU;
+        c.regions[0].end = c.regions[0].start + 0x1000U;
+        c.regions[0].prot = (uint32_t)(PROT_READ | PROT_WRITE);
+        c.regions[0].flags = 0U;
+        c.regions[0].name[0] = '\0';
+        c.vm_gen = g_vm_gen;
+
+        /* R7-6: LDC1/SDC1 at 4 mod 8 still reports BUS_ADRALN (1). */
+        gst_put32(0x9000U, 0U);
+        gst_put32(0x9004U, 0x1234U);
+        gst_put32(0x9008U, 0U);
+        gst_put32(0x900CU, 0U);
+        gst_put32(0x9010U, 0U);
+        gst_put32(0x9014U, 0U);
+        set_args(&c, 10U, 0x9000U, 0U, 16U);
+        CHECK(mips_sc_rt_sigaction(&c, 0U) == 0);
+        mips_fault_align(&c, 0x1004U);
+        newsp = c.gpr[MIPS32_REG_SP];
+        CHECK(gst_get32(newsp + 28U) == 1U);
+        CHECK(gst_get32(newsp + 36U) == 0x1004U);
+
+        /* R7-9: explicit trap codes reach the frame verbatim. */
+        c.gpr[MIPS32_REG_SP] = 0x1F001U;
+        c.sig_depth = 0U;
+        set_args(&c, 5U, 0x9000U, 0U, 16U);
+        CHECK(mips_sc_rt_sigaction(&c, 0U) == 0);
+        mips_trap_code(&c, 5, 1, 0x400100U);
+        newsp = c.gpr[MIPS32_REG_SP];
+        CHECK(gst_get32(newsp + 28U) == 1U);
+        c.gpr[MIPS32_REG_SP] = 0x1F001U;
+        c.sig_depth = 0U;
+        mips_trap_code(&c, 5, 0x80, 0x400100U);
+        newsp = c.gpr[MIPS32_REG_SP];
+        CHECK(gst_get32(newsp + 28U) == 0x80U);
     }
 
     printf("%d checks, %d failures\n", checks, failures);
