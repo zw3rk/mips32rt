@@ -82,7 +82,7 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
  * that vfp_simd interleaves for pointer arithmetic).  Everything else
  * (CFC1/CTC1/MFC1/MTC1/BC1, C.cond.fmt, CVT.*, branches, traps,
  * trapping ALU, unknown/D2 words) stops the scan. */
-static inline int fp_batch_is_arith(const mips_dec_t *d)
+static inline int fp_batch_is_arith(const mips_dec_t *d, int fr_mode)
 {
     if (d == NULL) {
         return 0;
@@ -91,15 +91,29 @@ static inline int fp_batch_is_arith(const mips_dec_t *d)
         if (d->rs != 16U && d->rs != 17U) {
             return 0;
         }
-        return d->funct <= 0x04U;
+        if (d->funct > 0x04U) {
+            return 0;
+        }
+        if (fr_mode == 0 && d->rs == 17U &&
+            (((d->rd | d->sa | ((d->funct == 0x04U) ? 0U : d->rt)) & 1U) != 0U)) {
+            return 0;
+        }
+        return 1;
     }
     if (d->op == 0x13U) {
-        return (d->funct & 0x26U) == 0x20U;
+        if ((d->funct & 0x26U) != 0x20U) {
+            return 0;
+        }
+        if (fr_mode == 0 && (d->funct & 1U) != 0U &&
+            (((d->rs | d->rt | d->rd | d->sa) & 1U) != 0U)) {
+            return 0;
+        }
+        return 1;
     }
     return 0;
 }
 
-static inline int fp_batch_is_unary(const mips_dec_t *d)
+static inline int fp_batch_is_unary(const mips_dec_t *d, int fr_mode)
 {
     if (d == NULL || d->op != 0x11U) {
         return 0;
@@ -107,17 +121,24 @@ static inline int fp_batch_is_unary(const mips_dec_t *d)
     if (d->rs != 16U && d->rs != 17U) {
         return 0;
     }
-    return d->funct == 0x05U || d->funct == 0x06U || d->funct == 0x07U;
+    if (d->funct < 0x05U || d->funct > 0x07U) {
+        return 0;
+    }
+    if (fr_mode == 0 && d->rs == 17U && (((d->rd | d->sa) & 1U) != 0U)) {
+        return 0;
+    }
+    return 1;
 }
 
 /* An FP batch starts on arithmetic and stays open across unary ops
  * while a later arithmetic op still needs the accumulated flags. */
-static inline int fp_batch_starts(const mips_dec_t *d)
+static inline int fp_batch_starts(const mips_dec_t *d, int fr_mode)
 {
-    return fp_batch_is_arith(d) != 0 || fp_batch_is_unary(d) != 0;
+    return fp_batch_is_arith(d, fr_mode) != 0 ||
+        fp_batch_is_unary(d, fr_mode) != 0;
 }
 
-static inline int fp_batch_is_transparent(const mips_dec_t *d)
+static inline int fp_batch_is_transparent(const mips_dec_t *d, int fr_mode)
 {
     unsigned o;
 
@@ -128,10 +149,14 @@ static inline int fp_batch_is_transparent(const mips_dec_t *d)
     /* LWC1/LDC1/SWC1/SDC1: no FCSR interaction (double loads populate
      * the d16..d23 write-through cache, stores read it on hits). */
     if (o == 0x31U || o == 0x35U || o == 0x39U || o == 0x3DU) {
+        if (fr_mode == 0 && (o == 0x35U || o == 0x3DU) &&
+            (d->rt & 1U) != 0U) {
+            return 0;
+        }
         return 1;
     }
     if (o == 0x11U) {
-        return fp_batch_is_unary(d);
+        return fp_batch_is_unary(d, fr_mode);
     }
     /* Non-trapping integer ALU only (trapping ADD/SUB, MULT/DIV/MADD,
      * shifts with variable counts, loads/stores, and LUI stop the
@@ -149,6 +174,10 @@ static inline int fp_batch_is_transparent(const mips_dec_t *d)
     case MIPS_FUNCT_SRA:
     case MIPS_FUNCT_ADDU:
     case 0x23U: /* SUBU (no decode.h macro; cf. emit_int.c) */
+    case MIPS_FUNCT_AND:
+    case MIPS_FUNCT_OR:
+    case MIPS_FUNCT_XOR:
+    case MIPS_FUNCT_NOR:
     case MIPS_FUNCT_SLT:
     case MIPS_FUNCT_SLTU:
         return 1;

@@ -674,15 +674,18 @@ static int emit_branch(a64_buf_t *b, const mips_dec_t *d,
         emit_link_imm(b, (unsigned)link_rd, cur + 8U);
     }
     if (indirect != 0) {
-        /* M32-R8-4: link aliasing rs is committed; arm slot-exit restore. */
+        /* M32-R8-3/4: arm indirect-slot PC and aliased-link recovery. */
+        b->ind_slot = 1U;
         if (link_rd == (int)d->rs && d->rs != MIPS32_REG_ZERO) {
             b->ind_link_restore = 1U;
             b->ind_link_rs = (uint8_t)d->rs;
         }
         if (emit_one(b, s, cur + 4U, cur, be, 1, ctx) < 0) {
+            b->ind_slot = 0U;
             b->ind_link_restore = 0U;
             return -1;
         }
+        b->ind_slot = 0U;
         b->ind_link_restore = 0U;
         emit_exit_indirect(b);
         return 0;
@@ -728,10 +731,7 @@ static int emit_one(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
         return emit_imm_op(b, d, cur, fpc, ind_slot);
     case MIPS_OP_COP0: return emit_cop0(b, d);
     case MIPS_OP_COP1: /* Non-branch COP1; BC1 declines in dbt_emit_fp. */
-        return (ctx != NULL &&
-            dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
-            ? 0 : -1;
-    case 0x13u: /* Wave P4 COP1X MADD family. */
+    case 0x13u:        /* Wave P4 COP1X MADD family. */
         return (ctx != NULL &&
             dbt_emit_fp(b, d, cur, fpc, be, ctx->fr_mode, ctx->nan2008) == 0)
             ? 0 : -1;
@@ -833,6 +833,7 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
         }
     }
     a64_buf_init(&b, (uint32_t *)out, cap / 4U);
+    b.fr_mode = (uint8_t)(ctx->fr_mode != 0U);
     emit_prologue(&b, insns, count);
     cur = pc;
     {
@@ -850,13 +851,13 @@ int dbt_emit_int(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *insns,
             }
             if (d->op == MIPS_OP_COP1 || d->op == 0x13u) {
                 b.fp_defer_finish = 0U;
-                if (ok != 0 && fp_batch_starts(d) != 0) {
+                if (ok != 0 && fp_batch_starts(d, ctx->fr_mode) != 0) {
                     for (j = i + 1U; j < count; j++) {
-                        if (fp_batch_is_arith(&insns[j]) != 0) {
+                        if (fp_batch_is_arith(&insns[j], ctx->fr_mode) != 0) {
                             b.fp_defer_finish = 1U;
                             break;
                         }
-                        if (fp_batch_is_transparent(&insns[j]) == 0) break;
+                        if (fp_batch_is_transparent(&insns[j], ctx->fr_mode) == 0) break;
                     }
                 }
                 if (!dbt_emit_fp(&b, d, cur, cur, be, ctx->fr_mode,

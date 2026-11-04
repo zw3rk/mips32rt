@@ -112,7 +112,8 @@ void fp_quiet_reg(a64_buf_t *b, unsigned vd, unsigned greg, unsigned wsticky,
 void fp_fix(a64_buf_t *b, unsigned vd, unsigned is_d);
 
 /* Conversion ops (src/dbt/emit_fp_cvt.c). */
-int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be);
+int fp_to_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
+                 int nan2008);
 int fp_cvt_float_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,
                     int nan2008, unsigned is_d);
 int fp_from_int_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur, int be,

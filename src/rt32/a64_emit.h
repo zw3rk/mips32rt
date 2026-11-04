@@ -99,6 +99,8 @@ typedef struct a64_buf {
      * already clobbered the jump source). */
     uint8_t   ind_link_restore;
     uint8_t   ind_link_rs;
+    uint8_t   ind_slot;
+    uint8_t   fr_mode;
     /* Wave P12 16-slot write-through FPR cache in v16..v31 (slot =
      * ((fs>>1)^((fs&1)<<3))&15, creg = 16+slot; even O32 regs map 1-1)
      * plus known-non-NaN / known-no-sNaN bitmaps (bit = guest FPR). */
