@@ -11,8 +11,10 @@
  * arithmetic opcode still faults for Phase 3 (src/interp/fp.c), which
  * refines FR=0/FR=1 pairing and Legacy/2008 NaN semantics (E03).
  *
- * Transfer order is byte-wise through guest_ld/st8, so aligned and
- * unaligned addresses behave identically; endianness follows mips_is_be.
+ * LWC1/SWC1 require 4-byte alignment and LDC1/SDC1 8-byte alignment:
+ * a misaligned address delivers an address-alignment fault via
+ * mips_fault_align (never emulated, never a mapping fault); aligned
+ * transfers move bytes through guest_ld/st8, endianness follows mips_is_be.
  */
 
 #include <stdint.h>

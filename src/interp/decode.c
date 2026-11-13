@@ -78,7 +78,8 @@ static int is_regimm_branch(uint8_t rt)
 {
     return rt == MIPS_REGIMM_BLTZ || rt == MIPS_REGIMM_BGEZ ||
         rt == MIPS_REGIMM_BLTZL || rt == MIPS_REGIMM_BGEZL ||
-        rt == MIPS_REGIMM_BLTZAL || rt == MIPS_REGIMM_BGEZAL;
+        rt == MIPS_REGIMM_BLTZAL || rt == MIPS_REGIMM_BGEZAL ||
+        rt == MIPS_REGIMM_BLTZALL || rt == MIPS_REGIMM_BGEZALL;
 }
 
 int mips_is_branch(const mips_dec_t *d)
@@ -117,7 +118,8 @@ int mips_is_branch_likely(const mips_dec_t *d)
     case MIPS_OP_BGTZL:
         return 1;
     case MIPS_OP_REGIMM:
-        return d->rt == MIPS_REGIMM_BLTZL || d->rt == MIPS_REGIMM_BGEZL;
+        return d->rt == MIPS_REGIMM_BLTZL || d->rt == MIPS_REGIMM_BGEZL ||
+            d->rt == MIPS_REGIMM_BLTZALL || d->rt == MIPS_REGIMM_BGEZALL;
     case MIPS_OP_COP1:
         return d->rs == MIPS_COP1_RS_BC &&
             (d->rt == MIPS_COP1_BC1FL || d->rt == MIPS_COP1_BC1TL);
@@ -150,7 +152,25 @@ int mips_is_link(const mips_dec_t *d)
         return 1;
     }
     return d->op == MIPS_OP_REGIMM &&
-        (d->rt == MIPS_REGIMM_BLTZAL || d->rt == MIPS_REGIMM_BGEZAL);
+        (d->rt == MIPS_REGIMM_BLTZAL || d->rt == MIPS_REGIMM_BGEZAL ||
+         d->rt == MIPS_REGIMM_BLTZALL || d->rt == MIPS_REGIMM_BGEZALL);
+}
+
+int mips_is_ras_call(const mips_dec_t *d)
+{
+    if (d == NULL) {
+        return 0;
+    }
+    if (d->op == MIPS_OP_JAL) {
+        return 1;
+    }
+    if (d->op == MIPS_OP_SPECIAL && d->funct == MIPS_FUNCT_JALR &&
+        d->rd == MIPS32_REG_RA) {
+        return 1;
+    }
+    return d->op == MIPS_OP_REGIMM &&
+        (d->rt == MIPS_REGIMM_BLTZAL || d->rt == MIPS_REGIMM_BGEZAL ||
+         d->rt == MIPS_REGIMM_BLTZALL || d->rt == MIPS_REGIMM_BGEZALL);
 }
 
 int mips_has_delay_slot(const mips_dec_t *d)

@@ -42,6 +42,7 @@
 #include "os/syscalls_priv.h"
 #include "rt32/rt32.h"
 #include "rt32/vm_priv.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -67,7 +68,11 @@ extern long syscall(long __n, ...);
  * sysmips(MIPS_FIXADE, 0) disables unaligned emulation (next
  * misaligned access faults -> SIGBUS/BUS_ADRALN); nonzero enables. */
 #define MIPS32_NR_SYSMIPS 4149U
-#define MIPS32_SYSMIPS_FIXADE 7U
+/* O32 mremap = __NR_Linux + 167 (syscall_o32.tbl).  MREMAP_FIXED is 2
+ * on MIPS as on every other Linux arch.  Defined locally so the
+ * frozen src/os/syscall_nr.h stays untouched (TID_ADDRESS precedent). */
+#define MIPS32_NR_MREMAP 4167U
+#define MIPS32_MREMAP_FIXED 2U
 
 /* Wave C2: O32 tkill = __NR_Linux + 236, tgkill = __NR_Linux + 266,
  * gettid = __NR_Linux + 222 (asm/unistd_o32.h, matching the
@@ -409,6 +414,25 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         }
         return sc_ret(ctx, (int32_t)rt32_vm_mprotect(ctx, addr, len, prot));
     }
+    case (uint32_t)MIPS32_NR_MREMAP: {
+        uint32_t old_addr = o32_arg(ctx, sp, 0, &ok);
+        uint32_t old_len  = o32_arg(ctx, sp, 1, &ok);
+        uint32_t new_len  = o32_arg(ctx, sp, 2, &ok);
+        uint32_t flags    = o32_arg(ctx, sp, 3, &ok);
+        uint32_t new_addr = 0U;
+
+        if (!ok) {
+            return sc_ret(ctx, -EFAULT);
+        }
+        if ((flags & (uint32_t)MIPS32_MREMAP_FIXED) != 0U) {
+            new_addr = o32_arg(ctx, sp, 4, &ok);
+            if (!ok) {
+                return sc_ret(ctx, -EFAULT);
+            }
+        }
+        return sc_ret(ctx, (int32_t)rt32_vm_mremap(ctx, old_addr, old_len,
+                                                  new_len, flags, new_addr));
+    }
     case MIPS32_NR_cacheflush: {
         uint32_t addr = o32_arg(ctx, sp, 0, &ok);
         uint32_t len  = o32_arg(ctx, sp, 1, &ok);
@@ -511,8 +535,7 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         if (cmd != (uint32_t)MIPS32_SYSMIPS_FIXADE) {
             return sc_ret(ctx, -(int32_t)ENOSYS);
         }
-        ctx->fixade_enabled = (arg != 0U) ? 1u : 0u;
-        return sc_ret(ctx, 0);
+        return sc_ret(ctx, mips32_fixade_sysmips(ctx, arg));
     }
     /* Wave C2: kill-class self-delivery (raise/tgkill path). */
     case (uint32_t)MIPS32_NR_kill:

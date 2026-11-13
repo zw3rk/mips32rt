@@ -263,20 +263,34 @@ void mips_fault_align(mips32_ctx_t *ctx, uint32_t addr)
     mips_trap_code(ctx, 10, 1 /* L4A_BUS_ADRALN */, addr);
 }
 
-/* Regime-A2 access validation (RC-U3-r3 #4): route every byte through
- * the Soft-TLB miss helper so unmapped pages fault, clean COW pages
- * promote on first write, and the TLB entry is installed for the
- * (future) DBT fast path. Byte-granular so spanning and fixade-
- * emulated accesses validate every touched page. Returns 0 when the
- * access may proceed (fault already recorded otherwise). */
+/* Regime-A2 access validation (RC-U3-r3 #4): route one probe per
+ * touched 4 KiB page through the Soft-TLB miss helper so unmapped
+ * pages fault, clean COW pages promote on first write, and the TLB
+ * entry is installed for the (future) DBT fast path. Page-stepping
+ * (not byte-stepping) still validates every touched page, including
+ * spanning and fixade-emulated accesses. Returns 0 when the access
+ * may proceed (fault already recorded otherwise). */
 static int a2_validate(mips32_ctx_t *ctx, uint32_t va, uint32_t len,
                        int is_write)
 {
-    uint32_t i;
+    uint64_t end64;
+    uint32_t cur;
 
-    for (i = 0u; i < len; i++) {
-        if (mips32_vm_tlb_miss(ctx, va + i, is_write, 1u) != 0) {
+    if (len == 0U) {
+        return 0;
+    }
+    end64 = (uint64_t)va + (uint64_t)len;
+    if (end64 > 0x100000000ULL) {
+        end64 = 0x100000000ULL;
+    }
+    cur = va;
+    while ((uint64_t)cur < end64) {
+        if (mips32_vm_tlb_miss(ctx, cur, is_write, 1u) != 0) {
             return MIPS_FAULT;
+        }
+        cur = (cur | 0xFFFU) + 1U;
+        if (cur == 0U) {
+            break;
         }
     }
     return 0;

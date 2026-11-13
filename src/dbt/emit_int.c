@@ -182,9 +182,9 @@ static void emit_exit_indirect(a64_buf_t *b)
     a64_emit_mov_imm32(b, 1U, 0U);
     a64_emit_ret(b);
 }
-/* B.cond fault exit (info = cur); in a delay slot npc = delay_target. */
-static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
-                            uint32_t fpc, int ind_slot)
+/* B.cond checked exit (info = cur): TRAP for overflow replay, FAULT for traps. */
+static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t reason,
+                            uint32_t cur, uint32_t fpc, int ind_slot)
 {
     size_t ph_f = a64_emit_b_cond_placeholder(b, cond);
     size_t ph_c = a64_emit_b_cond_placeholder(b, A64_COND_AL);
@@ -198,9 +198,9 @@ static void emit_cond_fault(a64_buf_t *b, unsigned cond, uint32_t cur,
         emit_load_delay_target(b, A64_TMP1);
         a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX,
                            MIPS32_CTX_NEXT_PC_OFFSET);
-        emit_reason(b, MIPS32_EXIT_FAULT, cur);
+        emit_reason(b, reason, cur);
     } else {
-        emit_exit_imm(b, MIPS32_EXIT_FAULT, cur, fpc, fpc + 4U);
+        emit_exit_imm(b, reason, cur, fpc, fpc + 4U);
     }
     a64_patch_b_cond(b, ph_c, b->count);
 }
@@ -239,7 +239,7 @@ static int emit_imm_op(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
             a64_emit_add_reg_w(b, true, A64_TMP1, ra, A64_TMP2,
                                A64_SHIFT_LSL, 0U);
         }
-        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
+        emit_cond_fault(b, A64_COND_VS, MIPS32_EXIT_TRAP, cur, fpc, ind_slot);
         put_rd(b, rt, A64_TMP1);
         return 0;
     case MIPS_OP_ADDIU:
@@ -453,13 +453,13 @@ static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     switch (d->funct) {
     case MIPS_FUNCT_ADD:
         a64_emit_add_reg_w(b, true, A64_TMP1, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
+        emit_cond_fault(b, A64_COND_VS, MIPS32_EXIT_TRAP, cur, fpc, ind_slot);
         put_rd(b, d->rd, A64_TMP1);
         return 0;
     case MIPS_FUNCT_ADDU: ALU3(add_reg_w, d->rd, ra, rb); return 0;
     case MIPS_FUNCT_SUB:
         a64_emit_sub_reg_w(b, true, A64_TMP1, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, A64_COND_VS, cur, fpc, ind_slot);
+        emit_cond_fault(b, A64_COND_VS, MIPS32_EXIT_TRAP, cur, fpc, ind_slot);
         put_rd(b, d->rd, A64_TMP1);
         return 0;
     case 0x23U: ALU3(sub_reg_w, d->rd, ra, rb); return 0; /* SUBU */
@@ -483,8 +483,8 @@ static int emit_special(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     case 0x30U: case 0x31U: case 0x32U: case 0x33U: /* TGE/TLT */
     case 0x34U: case 0x36U: /* TEQ/TNE */
         a64_emit_sub_reg_w(b, true, A64_ZR, ra, rb, A64_SHIFT_LSL, 0U);
-        emit_cond_fault(b, kCond[(d->funct - 0x30U) & 7U], cur, fpc,
-                        ind_slot);
+        emit_cond_fault(b, kCond[(d->funct - 0x30U) & 7U],
+                        MIPS32_EXIT_FAULT, cur, fpc, ind_slot);
         return 0;
     default:
         return -1;
@@ -563,7 +563,7 @@ static int emit_regimm(a64_buf_t *b, const mips_dec_t *d, uint32_t cur,
     default: return -1;
     }
     cmp_simm(b, d->rs, d->simm);
-    emit_cond_fault(b, kCond[idx], cur, fpc, ind_slot);
+    emit_cond_fault(b, kCond[idx], MIPS32_EXIT_FAULT, cur, fpc, ind_slot);
     return 0;
 }
 
@@ -773,7 +773,7 @@ static int slot_ok(const mips_dec_t *d)
         if (f <= 0x13U) return f >= 0x0AU && f != 0x0CU && f != 0x0DU &&
             f != 0x0EU;
         if (f <= 0x1BU) return f >= 0x18U;
-        return (f >= 0x20U && f <= 0x27U) || f == 0x2AU || f == 0x2BU;
+        return (f >= 0x21U && f <= 0x27U && f != 0x20U && f != 0x22U) || f == 0x2AU || f == 0x2BU;
     }
     case MIPS_OP_SPECIAL2: {
         unsigned f = d->funct;
@@ -786,8 +786,8 @@ static int slot_ok(const mips_dec_t *d)
             (f == 0x20U && (d->sa == 2U || d->sa == 16U || d->sa == 24U)) ||
             (f == 0x3BU && d->rd == MIPS32_RDHWR_ULR);
     }
-    case MIPS_OP_REGIMM: return 0; /* SYNCI now single-steps (SMC) */
-    case MIPS_OP_ADDI: case MIPS_OP_ADDIU: case MIPS_OP_SLTI:
+    case MIPS_OP_REGIMM: case MIPS_OP_ADDI: return 0;
+    case MIPS_OP_ADDIU: case MIPS_OP_SLTI:
     case MIPS_OP_SLTIU: case MIPS_OP_ANDI: case MIPS_OP_ORI:
     case MIPS_OP_XORI: case MIPS_OP_LUI: case MIPS_OP_LB: case MIPS_OP_LH:
     case MIPS_OP_LW: case MIPS_OP_LBU: case MIPS_OP_LHU: case MIPS_OP_SB:

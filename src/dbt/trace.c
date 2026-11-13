@@ -32,6 +32,7 @@
 #include "mips32rt.h"
 
 #include "dbt/dbt.h"
+#include "interp/decode.h"
 #include "os/syscalls_priv.h"
 
 #include <stddef.h>
@@ -81,41 +82,15 @@ static void trace_range(mips32_ctx_t *ctx, uint32_t start, uint32_t limit)
     }
 }
 
-/* True when the word is a control transfer with a delay slot (the slot
- * executes before any redirect takes effect, so the interpreter prints
- * both fetches).  J/JAL, Bcond/BcondL, REGIMM branches (rt 0-3 and
- * 0x10-0x13; trap immediates have no delay slot), JR/JALR, BCzF/BCzT. */
+/* Delay-slot predicate, unified with the interp classifier
+ * (M32-R13-7): decode once and ask mips_has_delay_slot instead of
+ * maintaining a duplicate opcode switch. */
 static int has_delay_slot(uint32_t word)
 {
-    uint32_t op = word >> 26;
+    mips_dec_t d;
 
-    if (op == 2U || op == 3U) {
-        return 1;
-    }
-    if (op == 4U || op == 5U || op == 6U || op == 7U) {
-        return 1;
-    }
-    if (op == 20U || op == 21U || op == 22U || op == 23U) {
-        return 1;
-    }
-    if (op == 1U) {
-        /* M32-R8-6: REGIMM links (BLTZAL/BGEZAL/BLTZALL/BGEZALL,
-         * rt 0x10-0x13) have delay slots, like rt 0-3. */
-        uint32_t rt = (word >> 16) & 31U;
-
-        return rt <= 3U || (rt >= 0x10U && rt <= 0x13U);
-    }
-    if (op == 0U) {
-        uint32_t funct = word & 63U;
-
-        return funct == 8U || funct == 9U;
-    }
-    if (op == 16U || op == 17U) {
-        uint32_t rs = (word >> 21) & 31U;
-
-        return rs >= 8U && rs <= 11U;
-    }
-    return 0;
+    mips_decode(word, &d);
+    return mips_has_delay_slot(&d);
 }
 
 /* Replay bound for a mid-block redirect: [start, bound). Inclusion

@@ -314,20 +314,47 @@ static inline int mips32_range_ok(const mips32_ctx_t *ctx, uint32_t va,
     }
     rt32_vm_sync_ctx((mips32_ctx_t *)(uintptr_t)ctx);
     cur = va;
-    for (i = 0U; i < ctx->region_count; i++) {
-        const mips32_region_t *r = &ctx->regions[i];
-        if (r->start > cur) {
+    /* Regions are sorted by start (SPEC invariant): binary-search the
+     * region containing cur, then step across abutting regions only. */
+    {
+        size_t lo = 0U;
+        size_t hi = ctx->region_count;
+        size_t idx = 0U;
+        int found = 0;
+
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2U;
+            const mips32_region_t *r = &ctx->regions[mid];
+
+            if (cur < r->start) {
+                hi = mid;
+            } else if (cur >= r->end) {
+                lo = mid + 1U;
+            } else {
+                idx = mid;
+                found = 1;
+                break;
+            }
+        }
+        if (found == 0) {
             return 0;
         }
-        if (r->end <= cur) {
-            continue;
-        }
-        if ((r->prot & need) != need) {
-            return 0;
-        }
-        cur = r->end;
-        if ((uint64_t)cur >= end64) {
-            return 1;
+        for (i = idx; i < ctx->region_count; i++) {
+            const mips32_region_t *r = &ctx->regions[i];
+
+            if (r->start > cur) {
+                return 0;
+            }
+            if (r->end <= cur) {
+                continue;
+            }
+            if ((r->prot & need) != need) {
+                return 0;
+            }
+            cur = r->end;
+            if ((uint64_t)cur >= end64) {
+                return 1;
+            }
         }
     }
     return 0;

@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
@@ -49,6 +50,7 @@
 #include "mips32rt.h"
 #include "dbt/aot_emit.h"
 #include "dbt/dbt.h"
+#include "interp/decode.h"
 #include "vm/vm32.h"
 
 /* MIPS major opcodes needed for block-boundary classification. */
@@ -76,26 +78,7 @@
 #define DBT_COP1_CTC1 0x06U
 #define DBT_COP1_BC   0x08U
 
-typedef struct dbt_cache {
-    dbt_block_t blocks[DBT_MAX_BLOCKS];
-    uint8_t     block_link[DBT_MAX_BLOCKS];
-    size_t      block_count;
-    dbt_ibtc_entry_t *ibtc;
-    dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
-    unsigned    ras_top;
-    uint8_t    *pool;
-    size_t      pool_used;
-    uint32_t    last_pc;
-    void       *last_code;
-    uint32_t    last_smc;
-    int         last_valid;
-    size_t      last_bi; /* block index for last_* (H3: O(1) metadata) */
-    uint32_t    smc_memo_page; /* H3: last page resolved by dbt_smc_version */
-    uint32_t    smc_memo_version;
-    int         smc_memo_valid;
-    uint64_t    local_flush_epoch;
-    uint64_t    local_ver_epoch;
-} dbt_cache_t;
+/* Per-thread cache layout lives in dbt/dbt.h (shared with dbt/smc.c). */
 
 static void dbt_ras_push(uint32_t pc);
 
@@ -103,18 +86,15 @@ static void dbt_ras_push(uint32_t pc);
  * any thread performing SMC / cacheflush / mprotect / munmap / SYNCI
  * updates the shared table or bumps g_smc_flush_epoch, and every thread's
  * local dbt_cache validates against the shared state. */
-static _Atomic uint32_t g_smc_lock = 0U;
-static dbt_smc_entry_t  g_smc_table[DBT_SMC_TABLE_SIZE];
-static _Atomic uint32_t g_smc_used_count = 0U;
-static _Atomic uint64_t g_smc_flush_epoch = 1U;
-_Atomic uint64_t dbt_smc_ver_epoch = 1U;
+/* Process-wide SMC table, lock, and epochs live in dbt/smc.c
+ * (M32-R13-3 open-addressed hash); declared in dbt/dbt.h. */
 
 /* RC4 threads: one cache per host thread.  A shared cache would race
  * concurrent compiles (bump allocator, block/ibtc/ras tables, SMC
  * flush) and corrupt execution; translations are guest-pc-keyed so
  * per-thread duplication stays correct.  Each thread's pool is
  * registered with the (likewise per-thread) hostfault range. */
-static __thread dbt_cache_t *dbt_cache;
+__thread dbt_cache_t *dbt_cache;
 
 /* True when the decoded instruction transfers control with a delay slot:
  * J/JAL, integer branches (plain and likely), JR/JALR, and COP1 branches. */
@@ -142,30 +122,13 @@ static int dbt_is_control(const mips_dec_t *d)
     }
 }
 
-/* True for instructions with link semantics (ra = pc + 8 on the MIPS side). */
-static int dbt_is_link(const mips_dec_t *d)
-{
-    if (d->op == DBT_OP_JAL) {
-        return 1;
-    }
-    if (d->op == DBT_OP_SPECIAL && d->funct == 0x09U &&
-        d->rd == MIPS32_REG_RA) {
-        return 1;
-    }
-    if (d->op == DBT_OP_REGIMM &&
-        (d->rt == 0x10U || d->rt == 0x11U || d->rt == 0x12U ||
-         d->rt == 0x13U)) {
-        return 1;
-    }
-    return 0;
-}
-
 /*
  * Still-fallback coprocessor test (Wave P lane P4): COP1 itself is now
  * fully owned by the L2c/L3b emitter (dbt_emit_fp declines unknown forms
- * to UNDEF/SINGLE_STEP exits), so only COP1X/COP2 still force a block
- * break into the interp_step fallback.  COP0 (other than the L2c-owned
- * RDHWR path) and traps remain dispatcher exits.
+ * to UNDEF/SINGLE_STEP exits), so only COP2 and the COP1X forms outside
+ * the inline MADD/MSUB/NMADD/NMSUB family ((funct & 0x26) == 0x20) still
+ * force a block break into the interp_step fallback.  COP0 (other than
+ * the L2c-owned RDHWR path) and traps remain dispatcher exits.
  */
 static int dbt_is_unhandled_coproc(const mips_dec_t *d)
 {
@@ -217,7 +180,7 @@ static int dbt_pool_ensure(mips32_ctx_t *ctx)
 }
 
 /* Flush the calling thread's local translation cache and sync its flush epoch. */
-static void dbt_flush_local(mips32_ctx_t *ctx)
+void dbt_flush_local(mips32_ctx_t *ctx)
 {
     size_t i;
 
@@ -269,17 +232,7 @@ void mips32_dbt_fork_release(void)
 /* Drop every cached translation across all threads (explicit global SMC flush). */
 static void dbt_flush_all(mips32_ctx_t *ctx)
 {
-    size_t i;
-
-    mips32_spin_lock(&g_smc_lock);
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        g_smc_table[i].used = 0U;
-    }
-    atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
-    mips32_spin_unlock(&g_smc_lock);
-
+    dbt_smc_reset_for_flush();
     dbt_flush_local(ctx);
 }
 
@@ -313,89 +266,8 @@ static int dbt_cache_ensure(mips32_ctx_t *ctx)
     return 0;
 }
 
-uint32_t dbt_smc_version(mips32_ctx_t *ctx, uint32_t page)
-{
-    size_t i;
-    uint32_t v = 1U;
-    uint64_t ver_ep;
-
-    (void)ctx;
-    if (atomic_load_explicit(&g_smc_used_count, memory_order_acquire) == 0U) {
-        return 1U;
-    }
-    ver_ep = atomic_load_explicit(&dbt_smc_ver_epoch, memory_order_acquire);
-    if (dbt_cache != NULL && dbt_cache->smc_memo_valid != 0 &&
-        dbt_cache->smc_memo_page == page &&
-        dbt_cache->local_ver_epoch == ver_ep) {
-        return dbt_cache->smc_memo_version;
-    }
-    mips32_spin_lock(&g_smc_lock);
-    ver_ep = atomic_load_explicit(&dbt_smc_ver_epoch, memory_order_relaxed);
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (g_smc_table[i].used != 0U && g_smc_table[i].page == page) {
-            v = g_smc_table[i].version;
-            break;
-        }
-    }
-    mips32_spin_unlock(&g_smc_lock);
-    if (dbt_cache != NULL) {
-        dbt_cache->smc_memo_page = page;
-        dbt_cache->smc_memo_version = v;
-        dbt_cache->local_ver_epoch = ver_ep;
-        dbt_cache->smc_memo_valid = 1;
-    }
-    return v;
-}
-
-void dbt_smc_bump(mips32_ctx_t *ctx, uint32_t va)
-{
-    uint32_t page = mips32_page_down(va);
-    size_t i;
-
-    if (ctx != NULL) {
-        ctx->ibtc_ptr = 0U;
-    }
-    if (dbt_cache != NULL) {
-        dbt_cache->smc_memo_valid = 0;
-    }
-    mips32_spin_lock(&g_smc_lock);
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (g_smc_table[i].used != 0U && g_smc_table[i].page == page) {
-            g_smc_table[i].version += 1U;
-            if (g_smc_table[i].version == 0U) {
-                g_smc_table[i].version = 1U;
-            }
-            atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U,
-                memory_order_release);
-            mips32_spin_unlock(&g_smc_lock);
-            return;
-        }
-    }
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        if (g_smc_table[i].used == 0U) {
-            g_smc_table[i].page = page;
-            g_smc_table[i].version = 2U;
-            g_smc_table[i].used = 1U;
-            atomic_fetch_add_explicit(&g_smc_used_count, 1U,
-                memory_order_relaxed);
-            atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U,
-                memory_order_release);
-            mips32_spin_unlock(&g_smc_lock);
-            return;
-        }
-    }
-    /* M32-6: when all DBT_SMC_TABLE_SIZE slots are occupied, flush all
-     * threads' caches and reset the shared SMC table rather than dropping
-     * the invalidation. */
-    for (i = 0; i < DBT_SMC_TABLE_SIZE; i++) {
-        g_smc_table[i].used = 0U;
-    }
-    atomic_store_explicit(&g_smc_used_count, 0U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&dbt_smc_ver_epoch, 1U, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_smc_flush_epoch, 1U, memory_order_release);
-    mips32_spin_unlock(&g_smc_lock);
-    dbt_flush_local(ctx);
-}
+/* SMC version hooks live in dbt/smc.c (M32-R13-3 open-addressed hash
+ * keyed by guest page, UINT32_MAX empty sentinel, lock-free lookup). */
 
 static void dbt_ibtc_fill(uint32_t pc, void *code, uint32_t smc, size_t bi)
 {
@@ -609,13 +481,27 @@ static void *dbt_publish(mips32_ctx_t *ctx, const uint8_t *bytes, size_t len)
     sys_icache_invalidate(dst, len);
 #else
     {
-        uintptr_t start = base & ~(uintptr_t)4095U;
-        uintptr_t end = (base + dbt_cache->pool_used + len + 4095U) & ~(uintptr_t)4095U;
-        if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
+        static long cached_psz = 0L;
+        uintptr_t page_mask;
+        uintptr_t span_start;
+        uintptr_t span_end;
+
+        if (cached_psz <= 0L) {
+            cached_psz = sysconf(_SC_PAGESIZE);
+            if (cached_psz <= 0L) {
+                cached_psz = 4096L;
+            }
+        }
+        page_mask = (uintptr_t)cached_psz - 1U;
+        span_start = (uintptr_t)dst & ~page_mask;
+        span_end = ((uintptr_t)dst + len + page_mask) & ~page_mask;
+        if (mprotect((void *)span_start, span_end - span_start,
+                     PROT_READ | PROT_WRITE) != 0) {
             return NULL;
         }
         memcpy(dst, bytes, len);
-        if (mprotect((void *)start, end - start, PROT_READ | PROT_EXEC) != 0) {
+        if (mprotect((void *)span_start, span_end - span_start,
+                     PROT_READ | PROT_EXEC) != 0) {
             return NULL;
         }
         __builtin___clear_cache((char *)dst, (char *)dst + len);
@@ -669,14 +555,18 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
         if (mips_fetch(ctx, cur, &word) != 0) {
             if (count == 0U) {
                 if (ctx->exit_reason == MIPS32_EXIT_NONE) {
-                    mips_fault(ctx, cur);
+                    if ((cur & 3U) != 0U) {
+                        mips_fault_align(ctx, cur);
+                    } else {
+                        mips_fault(ctx, cur);
+                    }
                 }
                 return MIPS_FAULT;
             }
             break;
         }
         mips_decode(word, d);
-        /* COP1X/COP2 and unknown system classes fall back to interp. */
+        /* COP2 and non-MADD-family COP1X fall back to interp_step. */
         if (dbt_is_unhandled_coproc(d)) {
             break;
         }
@@ -702,7 +592,7 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
                 break;
             }
             mips_decode(word, &insns[count + 1]);
-            link = (unsigned)dbt_is_link(d);
+            link = (unsigned)mips_is_ras_call(d);
             count += 2U;
             end = cur + 8U;
             break;

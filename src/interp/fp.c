@@ -554,7 +554,7 @@ static int fp_compare(struct fp_st *s, unsigned f, uint64_t aw, uint64_t bw,
     return 0;
 }
 
-/* Float->int (R7-15 always raises Inexact; R7-17 mode-specific invalid). */
+/* Float->int: rounded non-integral inputs raise Inexact (R7-15); exact conversions (0.0, exact INT_MIN/LONG_MIN) leave it clear; invalid raises Invalid. */
 static int fp_to_int(struct fp_st *s, unsigned f, uint64_t w, int nbits,
                      int forced_rm, uint64_t *out)
 {

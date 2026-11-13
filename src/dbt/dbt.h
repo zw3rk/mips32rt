@@ -21,6 +21,7 @@
 #ifndef MIPS32RT_DBT_H
 #define MIPS32RT_DBT_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -48,12 +49,43 @@ typedef struct dbt_ras_entry {
     size_t   blk_idx; /* index into dbt_cache.blocks (O(1) metadata) */
 } dbt_ras_entry_t;
 
-/* One guest-page version slot for SMC invalidation. */
+/* One guest-page version slot for SMC invalidation: open-addressed
+ * hash entry keyed by page (UINT32_MAX marks an empty slot; valid page
+ * bases are 4 KiB-aligned so they never collide with the sentinel). */
 typedef struct dbt_smc_entry {
-    uint32_t page;
-    uint32_t version;
-    uint32_t used;
+    _Atomic uint32_t page;
+    _Atomic uint64_t version;
 } dbt_smc_entry_t;
+
+/* Per-host-thread translation cache (owned by src/dbt/dbt.c; shared
+ * here so the SMC table TU sees the memo fields). */
+typedef struct dbt_cache {
+    dbt_block_t blocks[DBT_MAX_BLOCKS];
+    uint8_t     block_link[DBT_MAX_BLOCKS];
+    size_t      block_count;
+    dbt_ibtc_entry_t *ibtc;
+    dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
+    unsigned    ras_top;
+    uint8_t    *pool;
+    size_t      pool_used;
+    uint32_t    last_pc;
+    void       *last_code;
+    uint32_t    last_smc;
+    int         last_valid;
+    size_t      last_bi; /* block index for last_* (H3: O(1) metadata) */
+    uint32_t    smc_memo_page; /* H3: last page resolved by dbt_smc_version */
+    uint32_t    smc_memo_version;
+    int         smc_memo_valid;
+    uint64_t    local_flush_epoch;
+    uint64_t    local_ver_epoch;
+} dbt_cache_t;
+
+extern __thread dbt_cache_t *dbt_cache;
+extern _Atomic uint32_t g_smc_lock;
+extern _Atomic uint32_t g_smc_used_count;
+extern _Atomic uint64_t g_smc_flush_epoch;
+void dbt_flush_local(mips32_ctx_t *ctx);
+void dbt_smc_reset_for_flush(void);
 
 /*
  * dbt_compile return contract (0 ok, 1 interp_step fallback, MIPS_FAULT):

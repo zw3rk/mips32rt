@@ -428,7 +428,12 @@ static int l4a_ensure_sigtramp(mips32_ctx_t *ctx)
         h[6] = 0x00U;
         h[7] = 0x00U;
     }
-#ifndef __APPLE__
+#ifdef __APPLE__
+    if (mprotect((void *)((uintptr_t)want & ~0x3FFFull), 0x4000u,
+                 PROT_READ) != 0) {
+        return -1;
+    }
+#else
     if (mprotect(want, (size_t)MIPS32_PAGE_SIZE, PROT_READ) != 0) {
         return -1;
     }

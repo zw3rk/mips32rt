@@ -89,6 +89,9 @@ test: ## Run the host-native test suites (ABI invariants + decoder self-test)
 	@if [ -f tests/test_r3_regress.c ]; then \
 		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 tests/test_r3_regress.c src/rt32/vm.c src/rt32/vm_init.c src/rt32/vm_mmap.c src/rt32/vm_darw.c src/os/mem.c src/os/signals.c src/os/sigqueue.c -o $(BUILD_DIR)/test_r3_regress && ./$(BUILD_DIR)/test_r3_regress; \
 	fi
+	@if [ -f tests/test_r18_regress.c ]; then \
+		cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/rt32 tests/test_r18_regress.c src/rt32/vm.c src/rt32/vm_init.c src/rt32/vm_mmap.c src/rt32/vm_darw.c src/rt32/a64_emit.c src/os/mem.c src/os/signals.c src/os/sigqueue.c src/os/syscall_min.c src/vm/vm32.c src/interp/decode.c src/interp/interp.c src/interp/fp.c src/interp/fpmove.c src/interp/unaligned.c src/dbt/dbt.c src/dbt/smc.c src/dbt/emit_int.c src/dbt/emit_mem.c src/dbt/emit_fp.c src/dbt/emit_fp_cvt.c src/dbt/trace.c -o $(BUILD_DIR)/test_r18_regress && ./$(BUILD_DIR)/test_r18_regress; \
+	fi
 
 check: test check-line-limits check-abi-invariants ## Run all Phase 0 checks
 

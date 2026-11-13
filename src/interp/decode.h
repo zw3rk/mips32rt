@@ -62,6 +62,8 @@
 #define MIPS_REGIMM_BGEZL  0x03U
 #define MIPS_REGIMM_BLTZAL 0x10U
 #define MIPS_REGIMM_BGEZAL 0x11U
+#define MIPS_REGIMM_BLTZALL 0x12U
+#define MIPS_REGIMM_BGEZALL 0x13U
 
 /* SPECIAL funct selectors (op == MIPS_OP_SPECIAL). */
 #define MIPS_FUNCT_SLL   0x00U
@@ -106,6 +108,9 @@ int mips_is_branch(const mips_dec_t *d);
 int mips_is_branch_likely(const mips_dec_t *d);
 int mips_is_jump(const mips_dec_t *d);
 int mips_is_link(const mips_dec_t *d);
+/* RAS call predicate (JAL, JALR with rd == $ra, link REGIMM): the
+ * return-address stack push condition used by the DBT dispatcher. */
+int mips_is_ras_call(const mips_dec_t *d);
 int mips_has_delay_slot(const mips_dec_t *d);
 
 #endif /* MIPS32RT_INTERP_DECODE_H */

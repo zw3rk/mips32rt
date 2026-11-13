@@ -574,7 +574,15 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             mips_guest_store_commit(ctx, new_va,
                                     mips32_guest_ptr(ctx, old_addr), copy_len);
             if (prot != map_prot) {
-                (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+                int mrc = vm_mprotect_locked(ctx, new_va,
+                                             (uint32_t)new_aligned, prot);
+                if (mrc != 0) {
+                    (void)vm_munmap_locked(ctx, new_va,
+                                           (uint32_t)new_aligned);
+                    vm_sync_to_ctx(ctx);
+                    vm_lock_release();
+                    return (uint32_t)mrc;
+                }
             }
         }
     } else {
@@ -595,8 +603,16 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                 mips32_guest_ptr(ctx, new_va));
             if (mres != MAP_FAILED) {
                 if (prot != rw_prot) {
-                    (void)mprotect(mips32_guest_ptr(ctx, new_va), (size_t)new_aligned,
-                                   mips32_host_prot(ctx, prot));
+                    if (mprotect(mips32_guest_ptr(ctx, new_va),
+                                 (size_t)new_aligned,
+                                 mips32_host_prot(ctx, prot)) != 0) {
+                        int e = errno;
+                        (void)vm_munmap_locked(ctx, new_va,
+                                               (uint32_t)new_aligned);
+                        vm_sync_to_ctx(ctx);
+                        vm_lock_release();
+                        return (uint32_t)-(int32_t)e;
+                    }
                 }
                 (void)vm_record_region_backed_locked(new_va,
                     (uint32_t)((uint64_t)new_va + new_aligned),
@@ -635,7 +651,14 @@ uint32_t rt32_vm_mremap(mips32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                              (off_t)(orig_back.file_off + old_aligned));
         }
         if (prot != 0x3U) {
-            (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+            int mrc = vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned,
+                                         prot);
+            if (mrc != 0) {
+                (void)vm_munmap_locked(ctx, new_va, (uint32_t)new_aligned);
+                vm_sync_to_ctx(ctx);
+                vm_lock_release();
+                return (uint32_t)mrc;
+            }
         }
         vm_backing_t new_back = { orig_back.fd, orig_back.file_off, orig_back.dev, orig_back.ino, 0U };
         (void)vm_record_region_backed_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),

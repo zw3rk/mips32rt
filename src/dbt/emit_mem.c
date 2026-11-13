@@ -683,19 +683,36 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
              int ind_slot)
 {
     unsigned data = op_val(b, d->rt, A64_TMP3);
-    size_t ph_fail1, ph_fail2, ph_fail3, ph_fail4;
+    size_t ph_live, ph_fail2, ph_fail3, ph_fail4;
     size_t ph_done;
 
     emit_sync_pc(b, fpc, ind_slot);
     emit_align_fault(b, 1U, fpc, ind_slot);
+    /* A dead reservation exits to interp_step before touching memory:
+     * guest_sc32 checks PROT_WRITE before llbit, so an SC to a PROT_READ
+     * page faults (SIGSEGV) with rt preserved instead of silently
+     * writing rt = 0.  Writable pages just report failure (rt = 0). */
+    a64_emit_ldrb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
+    ph_live = a64_emit_cbz_w_placeholder(b, true, A64_TMP2);
+    emit_flush(b);
+    a64_emit_mov_imm32(b, A64_TMP1, fpc);
+    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_PC_OFFSET);
+    if (ind_slot != 0) {
+        emit_load_delay_target(b, A64_TMP1);
+    } else {
+        a64_emit_mov_imm32(b, A64_TMP1, fpc + 4U);
+    }
+    a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, MIPS32_CTX_NEXT_PC_OFFSET);
+    a64_emit_mov_imm32(b, 0U, MIPS32_EXIT_SINGLE_STEP);
+    a64_emit_mov_imm32(b, 1U, 0U);
+    a64_emit_ret(b);
+    a64_patch_cbz_w(b, ph_live, b->count);
     a64_emit_add_uxtw_x(b, 24U, A64_XG, A64_ADDR);
     emit_ll_lock(b);
-    /* Probe + value load (faults like the old LDXR did, even when the
-     * reservation below is dead). A host fault here abandons the
-     * block; mips_ll_abandon releases the lock for the faulting ctx. */
+    /* Probe + value load for a live reservation (faults like the old
+     * LDXR did). A host fault here abandons the block;
+     * mips_ll_abandon releases the lock for the faulting ctx. */
     a64_emit_ldr_imm_w(b, A64_TMP1, 24U, 0U);
-    a64_emit_ldrb_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLBIT_OFFSET);
-    ph_fail1 = a64_emit_cbz_w_placeholder(b, false, A64_TMP2);
     /* The reservation is address-specific: a live bit for another word
      * must not let this SC succeed (matches interp lladdr check). */
     a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, MIPS32_CTX_LLADDR_OFFSET);
@@ -732,7 +749,6 @@ void emit_sc(a64_buf_t *b, const mips_dec_t *d, uint32_t fpc, int be,
     emit_ll_unlock(b);
     a64_emit_mov_imm32(b, A64_TMP1, 1U);
     ph_done = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, ph_fail1, b->count);
     a64_patch_b_cond(b, ph_fail2, b->count);
     a64_patch_b_cond(b, ph_fail3, b->count);
     a64_patch_cbz_x(b, ph_fail4, b->count);

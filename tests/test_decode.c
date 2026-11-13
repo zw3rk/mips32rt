@@ -97,7 +97,13 @@ static const decode_case_t cases[] = {
     /* COP1. */
     { "mfc1", 0x44084800U, 17, 0, 8, 9, 0, 0x00, 0x4800, 0x00084800U, 18432, 18432U },
     { "bc1fl", 0x45020005U, 17, 8, 2, 0, 0, 0x05, 0x0005, 0x01020005U, 5, 5U },
-    { "bc1t", 0x4501fff8U, 17, 8, 1, 31, 31, 0x38, 0xfff8, 0x0101fff8U, -8, 65528U }
+    { "bc1t", 0x4501fff8U, 17, 8, 1, 31, 31, 0x38, 0xfff8, 0x0101fff8U, -8, 65528U },
+    /* REGIMM branch-likely-and-link (M32-R13-7). */
+    { "bltzall", 0x04920010U, 1, 4, 18, 0, 0, 0x10, 0x0010, 0x00920010U, 16, 16U },
+    { "bgezall", 0x04b3fffcu, 1, 5, 19, 31, 31, 0x3c, 0xfffc, 0x00b3fffcu, -4, 65532U },
+    /* JALR with $ra (RAS call) and without (link only). */
+    { "jalr-ra", 0x0120f809U, 0, 9, 0, 31, 0, 0x09, 0xf809, 0x0120f809U, -2039, 63497U },
+    { "jalr-t0", 0x01204009U, 0, 9, 0, 8, 0, 0x09, 0x4009, 0x01204009U, 16393, 16393U }
 };
 
 #define N_CASES (sizeof(cases) / sizeof(cases[0]))
@@ -109,27 +115,32 @@ typedef struct {
     int is_likely;
     int is_jump;
     int is_link;
+    int is_ras;
 } class_case_t;
 
 static const class_case_t class_cases[] = {
-    { "nop", 0, 0, 0, 0, 0 },
-    { "add", 2, 0, 0, 0, 0 },
-    { "jr", 3, 0, 0, 1, 0 },
-    { "bltz", 10, 1, 0, 0, 0 },
-    { "bltzal", 12, 1, 0, 0, 1 },
-    { "j", 14, 0, 0, 1, 0 },
-    { "jal", 15, 0, 0, 1, 1 },
-    { "beq", 16, 1, 0, 0, 0 },
-    { "bne", 17, 1, 0, 0, 0 },
-    { "beql", 20, 1, 1, 0, 0 },
-    { "blezl", 22, 1, 1, 0, 0 },
-    { "addi", 24, 0, 0, 0, 0 },
-    { "lw", 31, 0, 0, 0, 0 },
-    { "mfc0", 40, 0, 0, 0, 0 },
-    { "rdhwr", 41, 0, 0, 0, 0 },
-    { "mfc1", 42, 0, 0, 0, 0 },
-    { "bc1fl", 43, 1, 1, 0, 0 },
-    { "bc1t", 44, 1, 0, 0, 0 }
+    { "nop", 0, 0, 0, 0, 0, 0 },
+    { "add", 2, 0, 0, 0, 0, 0 },
+    { "jr", 3, 0, 0, 1, 0, 0 },
+    { "bltz", 10, 1, 0, 0, 0, 0 },
+    { "bltzal", 12, 1, 0, 0, 1, 1 },
+    { "j", 14, 0, 0, 1, 0, 0 },
+    { "jal", 15, 0, 0, 1, 1, 1 },
+    { "beq", 16, 1, 0, 0, 0, 0 },
+    { "bne", 17, 1, 0, 0, 0, 0 },
+    { "beql", 20, 1, 1, 0, 0, 0 },
+    { "blezl", 22, 1, 1, 0, 0, 0 },
+    { "addi", 24, 0, 0, 0, 0, 0 },
+    { "lw", 31, 0, 0, 0, 0, 0 },
+    { "mfc0", 40, 0, 0, 0, 0, 0 },
+    { "rdhwr", 41, 0, 0, 0, 0, 0 },
+    { "mfc1", 42, 0, 0, 0, 0, 0 },
+    { "bc1fl", 43, 1, 1, 0, 0, 0 },
+    { "bc1t", 44, 1, 0, 0, 0, 0 },
+    { "bltzall", 45, 1, 1, 0, 1, 1 },
+    { "bgezall", 46, 1, 1, 0, 1, 1 },
+    { "jalr-ra", 47, 0, 0, 1, 1, 1 },
+    { "jalr-t0", 48, 0, 0, 1, 1, 0 }
 };
 
 #define N_CLASS (sizeof(class_cases) / sizeof(class_cases[0]))
@@ -200,6 +211,11 @@ int main(void)
                 c->name, !!mips_is_link(&d), c->is_link);
             failures++;
         }
+        if (!!mips_is_ras_call(&d) != c->is_ras) {
+            printf("FAIL %s: is_ras_call got %d want %d\n",
+                c->name, !!mips_is_ras_call(&d), c->is_ras);
+            failures++;
+        }
         want_slot = (c->is_branch || c->is_jump) ? 1 : 0;
         if (!!mips_has_delay_slot(&d) != want_slot) {
             printf("FAIL %s: has_delay_slot got %d want %d\n",
@@ -211,7 +227,7 @@ int main(void)
     mips_decode(0x00000000U, NULL);
     if (mips_is_branch(NULL) != 0 || mips_is_branch_likely(NULL) != 0 ||
         mips_is_jump(NULL) != 0 || mips_is_link(NULL) != 0 ||
-        mips_has_delay_slot(NULL) != 0) {
+        mips_is_ras_call(NULL) != 0 || mips_has_delay_slot(NULL) != 0) {
         printf("FAIL null: classifier on NULL did not return 0\n");
         failures++;
     }

@@ -67,27 +67,6 @@ size_t mips32_host_page_size(void)
     return (size_t)v;
 }
 
-int mips32_host_map_anon(void *hint_addr, size_t len, int linux_prot,
-                          int fixed, int noreplace, void **out_host_addr)
-{
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    void *res;
-
-    if (len == 0u || out_host_addr == NULL) {
-        return -EINVAL;
-    }
-    (void)noreplace;
-    if (fixed != 0) {
-        flags |= MAP_FIXED;
-    }
-    res = mmap(hint_addr, len, linux_prot, flags, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
-    }
-    *out_host_addr = res;
-    return 0;
-}
-
 int mips32_host_create_shared_mem(const char *name, size_t size,
                                    int *out_host_fd)
 {

@@ -42,8 +42,6 @@ int mips32_host_is_hyper_linux(void);
 size_t mips32_host_page_size(void);
 
 /* 2. Low-level host memory primitives consumed by src/vm/vm32.c. */
-int mips32_host_map_anon(void *hint_addr, size_t len, int linux_prot,
-                          int fixed, int noreplace, void **out_host_addr);
 int mips32_host_map_file(void *hint_addr, size_t len, int linux_prot,
                           int shared, int fixed, int host_fd,
                           uint64_t aligned_file_offset,
