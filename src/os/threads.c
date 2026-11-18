@@ -413,11 +413,17 @@ int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp)
     if ((flags & (MIPS_CLONE_NEWNS_ALL | MIPS_CLONE_PIDFD)) != 0U) {
         return mips_sc_ret(ctx, -EINVAL); /* namespaces/pidfd unsupported */
     }
-    if ((flags & MIPS_CLONE_VM) == 0U) {
-        /* No address space shared: fork semantics (CoW). glibc implements
-         * fork() as clone without CLONE_VM; vfork likewise arrives here. */
-        extern int32_t mips_proc_fork(mips32_ctx_t *ctx, uint32_t sp);
-        return mips_proc_fork(ctx, sp);
+    if ((flags & MIPS_CLONE_VM) == 0U ||
+        ((flags & MIPS_CLONE_VFORK) != 0U &&
+         (flags & MIPS_CLONE_THREAD) == 0U)) {
+        /* No address space shared: fork semantics (CoW); vfork() is a
+         * fork plus a CLOEXEC pipe handshake (mips_clone_no_vm). */
+        extern int32_t mips_clone_no_vm(mips32_ctx_t *ctx, uint32_t sp,
+                                        int is_vfork,
+                                        uint32_t child_stack);
+        return mips_clone_no_vm(ctx, sp,
+                                (flags & MIPS_CLONE_VFORK) != 0U,
+                                child_stack);
     }
     if ((flags & MIPS_CLONE_PARENT_SETTID) != 0U &&
         !mips_sc_range_ok(ctx, ptid, 4U, (uint32_t)PROT_WRITE)) {
@@ -882,14 +888,8 @@ void mips_thread_exit(mips32_ctx_t *ctx, int status)
 }
 
 /* No clone peers can exist off Linux: nothing to rebuild after fork. */
-void mips_threads_fork_child(void)
-{
-}
-void mips_threads_fork_prepare(void)
-{
-}
-void mips_threads_fork_release(void)
-{
-}
+void mips_threads_fork_child(void) {}
+void mips_threads_fork_prepare(void) {}
+void mips_threads_fork_release(void) {}
 
 #endif

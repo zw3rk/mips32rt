@@ -106,7 +106,9 @@ static int exec_syscall(mips32_ctx_t *ctx)
     ctx->llbit = 0;
     ctx->sc_pc_advanced = 0U;
     (void)mips_syscall(ctx);
-    ctx->sc_pc_advanced = 0U;
+    /* The syscall is over (pc advanced by delivery or by the caller
+     * below): never leak a stale 0 outside an active mips_syscall. */
+    ctx->sc_pc_advanced = 1U;
     if (ctx->exit_reason != MIPS32_EXIT_NONE) {
         return 1;
     }
@@ -793,6 +795,7 @@ static int exec_branch(mips32_ctx_t *ctx, uint32_t pc, const mips_dec_t *d)
      * reports branch_pc = pc (slot - 4) and sigreturn re-executes the
      * branch and its delay slot. */
     ctx->in_delay_slot = 1;
+    ctx->delay_target = taken ? target : (pc + 8u);
     ctx->pc = pc + 4u;
     {
         mips_dec_t s;

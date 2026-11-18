@@ -20,8 +20,8 @@
  *   __NR_clone   +120 (clone, owned by lane L4b)
  * MIPS O32 defines NO __NR_vfork (the 425-define header has no vfork
  * entry): glibc vfork(2) lowers to clone(2), so vfork arrives through
- * the L4b clone path; mips_proc_vfork below is the same fork body for
- * any direct caller, documented as vfork-as-fork.
+ * the L4b clone path; mips_proc_vfork (fork.c) is fork plus a CLOEXEC
+ * pipe handshake so the parent blocks until exec/exit.
  *
  * Return convention (SPEC 2.3): success records $a3 = 0, $v0 = value;
  * error records $a3 = 1, $v0 = positive MIPS errno.  Only ENOSYS differs
@@ -414,6 +414,8 @@ int32_t mips_proc_execve(mips32_ctx_t *ctx, uint32_t sp)
     ctx->fr_mode = info.fr_mode != 0U ? 1U : 0U;
     ctx->exit_reason = 0U;
     ctx->exit_info = 0U;
+    /* New image starts at elf_entry: block the syscall-exit pc advance. */
+    ctx->sc_pc_advanced = 1U;
 
     /* Process state: same thread, new program. */
     ctx->clear_child_tid = 0U;

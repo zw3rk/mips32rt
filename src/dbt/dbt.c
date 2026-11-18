@@ -190,10 +190,14 @@ void dbt_flush_local(mips32_ctx_t *ctx)
     if (dbt_cache == NULL) {
         return;
     }
-    for (i = 0; i < DBT_MAX_BLOCKS; i++) {
+    /* Slots at or past block_count were never filled since the last flush. */
+    for (i = 0; i < dbt_cache->block_count; i++) {
         dbt_cache->blocks[i].code = NULL;
         dbt_cache->blocks[i].code_len = 0;
         dbt_cache->block_link[i] = 0;
+    }
+    for (i = 0; i < DBT_BLOCK_HASH_SIZE; i++) {
+        dbt_cache->block_hash[i] = DBT_BLOCK_NONE;
     }
     if (dbt_cache->ibtc != NULL) {
         for (i = 0; i < MIPS32_IBTC_SIZE; i++) {
@@ -238,6 +242,8 @@ static void dbt_flush_all(mips32_ctx_t *ctx)
 
 static int dbt_cache_ensure(mips32_ctx_t *ctx)
 {
+    size_t i;
+
     if (ctx == NULL) {
         return -1;
     }
@@ -248,6 +254,9 @@ static int dbt_cache_ensure(mips32_ctx_t *ctx)
         }
         dbt_cache->local_flush_epoch =
             atomic_load_explicit(&g_smc_flush_epoch, memory_order_acquire);
+        for (i = 0; i < DBT_BLOCK_HASH_SIZE; i++) {
+            dbt_cache->block_hash[i] = DBT_BLOCK_NONE;
+        }
     }
     if (dbt_cache->ibtc == NULL) {
         dbt_cache->ibtc = (dbt_ibtc_entry_t *)calloc(MIPS32_IBTC_SIZE,
@@ -306,11 +315,18 @@ void mips32_dbt_invalidate_range(mips32_ctx_t *ctx, uint32_t start,
     }
 }
 
+static uint32_t dbt_block_hash_index(uint32_t pc)
+{
+    return ((pc >> 2U) ^ (pc >> 16U)) & (DBT_BLOCK_HASH_SIZE - 1U);
+}
+
+/* Pool search behind the IBTC: walk the guest-PC hash chain. */
 static void *dbt_pool_lookup(uint32_t pc, uint32_t smc, size_t *bip)
 {
-    size_t i;
+    uint32_t i;
 
-    for (i = 0; i < dbt_cache->block_count; i++) {
+    for (i = dbt_cache->block_hash[dbt_block_hash_index(pc)];
+         i != DBT_BLOCK_NONE; i = dbt_cache->block_next[i]) {
         if (dbt_cache->blocks[i].guest_pc == pc &&
             dbt_cache->blocks[i].code != NULL &&
             dbt_cache->blocks[i].smc_version == smc) {
@@ -636,6 +652,13 @@ int dbt_compile(mips32_ctx_t *ctx, uint32_t pc)
     /* Wave C2 --cache cold emit: record the published guest range. */
     mips32_aot_note_block(ctx, pc, b->guest_end);
     dbt_cache->block_link[dbt_cache->block_count] = (uint8_t)link;
+    {
+        uint32_t h = dbt_block_hash_index(pc);
+
+        dbt_cache->block_next[dbt_cache->block_count] =
+            dbt_cache->block_hash[h];
+        dbt_cache->block_hash[h] = (uint32_t)dbt_cache->block_count;
+    }
     dbt_ibtc_fill(pc, code, smc, dbt_cache->block_count);
     dbt_cache->block_count++;
     ctx->blocks_compiled++;

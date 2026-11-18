@@ -355,6 +355,8 @@ int main(int argc, char **argv)
     int st;
 
     memset(&ctx, 0, sizeof(ctx));
+    /* No syscall is active: sc_pc_advanced starts set (see interp.c). */
+    ctx.sc_pc_advanced = 1U;
     ctx.engine = -1; /* unset: --interp/--dbt or MIPS32RT_ENGINE; INTERP default */
     ctx.fixade_enabled = 1u; /* Wave U3: Linux MIPS TIF_FIXADE default-on */
 

@@ -306,7 +306,8 @@ static int32_t sc_uname(mips32_ctx_t *ctx, uint32_t sp)
     copy_uts_field(staged + 1U * MIPS_UTS_FIELD, un.nodename);
     copy_uts_field(staged + 2U * MIPS_UTS_FIELD, un.release);
     copy_uts_field(staged + 3U * MIPS_UTS_FIELD, un.version);
-    copy_uts_field(staged + 4U * MIPS_UTS_FIELD, un.machine);
+    /* Report the guest ISA, not the host's (userland probes uname -m). */
+    copy_uts_field(staged + 4U * MIPS_UTS_FIELD, "mips");
 #if defined(__linux__) && !defined(__GLIBC__)
     /* musl spells the sixth utsname field with leading underscores. */
     copy_uts_field(staged + 5U * MIPS_UTS_FIELD, un.__domainname);
@@ -333,7 +334,7 @@ int32_t mips_proc_waitpid(mips32_ctx_t *ctx, uint32_t sp);
 /* Phase 4 thread layer (src/os/threads.c, lane L4b). */
 int32_t mips_sc_clone(mips32_ctx_t *ctx, uint32_t sp);
 
-int32_t mips_syscall(mips32_ctx_t *ctx)
+static int32_t mips_syscall_dispatch(mips32_ctx_t *ctx)
 {
     uint32_t nr;
     uint32_t sp;
@@ -569,7 +570,23 @@ int32_t mips_syscall(mips32_ctx_t *ctx)
         return sc_ret(ctx, 0);
     }
     default:
-        break;
+        /* Everything else (chdir, poll, ...) is handled in syscalls*.c,
+         * which answers -ENOSYS itself for unknown numbers. */
+        return mips_syscall_extra(ctx, sp);
     }
-    return sc_ret(ctx, -(int32_t)ENOSYS);
+}
+
+/* Common syscall exit (both engines arrive here): convert a recorded
+ * host SIGCHLD into a pending guest SIGCHLD and deliver whatever is
+ * pending and unblocked, so a child exit that lands while the guest
+ * sits in plain poll/select/nanosleep/read -- or runs translated code
+ * with a non-pselect event loop -- still reaches its handler promptly.
+ * Skipped once the syscall stopped the thread (exit, execve teardown,
+ * fatal signal). */
+int32_t mips_syscall(mips32_ctx_t *ctx)
+{
+    int32_t r = mips_syscall_dispatch(ctx);
+
+    mips_sig_check_at_syscall_exit(ctx);
+    return r;
 }

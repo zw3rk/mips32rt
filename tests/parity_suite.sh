@@ -12,38 +12,27 @@
 #   p1_isa      integer/branch/unaligned/trap torture (--interp, --dbt, --difftest)
 #   p2_libc     static libc hello/printf/malloc/qsort/fileio (--interp, --dbt, --difftest)
 #   p3_fp       FP/SIMD torture (--interp, --dbt, --difftest)
-#   p3_torture  portable FP/signal/VM/atomics torture, compiled from
-#               ../../rt-series/tests/p3_torture.c (--interp, --dbt, --difftest)
-#   tcg_smoke   portable ALU/signal/mmap/thread torture, compiled from
-#               ../../rt-series/tests/tcg/smoke_tcg.c (--interp, --dbt, --difftest)
+#   p3_torture  portable FP/signal/VM/atomics torture (p3_torture.c)
+#   tcg_smoke   portable ALU/signal/mmap/thread torture (smoke_tcg.c)
 #   p4_threads  threads/signals/pipe/fork-wait (--interp, --dbt, --difftest)
-#   p5_dyn      dynamic PT_INTERP/ld.so + shared libc via the committed
-#               minimal tests/sysroot/ fixture (--interp, --dbt, --difftest)
+#   p5_dyn      dynamic PT_INTERP/ld.so + shared libc (tests/sysroot/)
 #   h1_smc      self-modifying code + I-cache invalidation (--interp, --dbt, --difftest)
 #   h4_cxx      C++17 exceptions/RTTI/threads (--interp, --dbt, --difftest)
 #   bench_smoke bench-mipsel --smoke (ALL_PASS, no FAIL) on interp+dbt
-#   aot_reload  real guest ELF cold-emit (-> --cache DIR, magic check) +
-#               warm-reload (byte-identical stdout); the sole AOT row.
+#   aot_reload  guest ELF cold-emit (-> --cache DIR) + warm-reload; sole AOT row.
 #
 # Sources the frozen cross-repo contract
 # ../../rt-series/tools/parity_contract.sh and emits one structured
 # PARITY_ROW per executed check, finishing with parity_summary (non-zero
 # exit on any FAIL/GAP/SKIP).
 #
-# Golden comparison is stdout-plus-exit: the committed goldens in tests/
-# bundle the Docker toolchain header ("--- toolchain ---" through
-# "--- run ... ---"), the qemu stderr line ("qemu: uncaught target
-# signal ..."), and an EXIT trailer; golden_split() strips exactly those
-# harness lines and the suite additionally requires the translator exit
-# code to equal the golden's trailer code.
+# Golden comparison is stdout-plus-exit: golden_split() strips the
+# toolchain header, qemu stderr line, and EXIT trailer, then the suite
+# requires the translator exit code to equal the golden's trailer code.
 #
-# Backend order for guest legs: a Linux _build/mips32rt runs natively on
-# Linux CI, else inside one Debian bookworm container (which also builds
-# the guests and runs the qemu-mipsel/qemu-mips oracle, so the whole
-# Linux leg is a single audited environment), else GAP. The darwin
-# translator runs the bench-smoke rows only: backend_darwin implements
-# neither fork nor clone, so signal/thread guests cannot match the
-# goldens there by construction.
+# Backend order: native Linux _build/mips32rt, else one Debian bookworm
+# container (builds guests, runs the qemu oracle), else GAP. The darwin
+# translator runs bench-smoke rows only (no fork/clone there).
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -243,9 +232,9 @@ if cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
         -Iinclude -Isrc tests/test_decode.c src/interp/decode.c \
         -o "$OUT/test_decode" 2>"$OUT/host-decode.log" \
     && "$OUT/test_decode" >"$OUT/host-decode.out" 2>&1 \
-    && grep -q "DECODE: all 45 cases" "$OUT/host-decode.out"; then
+    && grep -q "DECODE: all 49 cases" "$OUT/host-decode.out"; then
     parity_row "struct" "$HOST" "test-decode" "host" "PASS" \
-        "$(( $(parity_now_ms) - _t0 ))" "45 cases + 18 classifier checks"
+        "$(( $(parity_now_ms) - _t0 ))" "49 cases + 22 classifier checks"
 else
     parity_row "struct" "$HOST" "test-decode" "host" "FAIL" "0" \
         "see $OUT/host-decode.log"
