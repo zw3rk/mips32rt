@@ -29,6 +29,7 @@
 #define L4A_SIGKILL 9U
 #define L4A_SIGBUS  10U
 #define L4A_SIGSEGV 11U
+#define L4A_SIGCHLD 18U
 #define L4A_SIGSTOP 23U
 #define L4A_NSIG    128U
 
@@ -291,6 +292,15 @@ int32_t mips_sc_rt_sigaction(mips32_ctx_t *ctx, uint32_t sp)
             g_actions[sig] = next;
         }
         mips32_spin_unlock(&g_sig_lock);
+        /* make -jN sleeps in pselect6 until SIGCHLD: bridge the host
+         * child-exit signal while the guest handles SIGCHLD (18). */
+        if (sig == 18U) {
+            if (next.handler == L4A_SIG_DFL || next.handler == L4A_SIG_IGN) {
+                mips_host_sigchld_disarm();
+            } else {
+                mips_host_sigchld_arm();
+            }
+        }
         if (next.handler == L4A_SIG_IGN ||
             (next.handler == L4A_SIG_DFL && mips_signal_default_ignore((int)sig))) {
             mips_sig_purge_signo(ctx, (int)sig);
@@ -533,10 +543,25 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
     }
     be = mips_is_be(ctx);
     memset(frame, 0, sizeof(frame));
-    /* siginfo: signo@frame+24, code@+28, errno@+32(=0), addr@+36. */
+    /* siginfo: signo@frame+24, code@+28, errno@+32(=0). The _sifields
+     * union follows: fault addr@+36, except for SIGCHLD with a
+     * CLD_EXITED/KILLED/DUMPED code, which carries the MIPS O32
+     * _sigchld triple (pid@+36, uid@+40, status@+44) from the host
+     * child-exit snapshot. */
     buf_put32(frame, 24U, (uint32_t)signo, be);
     buf_put32(frame, 28U, (uint32_t)si_code, be);
-    buf_put32(frame, 36U, fault_addr, be);
+    if (signo == (int)L4A_SIGCHLD && si_code > 0) {
+        int32_t cpid;
+        uint32_t cuid;
+        int32_t cstatus;
+
+        mips_sigchld_last_info(&cpid, &cuid, &cstatus);
+        buf_put32(frame, 36U, (uint32_t)cpid, be);
+        buf_put32(frame, 40U, cuid, be);
+        buf_put32(frame, 44U, (uint32_t)cstatus, be);
+    } else {
+        buf_put32(frame, 36U, fault_addr, be);
+    }
     branch_pc = ctx->in_delay_slot != 0U ? ctx->pc - 4U : ctx->pc;
     buf_put64(frame, 184U, (uint64_t)branch_pc, be);
     /* M32-R3-7: the frame keeps the exact interrupted $sp; only the
@@ -553,7 +578,9 @@ int mips_raise_guest_code(mips32_ctx_t *ctx, int signo, int32_t si_code,
     buf_put64(frame, 728U, (uint64_t)ctx->hi, be); /* sc_mdhi */
     buf_put64(frame, 736U, (uint64_t)ctx->lo, be); /* sc_mdlo */
     for (i = 0; i < 4U; i++) {
-        buf_put32(frame, 768U + 4U * i, ctx->sig_blocked[i], be);
+        buf_put32(frame,
+                  (size_t)MIPS_RT_SIGFRAME_SIGMASK_OFF + 4U * i,
+                  ctx->sig_blocked[i], be);
         entry_mask.sig[i] = ctx->sig_blocked[i] | act.mask.sig[i];
     }
     if (mips_sc_copy_to(ctx, newsp, frame, sizeof(frame)) != 0) {
@@ -654,7 +681,9 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
     ctx->hi = (uint32_t)buf_get64(frame, 728U, be);
     ctx->lo = (uint32_t)buf_get64(frame, 736U, be);
     for (i = 0; i < 4U; i++) {
-        saved.sig[i] = buf_get32(frame, 768U + 4U * i, be);
+        saved.sig[i] = buf_get32(frame,
+                                 (size_t)MIPS_RT_SIGFRAME_SIGMASK_OFF +
+                                 4U * i, be);
     }
     l4a_mask_scrub(&saved);
     for (i = 0; i < 4U; i++) {
@@ -665,6 +694,9 @@ int32_t mips_rt_sigreturn(mips32_ctx_t *ctx)
     ctx->llbit = 0U;
     ctx->exit_reason = MIPS32_EXIT_NONE;
     ctx->exit_info = 0U;
+    /* The restored frame pc is exact: neither deliver_pending nor the
+     * syscall-exit hook may advance past it. */
+    ctx->sc_pc_advanced = 1U;
     mips_signal_deliver_pending(ctx);
     return 0;
 }
@@ -808,6 +840,7 @@ void mips32_signals_reset_for_exec(mips32_ctx_t *ctx)
         }
     }
     mips32_spin_unlock(&g_sig_lock);
+    mips_host_sigchld_disarm();
     if (ctx != NULL) {
         memset(ctx->sig_frame_sp, 0, sizeof(ctx->sig_frame_sp));
         ctx->sig_depth = 0U;

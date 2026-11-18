@@ -335,6 +335,7 @@ static int32_t sc_openat(mips32_ctx_t *ctx, uint32_t sp, int is_open)
 static int32_t sc_unlinkat(mips32_ctx_t *ctx, uint32_t sp, int is_unlink)
 {
     char     path[MIPS_PATH_MAX];
+    char     hpath[MIPS_PATH_MAX];
     int      ok = 1;
     uint32_t dirfd;
     uint32_t path_va;
@@ -352,11 +353,31 @@ static int32_t sc_unlinkat(mips32_ctx_t *ctx, uint32_t sp, int is_unlink)
     if (rc != 0) {
         return mips_sc_ret(ctx, rc);
     }
+    rc = mips_sysroot_resolve(ctx, path, hpath);
+    if (rc != 0) {
+        return mips_sc_ret(ctx, rc);
+    }
     if ((flags & (uint32_t)MIPS_AT_REMOVEDIR) != 0U) {
-        rc = rmdir(path);
+        /* The dirfd must travel with the name: coreutils rm unlinks
+         * children dirfd-relative (openat O_DIRECTORY + unlinkat), so
+         * a bare rmdir(name) resolves against the wrong directory and a
+         * recursive rm -rf fails with ENOENT. */
+        rc = unlinkat((int)(int32_t)dirfd, hpath, AT_REMOVEDIR);
+        if (rc != 0 && mips_sysroot_fallback(ctx, path, errno)) {
+            rc = unlinkat((int)(int32_t)dirfd, path, AT_REMOVEDIR);
+        }
     } else if (flags == 0U) {
-        rc = (is_unlink != 0) ? unlink(path)
-                              : unlinkat((int)(int32_t)dirfd, path, 0);
+        if (is_unlink != 0) {
+            rc = unlink(hpath);
+            if (rc != 0 && mips_sysroot_fallback(ctx, path, errno)) {
+                rc = unlink(path);
+            }
+        } else {
+            rc = unlinkat((int)(int32_t)dirfd, hpath, 0);
+            if (rc != 0 && mips_sysroot_fallback(ctx, path, errno)) {
+                rc = unlinkat((int)(int32_t)dirfd, path, 0);
+            }
+        }
     } else {
         return mips_sc_ret(ctx, -EINVAL);
     }
@@ -766,6 +787,8 @@ int32_t mips_sc_close_range(mips32_ctx_t *ctx, uint32_t sp)
 #endif
 }
 
+int32_t mips_syscall_more(mips32_ctx_t *ctx, uint32_t sp);
+
 int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
 {
     uint32_t nr;
@@ -861,7 +884,6 @@ int32_t mips_syscall_extra(mips32_ctx_t *ctx, uint32_t sp)
     case (uint32_t)MIPS32_NR_get_robust_list:
         return mips_sc_robust(ctx, sp, 0);
     default:
-        break;
+        return mips_syscall_more(ctx, sp);
     }
-    return mips_sc_ret(ctx, -ENOSYS);
 }

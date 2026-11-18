@@ -16,9 +16,13 @@
 
 #include "mips32rt.h"
 
+#include "os/sigframe_mips32rt.h"
 #include "os/syscall_nr.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -55,6 +59,97 @@
 #define MIPS_F_SETFL         4
 #define MIPS_F_DUPFD_CLOEXEC 1030
 
+/* ---- MIPS O32 poll-bit translation (arch UAPI asm/poll.h, verified
+ * against the T14 Debian mipsel headers: POLLWRNORM is an alias of
+ * POLLOUT (0x04) and POLLWRBAND is 0x100; every other bit matches the
+ * host).  The low byte (IN PRI OUT ERR HUP NVAL RDNORM RDBAND) is
+ * identical on Linux, Darwin, and MIPS; only WRNORM/WRBAND/MSG/RDHUP
+ * need mapping.  On Darwin POLLWRBAND is 0x100 like MIPS, and MSG/RDHUP
+ * have no meaning, so those request bits are dropped. */
+static inline short mips_poll_events_to_host(uint16_t ev)
+{
+    unsigned h = (unsigned)ev & 0xFFU;
+
+#if defined(__APPLE__)
+    if ((ev & 0x0100U) != 0U) {
+        h |= (unsigned)POLLWRBAND;
+    }
+#else
+    if ((ev & 0x0004U) != 0U) {
+        h |= (unsigned)POLLWRNORM; /* guest OUT implies host WRNORM */
+    }
+    if ((ev & 0x0100U) != 0U) {
+        h |= (unsigned)POLLWRBAND; /* guest 0x100 -> host 0x200 */
+    }
+    if ((ev & 0x0400U) != 0U) {
+        h |= (unsigned)POLLMSG;
+    }
+    if ((ev & 0x2000U) != 0U) {
+        h |= (unsigned)POLLRDHUP;
+    }
+#endif
+    return (short)h;
+}
+
+static inline uint16_t mips_poll_revents_from_host(short re)
+{
+    unsigned r = (unsigned)(uint16_t)re;
+    uint16_t m = (uint16_t)(r & 0xFFU);
+
+#if defined(__APPLE__)
+    /* No RDHUP/MSG on Darwin: Darwin-only bits never appear in revents. */
+#else
+    if ((r & (unsigned)POLLWRNORM) != 0U) {
+        m |= 0x0004U;
+    }
+    if ((r & (unsigned)POLLWRBAND) != 0U) {
+        m |= 0x0100U;
+    }
+    if ((r & (unsigned)POLLMSG) != 0U) {
+        m |= 0x0400U;
+    }
+    if ((r & (unsigned)POLLRDHUP) != 0U) {
+        m |= 0x2000U;
+    }
+#endif
+    return m;
+}
+
+/* ---- MIPS O32 flock l_type translation (UAPI asm-generic/fcntl.h:
+ * F_RDLCK 0, F_WRLCK 1, F_UNLCK 2 — identical to Linux, so the Linux
+ * legs are identity; Darwin numbers them 1/3/2 and needs both
+ * directions mapped).  Lock *commands* already map by host macro name
+ * at the fcntl call site. */
+static inline short mips_flock_type_to_host(short mt)
+{
+#if defined(__APPLE__)
+    if (mt == 0) {
+        return (short)F_RDLCK;
+    }
+    if (mt == 1) {
+        return (short)F_WRLCK;
+    }
+    return (short)F_UNLCK;
+#else
+    return mt;
+#endif
+}
+
+static inline short mips_flock_type_from_host(short ht)
+{
+#if defined(__APPLE__)
+    if (ht == F_RDLCK) {
+        return 0;
+    }
+    if (ht == F_WRLCK) {
+        return 1;
+    }
+    return 2;
+#else
+    return ht;
+#endif
+}
+
 /* Futex ops (include/uapi/linux/futex.h, arch-independent). */
 #define MIPS_FUTEX_WAIT         0
 #define MIPS_FUTEX_WAKE         1
@@ -76,6 +171,33 @@
 
 /* sigaltstack flags (asm-generic signal.h): SS_DISABLE. */
 #define MIPS_SS_DISABLE 2U
+
+/* Frame offset of uc_sigmask in the synthetic rt_sigframe built by
+ * src/os/signals.c: rs_uc sits at 152 and uc_sigmask at 616 within the
+ * ucontext (24-byte header + 592-byte sigcontext), so the mask lands at
+ * frame+768.  The kernel's rs_code[2] trampoline words are NOT part of
+ * this frame (the return address lives in $ra = MIPS32_SIGTRAMP
+ * instead), which is why this differs from a naive 776 count.  The
+ * builder, the rt_sigreturn reader, and the pselect/ppoll wait tail in
+ * sigchld.c share this constant; never hardcode the number. */
+#define MIPS_RT_SIGFRAME_SIGMASK_OFF \
+    (offsetof(mips_rt_sigframe_t, rs_uc) + offsetof(mips_ucontext_t, uc_sigmask))
+
+_Static_assert(MIPS_RT_SIGFRAME_SIGMASK_OFF == 768,
+    "rt_sigframe uc_sigmask must sit at frame+768");
+
+/* Sysroot path resolution for *at-class and plain path syscalls
+ * (implemented in src/os/syscalls_fs.c): absolute guest paths resolve
+ * to sysroot+path when ctx->sysroot is set, relative paths pass through
+ * with dirfd unchanged.  Returns 0 with host_out holding the host path,
+ * or -ENAMETOOLONG when the prefixed path overflows MIPS_PATH_MAX. */
+int mips_sysroot_resolve(const mips32_ctx_t *ctx, const char *path,
+                         char *host_out);
+/* True when a sysroot-mapped attempt failed with ENOENT/ENOTDIR and the
+ * caller should retry the same operation with the raw guest path (the
+ * fixture only shadows absolute paths it actually contains). */
+int mips_sysroot_fallback(const mips32_ctx_t *ctx, const char *path,
+                          int host_errno);
 
 /* MIPS O32 struct stat64 is 104 bytes (asm/stat.h, SPEC 2.3). */
 #define MIPS_STAT64_SIZE 104U
@@ -107,6 +229,9 @@ int      mips_sc_read_cstr(const mips32_ctx_t *ctx, uint32_t va,
 #define MIPS_PROC_STAT    4
 #define MIPS_PROC_AUXV    5
 
+int      mips_fcntl_is_lock(uint32_t cmd);
+int32_t  mips_sc_fcntl_lock(mips32_ctx_t *ctx, uint32_t fd, uint32_t cmd,
+                            uint32_t va);
 int      mips_proc_classify(const char *path);
 int      mips_proc_open(mips32_ctx_t *ctx, int kind, int flags);
 long     mips_proc_readlink(mips32_ctx_t *ctx, int kind, char *buf,
@@ -270,5 +395,52 @@ int  mips_signal_pend(mips32_ctx_t *ctx, int signo, int32_t si_code);
 void mips_signal_deliver_pending(mips32_ctx_t *ctx);
 /* Pending-queue maintenance (defined in src/os/sigqueue.c). */
 void mips_sig_purge_signo(mips32_ctx_t *ctx, int signo);
+/* Common syscall-exit hook (defined in src/os/sigqueue.c): convert a
+ * recorded host SIGCHLD and deliver whatever is pending and unblocked.
+ * mips_syscall calls it on every exit; engines need no changes. */
+void mips_sig_check_at_syscall_exit(mips32_ctx_t *ctx);
+
+/* Darwin itimerfix: Darwin select/pselect reject tv_sec > 100000000
+ * with EINVAL, so sleeps longer than a day run in 1-day chunks (the
+ * caller re-waits when only the chunk expired). No-op elsewhere. */
+#ifdef __APPLE__
+#define MIPS_SEL_CAP_CHUNK(ptv) \
+    do { \
+        if ((ptv) != NULL && (ptv)->tv_sec > 86400) { \
+            (ptv)->tv_sec = 86400; \
+            (ptv)->tv_usec = 0; \
+        } \
+    } while (0)
+#else
+#define MIPS_SEL_CAP_CHUNK(ptv) ((void)0)
+#endif
+
+/* Host SIGCHLD bridge (src/os/sigchld.c). A wait brackets its blocking
+ * host pselect/ppoll with begin/end and sleeps on .wait when .active;
+ * begin returns 1 when a handled signal is already deliverable (end
+ * the wait with EINTR without sleeping). finish_wait sets the syscall
+ * result and, on EINTR, delivers under the wait's temporary mask with
+ * the frame recording old[] (swapped > 0: a temporary mask is live). */
+typedef struct mips_chld_wait {
+    sigset_t hold;
+    sigset_t wait;
+    int      active;
+} mips_chld_wait_t;
+void    mips_host_sigchld_arm(void);
+void    mips_host_sigchld_disarm(void);
+int     mips_host_sigchld_armed(void);
+void    mips_host_sigchld_poll(mips32_ctx_t *ctx);
+/* Last host child-exit snapshot for the MIPS O32 SIGCHLD siginfo
+ * frame (defined in src/os/sigqueue.c, read in src/os/signals.c). */
+void    mips_sigchld_last_info(int32_t *pid, uint32_t *uid,
+                               int32_t *status);
+int     mips_chld_wait_begin(mips32_ctx_t *ctx, mips_chld_wait_t *w);
+void    mips_chld_wait_end(mips32_ctx_t *ctx, mips_chld_wait_t *w);
+int32_t mips_sig_finish_wait(mips32_ctx_t *ctx, int32_t raw, int swapped,
+                             const uint32_t old[4]);
+/* EINTR triage for blocking host waits (sigchld.c): 1 when the guest
+ * call must be retried (spurious wake, nothing deliverable), 0 when
+ * the EINTR must be reported (a handled signal is unblocked+pending). */
+int     mips_sig_should_retry_wait(mips32_ctx_t *ctx);
 
 #endif /* MIPS32_SYSCALLS_PRIV_H */

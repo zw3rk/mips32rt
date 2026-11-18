@@ -160,7 +160,10 @@ int32_t mips_sc_fcntl(mips32_ctx_t *ctx, uint32_t sp)
         break;
     }
     default:
-        return mips_sc_ret(ctx, -ENOSYS); /* F_GETLK/F_SETLK*: Phase 4 */
+        if (mips_fcntl_is_lock(cmd)) {
+            return mips_sc_fcntl_lock(ctx, fd, cmd, arg);
+        }
+        return mips_sc_ret(ctx, -ENOSYS);
     }
     if (r < 0) {
         return mips_sc_ret(ctx, -(int32_t)errno);
@@ -606,15 +609,25 @@ int32_t mips_sc_nanosleep(mips32_ctx_t *ctx, uint32_t sp)
     if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000L) {
         return mips_sc_ret(ctx, -EINVAL);
     }
-    if (nanosleep(&req, &rem) != 0) {
-        if (errno == EINTR && rem_va != 0U) {
-            if (mips_sc_write_ts(ctx, rem_va, &rem, 0) != 0) {
-                return mips_sc_ret(ctx, -EFAULT);
-            }
+    /* A host SIGCHLD that fires while the guest mask blocks SIGCHLD (and
+     * nothing else is deliverable) must not surface as a spurious
+     * -EINTR: resume sleeping on the remainder instead. */
+    for (;;) {
+        if (nanosleep(&req, &rem) == 0) {
+            return mips_sc_ret(ctx, 0);
         }
-        return mips_sc_ret(ctx, -(int32_t)errno);
+        if (errno != EINTR || !mips_sig_should_retry_wait(ctx)) {
+            int e = errno;
+
+            if (e == EINTR && rem_va != 0U) {
+                if (mips_sc_write_ts(ctx, rem_va, &rem, 0) != 0) {
+                    return mips_sc_ret(ctx, -EFAULT);
+                }
+            }
+            return mips_sc_ret(ctx, -(int32_t)e);
+        }
+        req = rem;
     }
-    return mips_sc_ret(ctx, 0);
 }
 
 int32_t mips_sc_clock_gettime(mips32_ctx_t *ctx, uint32_t sp, int wide)

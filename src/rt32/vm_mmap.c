@@ -370,6 +370,11 @@ int rt32_vm_mprotect(mips32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t pr
     if (!ctx) {
         return -EINVAL;
     }
+    /* PROT_GROWSDOWN (0x01000000) / PROT_GROWSUP (0x02000000): glibc's
+     * _dl_make_stack_executable() passes GROWSDOWN when a loaded object
+     * has an executable PT_GNU_STACK (common on MIPS).  The stack region
+     * is fixed-size here, so the flags are accepted and dropped. */
+    prot &= ~0x03000000U;
 
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);

@@ -27,8 +27,13 @@
 
 #include "mips32rt.h"
 
-/* Pool sizes (all counts, never VLAs). */
-#define DBT_MAX_BLOCKS 1024U
+/* Pool sizes (all counts, never VLAs).  The block table must hold a
+ * large compiler's working set (cc1plus runs >1024 hot blocks): a
+ * small cap forces a full flush + recompile storm. */
+#define DBT_MAX_BLOCKS 65536U
+/* Buckets of the guest-PC hash over blocks[] (power of two). */
+#define DBT_BLOCK_HASH_SIZE 16384U
+#define DBT_BLOCK_NONE UINT32_MAX
 #define DBT_CODE_POOL_SIZE (16U * 1024U * 1024U)
 #define DBT_SMC_TABLE_SIZE 1024U
 #define DBT_STAGING_SIZE 65536U
@@ -62,6 +67,9 @@ typedef struct dbt_smc_entry {
 typedef struct dbt_cache {
     dbt_block_t blocks[DBT_MAX_BLOCKS];
     uint8_t     block_link[DBT_MAX_BLOCKS];
+    /* Guest-PC hash chains over blocks[] (DBT_BLOCK_NONE terminates). */
+    uint32_t    block_hash[DBT_BLOCK_HASH_SIZE];
+    uint32_t    block_next[DBT_MAX_BLOCKS];
     size_t      block_count;
     dbt_ibtc_entry_t *ibtc;
     dbt_ras_entry_t ras[MIPS32_RAS_SIZE];
